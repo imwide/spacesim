@@ -165,7 +165,7 @@ const AUTH_STORAGE_KEY = 'spacesim.auth';
 const seatPosition = new THREE.Vector3(0, 1.2, -3.2);
 const pilotCameraOffset = new THREE.Vector3(0, 1.45, -3.05);
 const AUTOPILOT_REACH_DISTANCE_METERS = 250;
-const AUTOPILOT_TURN_RESPONSE = 2.6;
+const AUTOPILOT_TURN_RESPONSE = 0.6; // Softened significantly for majestic, massive ship rotation
 const METERS_PER_LIGHT_YEAR = 9_460_730_472_580_800;
 const AUTOPILOT_ACCELERATION = SHIP_THRUST_ACCELERATION * 1.18;
 const AUTOPILOT_BRAKE_DECELERATION = SHIP_THRUST_ACCELERATION * 1.4;
@@ -388,50 +388,29 @@ function buildAutopilotDestinations(
 }
 
 function getAutopilotCurveBoost(currentSpeed: number): number {
-  const speedRatio = clamp(currentSpeed / AUTOPILOT_MAX_SPEED_METERS_PER_SECOND, 0, 1);
-  // Left tail of normal distribution-like polynomial curve (peaks right before max speed and flattens out)
-  const curve = speedRatio * Math.pow(1 - Math.max(0, speedRatio), 0.25);
-  return AUTOPILOT_ACCELERATION_CURVE_AMPLITUDE * curve;
+  return 0; // Deprecated by proportional logic
 }
 
 function getAutopilotAcceleration(currentSpeed: number): number {
-  return AUTOPILOT_ACCELERATION + getAutopilotCurveBoost(currentSpeed);
+  // Base thruster acceleration (50 m/s^2) plus warp multiplier (exponential scaling)
+  return 50.0 + currentSpeed * 0.6;
 }
 
 function getAutopilotBrakeDeceleration(currentSpeed: number): number {
-  return AUTOPILOT_BRAKE_DECELERATION + getAutopilotCurveBoost(currentSpeed);
+  // Base retro-thruster (100 m/s^2) plus warp braking capability
+  return 100.0 + currentSpeed * 1.2;
 }
 
 function getAutopilotTargetSpeed(distanceToDestination: number, arrivalDistance: number): number {
   const remainingDistance = Math.max(0, distanceToDestination - arrivalDistance);
+  if (remainingDistance <= 0) return 0;
   
-  // The ship's non-linear braking curve requires approximately 1.75e15 meters
-  // to come to a full stop from max speed.
-  const MAX_BRAKING_DISTANCE_METERS = 1.75e15;
+  // Proportional kinematic controller sets speed limit: v = distance / time_constant.
+  // This guarantees a smooth, exponential slide into the destination without overshooting.
+  // We add 25 m/s base speed so the final 100m isn't agonizingly slow.
+  const approachSpeed = (remainingDistance / 4.0) + 25.0;
   
-  let targetSpeed;
-  if (remainingDistance > MAX_BRAKING_DISTANCE_METERS) {
-    targetSpeed = AUTOPILOT_MAX_SPEED_METERS_PER_SECOND;
-  } else {
-    // Target velocity drops sublinearly with distance to match physical curve
-    const distanceRatio = remainingDistance / MAX_BRAKING_DISTANCE_METERS;
-    targetSpeed = AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * Math.pow(distanceRatio, 1.1);
-  }
-
-  const linearDecaySpeed = remainingDistance / 18;
-  const minBrakeTargetSpeed = Math.sqrt(Math.max(0, 2 * AUTOPILOT_BRAKE_DECELERATION * remainingDistance));
-  
-  if (remainingDistance < 1e9) {
-    targetSpeed = Math.min(targetSpeed, Math.max(linearDecaySpeed, minBrakeTargetSpeed));
-  } else {
-    targetSpeed = Math.max(targetSpeed, minBrakeTargetSpeed);
-  }
-
-  if (distanceToDestination < arrivalDistance * 2.5) {
-    targetSpeed = Math.min(targetSpeed, Math.max(8, remainingDistance * 0.24));
-  }
-
-  return clamp(targetSpeed, 0, AUTOPILOT_MAX_SPEED_METERS_PER_SECOND);
+  return clamp(approachSpeed, 0, AUTOPILOT_MAX_SPEED_METERS_PER_SECOND);
 }
 
 function getWarpEffectIntensity(currentSpeed: number): number {
@@ -474,14 +453,14 @@ function estimateAutopilotEtaSeconds(distanceToDestination: number, approachRadi
       simulatedSpeed += Math.sign(speedDelta) * maxVelocityStep;
     }
 
-    simulatedSpeed *= Math.max(0, 1 - SHIP_LINEAR_DAMPING * 0.15 * dt);
     simulatedSpeed = clamp(simulatedSpeed, 0, AUTOPILOT_MAX_SPEED_METERS_PER_SECOND);
 
     if (
       simulatedSpeed >= AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 0.999 &&
       targetSpeed >= AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 0.999
     ) {
-      const brakingDistance = AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 18;
+      // With proportional speed logic: targetSpeed < MAX_SPEED when remainingDistance / 4.0 < MAX_SPEED
+      const brakingDistance = AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 4.0;
       if (remainingDistance > brakingDistance + AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 2) {
         const cruiseDistance = remainingDistance - brakingDistance;
         const cruiseTime = cruiseDistance / simulatedSpeed;
@@ -559,10 +538,7 @@ function updateAutopilotShip(
   const currentSpeed = state.shipVelocity.length();
 
   if (distance <= arrivalDistance) {
-    state.shipVelocity.multiplyScalar(Math.max(0, 1 - 3.6 * dt));
-    if (state.shipVelocity.length() < 0.5) {
-      state.shipVelocity.set(0, 0, 0);
-    }
+    state.shipVelocity.set(0, 0, 0);
     state.position.copy(state.shipPosition);
     state.velocity.copy(state.shipVelocity);
     state.rotation.copy(state.shipRotation);
@@ -581,19 +557,41 @@ function updateAutopilotShip(
     const awayFromObstacle = state.shipPosition.clone().sub(obstacleLocalPosition);
     const centerDistance = awayFromObstacle.length();
     const surfaceDistance = centerDistance - obstacle.radius;
-    const influenceRadius = obstacle.radius + AUTOPILOT_AVOIDANCE_BUFFER_METERS;
+    // Look ahead heavily based on current speed and base avoidance buffer to steer wide and early
+    const anticipationBuffer = Math.max(AUTOPILOT_AVOIDANCE_BUFFER_METERS * 20, currentSpeed * 1.5 + AUTOPILOT_AVOIDANCE_BUFFER_METERS * 5);
+    const influenceRadius = obstacle.radius + anticipationBuffer;
 
-    if (surfaceDistance >= AUTOPILOT_AVOIDANCE_BUFFER_METERS || centerDistance >= influenceRadius) {
+    if (surfaceDistance >= anticipationBuffer || centerDistance >= influenceRadius) {
       return;
     }
 
-    const awayDirection = centerDistance > 1e-5 ? awayFromObstacle.multiplyScalar(1 / centerDistance) : targetDirection.clone().multiplyScalar(-1);
-    const obstacleDirection = obstacleLocalPosition.sub(state.shipPosition).normalize();
-    const closingBias = clamp((targetDirection.dot(obstacleDirection) + 1) * 0.5, 0.2, 1);
-    const normalizedSurfaceDistance = clamp(1 - surfaceDistance / AUTOPILOT_AVOIDANCE_BUFFER_METERS, 0, 1);
-    const kindWeight = obstacle.kind === 'star' ? 4.2 : obstacle.kind === 'planet' ? 3.4 : obstacle.kind === 'moon' ? 2.3 : 1.25;
+    const awayDirection = centerDistance > 1e-5 ? awayFromObstacle.clone().multiplyScalar(1 / centerDistance) : targetDirection.clone().multiplyScalar(-1);
+    const obstacleDirection = obstacleLocalPosition.clone().sub(state.shipPosition).normalize();
+    
+    // Find the tangential path around the obstacle that leads to the target
+    let tangentDirection = targetDirection.clone().sub(
+      obstacleDirection.clone().multiplyScalar(targetDirection.dot(obstacleDirection)),
+    );
+    
+    // If heading straight dead center into the obstacle, pick an arbitrary tangent
+    if (tangentDirection.lengthSq() < 1e-6) {
+      tangentDirection = new THREE.Vector3(0, 1, 0).cross(obstacleDirection);
+      if (tangentDirection.lengthSq() < 1e-6) {
+        tangentDirection = new THREE.Vector3(1, 0, 0).cross(obstacleDirection);
+      }
+    }
+    tangentDirection.normalize();
 
-    avoidance.addScaledVector(awayDirection, normalizedSurfaceDistance * normalizedSurfaceDistance * closingBias * kindWeight);
+    // Blend radial push (don't crash) with tangential push (slide around)
+    // Scale tangent weight based on how much speed we have (faster = steer wider)
+    const evasionDirection = awayDirection.clone().addScaledVector(tangentDirection, 3.5).normalize();
+
+    const closingBias = clamp((targetDirection.dot(obstacleDirection) + 1) * 0.5, 0.0, 1);
+    // Smoothly scale the avoidance strength as we enter the anticipation zone
+    const normalizedSurfaceDistance = Math.pow(clamp(1 - surfaceDistance / anticipationBuffer, 0, 1), 0.5);
+    const kindWeight = obstacle.kind === 'star' ? 6.0 : obstacle.kind === 'planet' ? 4.5 : obstacle.kind === 'moon' ? 3.0 : 1.5;
+
+    avoidance.addScaledVector(evasionDirection, normalizedSurfaceDistance * normalizedSurfaceDistance * closingBias * kindWeight);
   });
 
   const desiredDirection = targetDirection.clone().addScaledVector(avoidance, AUTOPILOT_AVOIDANCE_WEIGHT);
@@ -609,21 +607,36 @@ function updateAutopilotShip(
 
   const acceleration = getAutopilotAcceleration(currentSpeed);
   const brakeDeceleration = getAutopilotBrakeDeceleration(currentSpeed);
-  const targetSpeed = getAutopilotTargetSpeed(distance, arrivalDistance);
+  const absoluteTargetSpeed = getAutopilotTargetSpeed(distance, arrivalDistance);
 
-  const desiredVelocity = desiredDirection.multiplyScalar(targetSpeed);
+  // Prevent ship from blasting at maximum velocity while facing entirely the wrong direction.
+  // We throttle the target speed exponentially based on how well the ship is aligned.
+  const currentForward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
+  const headingAlignment = Math.max(0, currentForward.dot(desiredDirection));
+  const throttlingFactor = headingAlignment * headingAlignment * headingAlignment * headingAlignment;
+  const targetSpeed = absoluteTargetSpeed * Math.max(0.005, throttlingFactor);
+
+  const desiredVelocity = desiredDirection.clone().multiplyScalar(targetSpeed);
   const velocityDelta = desiredVelocity.sub(state.shipVelocity);
   const braking = targetSpeed < currentSpeed;
-  const maxVelocityStep = (braking ? brakeDeceleration : acceleration) * dt;
+  const effectiveAcceleration = braking
+    ? brakeDeceleration
+    : Math.max(acceleration, brakeDeceleration * 0.2); // Provide extra turning authority
+  const maxVelocityStep = effectiveAcceleration * dt;
   if (velocityDelta.length() > maxVelocityStep) {
     velocityDelta.setLength(maxVelocityStep);
   }
 
   state.shipVelocity.add(velocityDelta);
-  state.shipVelocity.multiplyScalar(Math.max(0, 1 - SHIP_LINEAR_DAMPING * 0.15 * dt));
 
   if (state.shipVelocity.length() > AUTOPILOT_MAX_SPEED_METERS_PER_SECOND) {
     state.shipVelocity.setLength(AUTOPILOT_MAX_SPEED_METERS_PER_SECOND);
+  }
+
+  // Safety net to smoothly finish the final millimeter without snapping past the destination
+  if (state.shipVelocity.length() * dt > remainingDistance) {
+    const safeVelocity = Math.max(0, (remainingDistance / dt) * 0.99);
+    state.shipVelocity.setLength(safeVelocity);
   }
 
   state.shipPosition.addScaledVector(state.shipVelocity, dt);
@@ -1072,7 +1085,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
         return;
       }
 
-      setAutopilotReachedDestinationId('');
+        setAutopilotReachedDestinationId('');
       setAutopilotStatus(
         autopilotEngaged ? `Autopilot retargeted to ${destination.name}.` : `Selected destination: ${destination.name}.`,
       );
