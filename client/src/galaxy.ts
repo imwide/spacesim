@@ -34,11 +34,18 @@ export interface AsteroidData {
   shape: 'boring' | 'abstract';
 }
 
+export interface DustAsteroidData {
+  position: GalaxyVec3;
+  size: number;
+  rotation: GalaxyVec3;
+}
+
 export interface AsteroidGroupData {
   id: string;
   position: GalaxyVec3;
   radius: number;
   asteroids: AsteroidData[];
+  dust: DustAsteroidData[];
   station: StationData;
 }
 
@@ -262,12 +269,23 @@ function createAsteroidGroup(random: () => number, id: string): AsteroidGroupDat
   const angle = random() * Math.PI * 2;
   const asteroidCount = buildAsteroidCount(random);
   const radius = 2_000 + random() * 4_000;
+  const dustCount = 1000;
+  const dust: DustAsteroidData[] = Array.from({ length: dustCount }, () => {
+    const dAngle = random() * Math.PI * 2;
+    const dRadius = Math.pow(random(), 0.7) * radius * 1.2;
+    return {
+      position: [Math.cos(dAngle) * dRadius, (random() - 0.5) * Math.max(radius * 0.25, 400), Math.sin(dAngle) * dRadius],
+      size: 1 + random() * 9,
+      rotation: [random() * Math.PI, random() * Math.PI, random() * Math.PI],
+    };
+  });
 
   return {
     id,
     position: [Math.cos(angle) * orbitRadius, (random() - 0.5) * 8_000, Math.sin(angle) * orbitRadius],
     radius,
     asteroids: Array.from({ length: asteroidCount }, (_, index) => createAsteroid(random, id, index + 1, radius)),
+    dust,
     station: createStation(
       random,
       `${id}-station`,

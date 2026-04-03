@@ -9,6 +9,7 @@ import {
   STAR_VISIBILITY_RANGE,
   type AsteroidData,
   type AsteroidGroupData,
+  type DustAsteroidData,
   type GalaxyData,
   type MoonData,
   type PlanetData,
@@ -105,6 +106,7 @@ interface HudState {
   connected: boolean;
   mode: Mode;
   speed: number;
+  shipSpeed: number;
   prompt: string;
   playersOnline: number;
 }
@@ -118,6 +120,26 @@ interface StationNode {
   localPosition: Vec3Tuple;
   mapPosition: [number, number];
   linkedStationIds: string[];
+}
+
+type AutopilotDestinationKind = StationKind | 'asteroid-object';
+
+interface AutopilotDestination {
+  id: string;
+  name: string;
+  kind: AutopilotDestinationKind;
+  systemId: string;
+  systemName: string;
+  localPosition: Vec3Tuple;
+  approachRadius: number;
+  distanceFromShip: number;
+}
+
+interface AutopilotObstacle {
+  id: string;
+  kind: 'star' | 'planet' | 'moon' | 'asteroid';
+  position: Vec3Tuple;
+  radius: number;
 }
 
 interface LocalGameState {
@@ -142,6 +164,22 @@ interface LocalGameState {
 const AUTH_STORAGE_KEY = 'spacesim.auth';
 const seatPosition = new THREE.Vector3(0, 1.2, -3.2);
 const pilotCameraOffset = new THREE.Vector3(0, 1.45, -3.05);
+const AUTOPILOT_REACH_DISTANCE_METERS = 250;
+const AUTOPILOT_TURN_RESPONSE = 2.6;
+const METERS_PER_LIGHT_YEAR = 9_460_730_472_580_800;
+const AUTOPILOT_ACCELERATION = SHIP_THRUST_ACCELERATION * 1.18;
+const AUTOPILOT_BRAKE_DECELERATION = SHIP_THRUST_ACCELERATION * 1.4;
+const AUTOPILOT_MAX_SPEED_METERS_PER_SECOND = 0.1 * METERS_PER_LIGHT_YEAR;
+const AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND = 0.01 * METERS_PER_LIGHT_YEAR;
+const AUTOPILOT_AVOIDANCE_WEIGHT = 1.9;
+const AUTOPILOT_AVOIDANCE_BUFFER_METERS = 1_600;
+const AUTOPILOT_ASTEROID_OBSTACLE_LIMIT = 120;
+const AUTOPILOT_TARGET_ASTEROID_MIN_SIZE = 20;
+const AUTOPILOT_TARGET_SURFACE_BUFFER_METERS = 140;
+const TARGET_OUTLINE_PULSE_SPEED = 3.6;
+const AUTOPILOT_ACCELERATION_CURVE_AMPLITUDE = 650_000_000_000_000;
+const AUTOPILOT_ETA_SIMULATION_STEP_SECONDS = 0.1;
+const AUTOPILOT_ETA_MAX_SIMULATION_STEPS = 120_000;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -259,6 +297,352 @@ function buildStationNetwork(galaxy: GalaxyData): StationNode[] {
   });
 
   return nodes;
+}
+
+function buildAutopilotObstacles(system: StarSystemData): AutopilotObstacle[] {
+  const asteroidObstacles = system.asteroidGroups
+    .flatMap((group) =>
+      group.asteroids.map((asteroid) => ({
+        id: asteroid.id,
+        kind: 'asteroid' as const,
+        position: tupleAdd(group.position, asteroid.position),
+        radius: Math.max(asteroid.size * 0.9, 18),
+      })),
+    )
+    .sort((left, right) => right.radius - left.radius)
+    .slice(0, AUTOPILOT_ASTEROID_OBSTACLE_LIMIT);
+
+  return [
+    {
+      id: `${system.id}-star-core`,
+      kind: 'star',
+      position: [0, 0, 0],
+      radius: system.radius,
+    },
+    ...system.planets.flatMap((planet) => [
+      {
+        id: planet.id,
+        kind: 'planet' as const,
+        position: planet.position,
+        radius: planet.radius,
+      },
+      ...planet.moons.map((moon) => ({
+        id: moon.id,
+        kind: 'moon' as const,
+        position: tupleAdd(planet.position, moon.position),
+        radius: moon.radius,
+      })),
+    ]),
+    ...asteroidObstacles,
+  ];
+}
+
+function buildAutopilotDestinations(
+  system: StarSystemData | null,
+  stations: StationNode[],
+  shipPosition: THREE.Vector3,
+  frameOrigin: Vec3Tuple,
+): AutopilotDestination[] {
+  const stationDestinations: AutopilotDestination[] = [...stations].sort((left, right) => left.name.localeCompare(right.name)).map((station) => ({
+    id: station.id,
+    name: station.name,
+    kind: station.kind,
+    systemId: station.systemId,
+    systemName: station.systemName,
+    localPosition: station.localPosition,
+    approachRadius:
+      station.kind === 'star'
+        ? 180
+        : station.kind === 'planet'
+          ? 110
+          : 80,
+    distanceFromShip: shipPosition.distanceTo(vectorFromTuple(toFrameLocalPosition(station.localPosition, frameOrigin))),
+  }));
+
+  if (!system) {
+    return stationDestinations;
+  }
+
+  const asteroidDestinations: AutopilotDestination[] = system.asteroidGroups
+    .flatMap((group, groupIndex) =>
+      group.asteroids
+        .filter((asteroid) => asteroid.size >= AUTOPILOT_TARGET_ASTEROID_MIN_SIZE)
+        .map((asteroid, asteroidIndex) => {
+          const localPosition = tupleAdd(group.position, asteroid.position);
+          const distanceFromShip = shipPosition.distanceTo(vectorFromTuple(toFrameLocalPosition(localPosition, frameOrigin)));
+          return {
+            id: asteroid.id,
+            name: `${system.name} Asteroid G${groupIndex + 1}-${asteroidIndex + 1} · ${Math.round(asteroid.size)} m`,
+            kind: 'asteroid-object' as const,
+            systemId: system.id,
+            systemName: system.name,
+            localPosition,
+            approachRadius: Math.max(asteroid.size * 0.7, AUTOPILOT_TARGET_ASTEROID_MIN_SIZE * 0.6),
+            distanceFromShip,
+          } satisfies AutopilotDestination;
+        }),
+    )
+    .sort((left, right) => left.distanceFromShip - right.distanceFromShip);
+
+  return [...stationDestinations, ...asteroidDestinations];
+}
+
+function getAutopilotCurveBoost(currentSpeed: number): number {
+  const speedRatio = clamp(currentSpeed / AUTOPILOT_MAX_SPEED_METERS_PER_SECOND, 0, 1);
+  // Left tail of normal distribution-like polynomial curve (peaks right before max speed and flattens out)
+  const curve = speedRatio * Math.pow(1 - Math.max(0, speedRatio), 0.25);
+  return AUTOPILOT_ACCELERATION_CURVE_AMPLITUDE * curve;
+}
+
+function getAutopilotAcceleration(currentSpeed: number): number {
+  return AUTOPILOT_ACCELERATION + getAutopilotCurveBoost(currentSpeed);
+}
+
+function getAutopilotBrakeDeceleration(currentSpeed: number): number {
+  return AUTOPILOT_BRAKE_DECELERATION + getAutopilotCurveBoost(currentSpeed);
+}
+
+function getAutopilotTargetSpeed(distanceToDestination: number, arrivalDistance: number): number {
+  const remainingDistance = Math.max(0, distanceToDestination - arrivalDistance);
+  
+  // The ship's non-linear braking curve requires approximately 1.75e15 meters
+  // to come to a full stop from max speed.
+  const MAX_BRAKING_DISTANCE_METERS = 1.75e15;
+  
+  let targetSpeed;
+  if (remainingDistance > MAX_BRAKING_DISTANCE_METERS) {
+    targetSpeed = AUTOPILOT_MAX_SPEED_METERS_PER_SECOND;
+  } else {
+    // Target velocity drops sublinearly with distance to match physical curve
+    const distanceRatio = remainingDistance / MAX_BRAKING_DISTANCE_METERS;
+    targetSpeed = AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * Math.pow(distanceRatio, 1.1);
+  }
+
+  const linearDecaySpeed = remainingDistance / 18;
+  const minBrakeTargetSpeed = Math.sqrt(Math.max(0, 2 * AUTOPILOT_BRAKE_DECELERATION * remainingDistance));
+  
+  if (remainingDistance < 1e9) {
+    targetSpeed = Math.min(targetSpeed, Math.max(linearDecaySpeed, minBrakeTargetSpeed));
+  } else {
+    targetSpeed = Math.max(targetSpeed, minBrakeTargetSpeed);
+  }
+
+  if (distanceToDestination < arrivalDistance * 2.5) {
+    targetSpeed = Math.min(targetSpeed, Math.max(8, remainingDistance * 0.24));
+  }
+
+  return clamp(targetSpeed, 0, AUTOPILOT_MAX_SPEED_METERS_PER_SECOND);
+}
+
+function getWarpEffectIntensity(currentSpeed: number): number {
+  return clamp(
+    (currentSpeed - AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND) /
+      (AUTOPILOT_MAX_SPEED_METERS_PER_SECOND - AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND),
+    0,
+    1,
+  );
+}
+
+function estimateAutopilotEtaSeconds(distanceToDestination: number, approachRadius: number, currentSpeed: number): number {
+  const arrivalDistance = Math.max(
+    AUTOPILOT_REACH_DISTANCE_METERS,
+    approachRadius + AUTOPILOT_TARGET_SURFACE_BUFFER_METERS,
+  );
+  let remainingDistance = Math.max(0, distanceToDestination - arrivalDistance);
+
+  if (remainingDistance <= 0) {
+    return 0;
+  }
+
+  let simulatedSpeed = Math.max(0, currentSpeed);
+  let elapsed = 0;
+
+  for (let step = 0; step < AUTOPILOT_ETA_MAX_SIMULATION_STEPS && remainingDistance > 0; step += 1) {
+    const dt =
+      simulatedSpeed > AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND * 0.5
+        ? 0.25
+        : AUTOPILOT_ETA_SIMULATION_STEP_SECONDS;
+    const targetSpeed = getAutopilotTargetSpeed(remainingDistance + arrivalDistance, arrivalDistance);
+    const accelerating = targetSpeed >= simulatedSpeed;
+    const maxVelocityStep =
+      (accelerating ? getAutopilotAcceleration(simulatedSpeed) : getAutopilotBrakeDeceleration(simulatedSpeed)) * dt;
+    const speedDelta = targetSpeed - simulatedSpeed;
+
+    if (Math.abs(speedDelta) <= maxVelocityStep) {
+      simulatedSpeed = targetSpeed;
+    } else {
+      simulatedSpeed += Math.sign(speedDelta) * maxVelocityStep;
+    }
+
+    simulatedSpeed *= Math.max(0, 1 - SHIP_LINEAR_DAMPING * 0.15 * dt);
+    simulatedSpeed = clamp(simulatedSpeed, 0, AUTOPILOT_MAX_SPEED_METERS_PER_SECOND);
+
+    if (
+      simulatedSpeed >= AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 0.999 &&
+      targetSpeed >= AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 0.999
+    ) {
+      const brakingDistance = AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 18;
+      if (remainingDistance > brakingDistance + AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 2) {
+        const cruiseDistance = remainingDistance - brakingDistance;
+        const cruiseTime = cruiseDistance / simulatedSpeed;
+        elapsed += cruiseTime;
+        remainingDistance = brakingDistance;
+        continue;
+      }
+    }
+
+    remainingDistance = Math.max(0, remainingDistance - simulatedSpeed * dt);
+    elapsed += dt;
+  }
+
+  return remainingDistance <= 0 ? elapsed : elapsed + remainingDistance / Math.max(simulatedSpeed, 1);
+}
+
+function formatEta(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return 'Arriving';
+  }
+
+  if (seconds < 10) {
+    return `${seconds.toFixed(1)}s`;
+  }
+
+  const rounded = Math.ceil(seconds);
+  const minutes = Math.floor(rounded / 60);
+  const secs = rounded % 60;
+
+  if (minutes <= 0) {
+    return `${rounded}s`;
+  }
+
+  return secs === 0 ? `${minutes}m` : `${minutes}m ${secs}s`;
+}
+
+function formatSpeed(speed: number): string {
+  if (speed >= AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND * 0.1) {
+    return `${(speed / METERS_PER_LIGHT_YEAR).toFixed(speed >= AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND ? 4 : 6)} ly/s`;
+  }
+
+  return `${speed.toFixed(1)} m/s`;
+}
+
+function createShipFacingQuaternion(forward: THREE.Vector3): THREE.Quaternion {
+  const safeForward = forward.lengthSq() > 1e-8 ? forward.clone().normalize() : new THREE.Vector3(0, 0, -1);
+  const zAxis = safeForward.clone().multiplyScalar(-1);
+  let xAxis = new THREE.Vector3(0, 1, 0).cross(zAxis);
+
+  if (xAxis.lengthSq() < 1e-8) {
+    xAxis = new THREE.Vector3(1, 0, 0).cross(zAxis);
+  }
+
+  xAxis.normalize();
+  const yAxis = zAxis.clone().cross(xAxis).normalize();
+
+  return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(xAxis, yAxis, zAxis));
+}
+
+function updateAutopilotShip(
+  state: LocalGameState,
+  dt: number,
+  destination: AutopilotDestination,
+  frameOrigin: Vec3Tuple,
+  obstacles: AutopilotObstacle[],
+): { arrived: boolean; distance: number } {
+  const destinationLocalPosition = vectorFromTuple(toFrameLocalPosition(destination.localPosition, frameOrigin));
+  const toTarget = destinationLocalPosition.sub(state.shipPosition);
+  const distance = toTarget.length();
+  const arrivalDistance = Math.max(
+    AUTOPILOT_REACH_DISTANCE_METERS,
+    destination.approachRadius + AUTOPILOT_TARGET_SURFACE_BUFFER_METERS,
+  );
+  const remainingDistance = Math.max(0, distance - arrivalDistance);
+  const currentSpeed = state.shipVelocity.length();
+
+  if (distance <= arrivalDistance) {
+    state.shipVelocity.multiplyScalar(Math.max(0, 1 - 3.6 * dt));
+    if (state.shipVelocity.length() < 0.5) {
+      state.shipVelocity.set(0, 0, 0);
+    }
+    state.position.copy(state.shipPosition);
+    state.velocity.copy(state.shipVelocity);
+    state.rotation.copy(state.shipRotation);
+    return { arrived: true, distance };
+  }
+
+  const targetDirection = toTarget.normalize();
+  const avoidance = new THREE.Vector3();
+
+  obstacles.forEach((obstacle) => {
+    if (obstacle.id === destination.id) {
+      return;
+    }
+
+    const obstacleLocalPosition = vectorFromTuple(toFrameLocalPosition(obstacle.position, frameOrigin));
+    const awayFromObstacle = state.shipPosition.clone().sub(obstacleLocalPosition);
+    const centerDistance = awayFromObstacle.length();
+    const surfaceDistance = centerDistance - obstacle.radius;
+    const influenceRadius = obstacle.radius + AUTOPILOT_AVOIDANCE_BUFFER_METERS;
+
+    if (surfaceDistance >= AUTOPILOT_AVOIDANCE_BUFFER_METERS || centerDistance >= influenceRadius) {
+      return;
+    }
+
+    const awayDirection = centerDistance > 1e-5 ? awayFromObstacle.multiplyScalar(1 / centerDistance) : targetDirection.clone().multiplyScalar(-1);
+    const obstacleDirection = obstacleLocalPosition.sub(state.shipPosition).normalize();
+    const closingBias = clamp((targetDirection.dot(obstacleDirection) + 1) * 0.5, 0.2, 1);
+    const normalizedSurfaceDistance = clamp(1 - surfaceDistance / AUTOPILOT_AVOIDANCE_BUFFER_METERS, 0, 1);
+    const kindWeight = obstacle.kind === 'star' ? 4.2 : obstacle.kind === 'planet' ? 3.4 : obstacle.kind === 'moon' ? 2.3 : 1.25;
+
+    avoidance.addScaledVector(awayDirection, normalizedSurfaceDistance * normalizedSurfaceDistance * closingBias * kindWeight);
+  });
+
+  const desiredDirection = targetDirection.clone().addScaledVector(avoidance, AUTOPILOT_AVOIDANCE_WEIGHT);
+  if (desiredDirection.lengthSq() < 1e-8) {
+    desiredDirection.copy(targetDirection);
+  } else {
+    desiredDirection.normalize();
+  }
+
+  const desiredRotation = createShipFacingQuaternion(desiredDirection);
+  state.shipRotation.slerp(desiredRotation, 1 - Math.exp(-AUTOPILOT_TURN_RESPONSE * dt));
+  state.rotation.copy(state.shipRotation);
+
+  const acceleration = getAutopilotAcceleration(currentSpeed);
+  const brakeDeceleration = getAutopilotBrakeDeceleration(currentSpeed);
+  const targetSpeed = getAutopilotTargetSpeed(distance, arrivalDistance);
+
+  const desiredVelocity = desiredDirection.multiplyScalar(targetSpeed);
+  const velocityDelta = desiredVelocity.sub(state.shipVelocity);
+  const braking = targetSpeed < currentSpeed;
+  const maxVelocityStep = (braking ? brakeDeceleration : acceleration) * dt;
+  if (velocityDelta.length() > maxVelocityStep) {
+    velocityDelta.setLength(maxVelocityStep);
+  }
+
+  state.shipVelocity.add(velocityDelta);
+  state.shipVelocity.multiplyScalar(Math.max(0, 1 - SHIP_LINEAR_DAMPING * 0.15 * dt));
+
+  if (state.shipVelocity.length() > AUTOPILOT_MAX_SPEED_METERS_PER_SECOND) {
+    state.shipVelocity.setLength(AUTOPILOT_MAX_SPEED_METERS_PER_SECOND);
+  }
+
+  state.shipPosition.addScaledVector(state.shipVelocity, dt);
+  state.position.copy(state.shipPosition);
+  state.velocity.copy(state.shipVelocity);
+
+  return { arrived: false, distance };
+}
+
+function settleShipVelocity(state: LocalGameState, dt: number): void {
+  const shipDampFactor = Math.max(0, 1 - SHIP_LINEAR_DAMPING * dt);
+  state.shipVelocity.multiplyScalar(shipDampFactor);
+  if (state.shipVelocity.length() < 0.2) {
+    state.shipVelocity.set(0, 0, 0);
+  }
+  state.shipPosition.addScaledVector(state.shipVelocity, dt);
+  state.position.copy(state.shipPosition);
+  state.velocity.copy(state.shipVelocity);
+  state.rotation.copy(state.shipRotation);
 }
 
 function createLocalState(frameSystemId: string): LocalGameState {
@@ -462,14 +846,58 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
   const [activeSystemId, setActiveSystemId] = useState(homeSystemId);
   const [activeFrameOrigin, setActiveFrameOrigin] = useState<Vec3Tuple>(homeStation?.localPosition ?? [0, 0, 0]);
   const [tabletOpen, setTabletOpen] = useState(false);
+  const [autopilotDestinationId, setAutopilotDestinationId] = useState('');
+  const [autopilotEngaged, setAutopilotEngaged] = useState(false);
+  const [autopilotReachedDestinationId, setAutopilotReachedDestinationId] = useState('');
+  const [autopilotStatus, setAutopilotStatus] = useState('Select a destination from inside the ship to engage autopilot.');
   const [hud, setHud] = useState<HudState>({
     connected: false,
     mode: 'space',
     speed: 0,
+    shipSpeed: 0,
     prompt: 'Connecting to the sector…',
     playersOnline: 1,
   });
+  const activeSystem = useMemo(
+    () => galaxy.systems.find((system) => system.id === activeSystemId) ?? null,
+    [activeSystemId, galaxy.systems],
+  );
   const localStateRef = useRef<LocalGameState>(createLocalState(homeSystemId));
+  const shipPositionForSort = localStateRef.current.shipPosition;
+  const currentSystemStations = useMemo(
+    () => stationNetwork.filter((station) => station.systemId === activeSystemId),
+    [activeSystemId, stationNetwork],
+  );
+  const autopilotDestinations = useMemo(
+    () => buildAutopilotDestinations(activeSystem, currentSystemStations, shipPositionForSort, activeFrameOrigin),
+    [activeFrameOrigin, activeSystem, currentSystemStations, hud.shipSpeed, shipPositionForSort],
+  );
+  const autopilotDestination = useMemo(
+    () => autopilotDestinations.find((destination) => destination.id === autopilotDestinationId) ?? autopilotDestinations[0] ?? null,
+    [autopilotDestinationId, autopilotDestinations],
+  );
+  // Refresh the ETA countdown every 5 seconds (5000 milliseconds)
+  const currentTimestampForEta = Math.floor(Date.now() / 5000) * 5000;
+  const autopilotEtaLabel = useMemo(() => {
+    if (!autopilotDestination) {
+      return '—';
+    }
+
+    const destinationLocalPosition = vectorFromTuple(toFrameLocalPosition(autopilotDestination.localPosition, activeFrameOrigin));
+    const liveDistance = destinationLocalPosition.distanceTo(localStateRef.current.shipPosition);
+
+    return formatEta(
+      estimateAutopilotEtaSeconds(
+        liveDistance,
+        autopilotDestination.approachRadius,
+        localStateRef.current.shipVelocity.length(),
+      ),
+    );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeFrameOrigin, autopilotDestination?.id, currentTimestampForEta]);
+  const autopilotObstacles = useMemo(() => (activeSystem ? buildAutopilotObstacles(activeSystem) : []), [activeSystem]);
+  const highlightedAsteroidTargetId =
+    autopilotDestination?.kind === 'asteroid-object' && autopilotDestination.id !== autopilotReachedDestinationId ? autopilotDestination.id : '';
   const socketRef = useRef<Socket | null>(null);
   const sendState = useCallback((payload: PlayerSnapshot) => {
     socketRef.current?.emit('state:update', payload);
@@ -488,6 +916,27 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     setActiveSystemId(homeStation.systemId);
     setActiveFrameOrigin(homeStation.localPosition);
   }, [homeStation]);
+
+  useEffect(() => {
+    setAutopilotDestinationId((current) => {
+      if (autopilotDestinations.some((destination) => destination.id === current)) {
+        return current;
+      }
+
+      return autopilotDestinations[0]?.id ?? '';
+    });
+
+    if (autopilotDestinations.length === 0) {
+      setAutopilotEngaged(false);
+      setAutopilotReachedDestinationId('');
+    }
+  }, [autopilotDestinations]);
+
+  useEffect(() => {
+    if (hud.mode === 'space') {
+      setAutopilotEngaged(false);
+    }
+  }, [hud.mode]);
 
   useEffect(() => {
     const socket = io('/', {
@@ -597,23 +1046,57 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
       setActiveSystemId(station.systemId);
       setActiveFrameOrigin(station.localPosition);
       setTabletOpen(false);
+      setAutopilotEngaged(false);
+      setAutopilotReachedDestinationId('');
+      setAutopilotStatus('Select a destination from inside the ship to engage autopilot.');
       setHud((current) => ({ ...current, prompt: `Fast-traveled to ${station.name}.` }));
     },
     [sendState],
   );
+
+  const handleEngageAutopilot = useCallback(() => {
+    if (!autopilotDestination || hud.mode === 'space') {
+      return;
+    }
+
+    setAutopilotEngaged(true);
+    setAutopilotReachedDestinationId('');
+    setAutopilotStatus(`Autopilot engaged for ${autopilotDestination.name}.`);
+  }, [autopilotDestination, hud.mode]);
+
+  const handleAutopilotDestinationChange = useCallback(
+    (destinationId: string) => {
+      setAutopilotDestinationId(destinationId);
+      const destination = autopilotDestinations.find((entry) => entry.id === destinationId);
+      if (!destination) {
+        return;
+      }
+
+      setAutopilotReachedDestinationId('');
+      setAutopilotStatus(
+        autopilotEngaged ? `Autopilot retargeted to ${destination.name}.` : `Selected destination: ${destination.name}.`,
+      );
+    },
+    [autopilotDestinations, autopilotEngaged],
+  );
+
+  const handleDisengageAutopilot = useCallback(() => {
+    setAutopilotEngaged(false);
+    setAutopilotStatus('Autopilot disengaged.');
+  }, []);
 
   const controls = useMemo(() => {
     switch (hud.mode) {
       case 'interior':
         return [
           'Move with WASD while gravity keeps you grounded inside the ship.',
-          'Press F near the pilot seat to take control of the ship.',
-          'Press X at any time to exit back into space, or T to open the Space-Tablet.',
+          'Press F near the pilot seat to sit down and monitor the autopilot view.',
+          'Use the autopilot panel to pick a destination, or press X to exit back into space.',
         ];
       case 'pilot':
         return [
-          'W/S thrust the ship forward or backward in the direction you face.',
-          'A/D strafes and Space/Shift move the ship up or down.',
+          'The pilot seat now operates autopilot only; the ship handles turning and thrust automatically.',
+          'Pick a destination in the autopilot panel and the ship will fly there, slowing itself near arrival.',
           'Press X to stand up and return to the interior. Press T for the Space-Tablet.',
         ];
       default:
@@ -634,9 +1117,18 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
         <pointLight intensity={10} distance={120} position={[0, 0, 0]} color="#60a5fa" />
         <GameScene
           activeFrameOrigin={activeFrameOrigin}
+          autopilotActive={autopilotEngaged}
+          autopilotDestination={autopilotDestination}
+          autopilotEtaLabel={autopilotEtaLabel}
+          autopilotObstacles={autopilotObstacles}
           activeSystemId={activeSystemId}
           galaxy={galaxy}
+          highlightedAsteroidTargetId={highlightedAsteroidTargetId}
+          mode={hud.mode}
+          onAutopilotArrival={setAutopilotReachedDestinationId}
           localStateRef={localStateRef}
+          onAutopilotStatusChange={setAutopilotStatus}
+          onAutopilotToggle={setAutopilotEngaged}
           playersOnline={remotePlayers.length + (selfId ? 1 : 0)}
           remotePlayers={remotePlayers}
           sendState={sendState}
@@ -659,7 +1151,11 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
             </div>
             <div>
               <span>Speed</span>
-              {hud.speed.toFixed(1)} m/s
+              {formatSpeed(hud.speed)}
+            </div>
+            <div>
+              <span>Ship</span>
+              {formatSpeed(hud.shipSpeed)}
             </div>
             <div>
               <span>Players</span>
@@ -674,6 +1170,20 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
         <div className="hud-banner">{hud.prompt}</div>
 
         {!tabletOpen ? <div className="crosshair" /> : null}
+
+        {hud.mode !== 'space' && !tabletOpen ? (
+          <AutopilotPanel
+            active={autopilotEngaged}
+            destinations={autopilotDestinations}
+            onDestinationChange={handleAutopilotDestinationChange}
+            onEngage={handleEngageAutopilot}
+            onStop={handleDisengageAutopilot}
+            selectedDestination={autopilotDestination}
+            selectedDestinationId={autopilotDestination?.id ?? ''}
+            selectedEtaLabel={autopilotEtaLabel}
+            status={autopilotStatus}
+          />
+        ) : null}
 
         <div className="hud-bottom">
           <strong>Controls</strong>
@@ -699,9 +1209,18 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
 
 function GameScene({
   activeFrameOrigin,
+  autopilotActive,
+  autopilotDestination,
+  autopilotEtaLabel,
+  autopilotObstacles,
   activeSystemId,
   galaxy,
+  highlightedAsteroidTargetId,
+  mode,
   localStateRef,
+  onAutopilotArrival,
+  onAutopilotStatusChange,
+  onAutopilotToggle,
   playersOnline,
   remotePlayers,
   sendState,
@@ -709,9 +1228,18 @@ function GameScene({
   tabletOpen,
 }: {
   activeFrameOrigin: Vec3Tuple;
+  autopilotActive: boolean;
+  autopilotDestination: AutopilotDestination | null;
+  autopilotEtaLabel: string;
+  autopilotObstacles: AutopilotObstacle[];
   activeSystemId: string;
   galaxy: GalaxyData;
+  highlightedAsteroidTargetId: string;
+  mode: Mode;
   localStateRef: MutableRefObject<LocalGameState>;
+  onAutopilotArrival: Dispatch<SetStateAction<string>>;
+  onAutopilotStatusChange: Dispatch<SetStateAction<string>>;
+  onAutopilotToggle: Dispatch<SetStateAction<boolean>>;
   playersOnline: number;
   remotePlayers: PlayerSnapshot[];
   sendState: (payload: PlayerSnapshot) => void;
@@ -748,6 +1276,10 @@ function GameScene({
       }
 
       const state = localStateRef.current;
+      if (state.mode === 'pilot') {
+        return;
+      }
+
       state.yaw -= event.movementX * 0.0025;
       state.pitch = clamp(state.pitch - event.movementY * 0.0025, -Math.PI / 2.1, Math.PI / 2.1);
     };
@@ -790,12 +1322,13 @@ function GameScene({
     const keys = pressedKeys.current;
     const movementEnabled = !tabletOpen;
     const lookRotation = new THREE.Quaternion().setFromEuler(new THREE.Euler(state.pitch, state.yaw, 0, 'YXZ'));
+    const autopilotAvailable = autopilotActive && Boolean(autopilotDestination) && state.mode !== 'space';
 
     if (state.mode === 'space') {
       state.rotation.copy(lookRotation);
       const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.rotation);
       const right = new THREE.Vector3(1, 0, 0).applyQuaternion(state.rotation);
-      const up = new THREE.Vector3(0, 1, 0).applyQuaternion(state.rotation);
+      const moveUp = new THREE.Vector3(0, 1, 0);
       const hasDirectionalInput =
         movementEnabled &&
         (keys.has('KeyW') ||
@@ -819,10 +1352,10 @@ function GameScene({
         state.velocity.addScaledVector(right, EVA_THRUST_ACCELERATION * dt);
       }
       if (movementEnabled && keys.has('Space')) {
-        state.velocity.addScaledVector(up, EVA_THRUST_ACCELERATION * dt);
+        state.velocity.addScaledVector(moveUp, EVA_THRUST_ACCELERATION * dt);
       }
       if (movementEnabled && (keys.has('ShiftLeft') || keys.has('ShiftRight'))) {
-        state.velocity.addScaledVector(up, -EVA_THRUST_ACCELERATION * dt);
+        state.velocity.addScaledVector(moveUp, -EVA_THRUST_ACCELERATION * dt);
       }
 
       const speed = state.velocity.length();
@@ -851,6 +1384,17 @@ function GameScene({
         state.interiorVelocity.set(0, 0, 0);
       }
     } else if (state.mode === 'interior') {
+      if (autopilotAvailable && autopilotDestination) {
+        const autopilotStep = updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles);
+        if (autopilotStep.arrived) {
+          onAutopilotArrival(autopilotDestination.id);
+          onAutopilotToggle(false);
+          onAutopilotStatusChange(`Destination reached: ${autopilotDestination.name}.`);
+        }
+      } else {
+        settleShipVelocity(state, dt);
+      }
+
       const localLook = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, state.yaw, 0, 'YXZ'));
       const walkForward = new THREE.Vector3(0, 0, -1).applyQuaternion(localLook);
       const walkRight = new THREE.Vector3(1, 0, 0).applyQuaternion(localLook);
@@ -912,54 +1456,20 @@ function GameScene({
         state.insideShip = false;
         state.position.copy(state.shipPosition).add(exitOffset);
         state.velocity.copy(state.shipVelocity);
+        onAutopilotToggle(false);
+        onAutopilotStatusChange('Autopilot disengaged.');
       }
     } else {
-      state.shipRotation.copy(lookRotation);
-      state.rotation.copy(state.shipRotation);
-      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
-      const right = new THREE.Vector3(1, 0, 0).applyQuaternion(state.shipRotation);
-      const up = new THREE.Vector3(0, 1, 0).applyQuaternion(state.shipRotation);
-      const hasShipDirectionalInput =
-        movementEnabled &&
-        (keys.has('KeyW') ||
-          keys.has('KeyS') ||
-          keys.has('KeyA') ||
-          keys.has('KeyD') ||
-          keys.has('Space') ||
-          keys.has('ShiftLeft') ||
-          keys.has('ShiftRight'));
-
-      if (movementEnabled && keys.has('KeyW')) {
-        state.shipVelocity.addScaledVector(forward, SHIP_THRUST_ACCELERATION * dt);
+      if (autopilotAvailable && autopilotDestination) {
+        const autopilotStep = updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles);
+        if (autopilotStep.arrived) {
+          onAutopilotArrival(autopilotDestination.id);
+          onAutopilotToggle(false);
+          onAutopilotStatusChange(`Destination reached: ${autopilotDestination.name}.`);
+        }
+      } else {
+        settleShipVelocity(state, dt);
       }
-      if (movementEnabled && keys.has('KeyS')) {
-        state.shipVelocity.addScaledVector(forward, -SHIP_THRUST_ACCELERATION * dt);
-      }
-      if (movementEnabled && keys.has('KeyA')) {
-        state.shipVelocity.addScaledVector(right, -SHIP_THRUST_ACCELERATION * dt);
-      }
-      if (movementEnabled && keys.has('KeyD')) {
-        state.shipVelocity.addScaledVector(right, SHIP_THRUST_ACCELERATION * dt);
-      }
-      if (movementEnabled && keys.has('Space')) {
-        state.shipVelocity.addScaledVector(up, SHIP_THRUST_ACCELERATION * dt);
-      }
-      if (movementEnabled && (keys.has('ShiftLeft') || keys.has('ShiftRight'))) {
-        state.shipVelocity.addScaledVector(up, -SHIP_THRUST_ACCELERATION * dt);
-      }
-
-      if (state.shipVelocity.length() > SHIP_MAX_SPEED_METERS_PER_SECOND) {
-        state.shipVelocity.setLength(SHIP_MAX_SPEED_METERS_PER_SECOND);
-      }
-
-      if (!hasShipDirectionalInput) {
-        const shipDampFactor = Math.max(0, 1 - SHIP_LINEAR_DAMPING * dt);
-        state.shipVelocity.multiplyScalar(shipDampFactor);
-      }
-
-      state.shipPosition.addScaledVector(state.shipVelocity, dt);
-      state.position.copy(state.shipPosition);
-      state.velocity.copy(state.shipVelocity);
 
       const cockpitOffset = pilotCameraOffset.clone().applyQuaternion(state.shipRotation);
       camera.position.copy(state.shipPosition).add(cockpitOffset);
@@ -973,6 +1483,7 @@ function GameScene({
     }
 
     if (shipGroupRef.current) {
+      shipGroupRef.current.visible = state.mode !== 'pilot';
       shipGroupRef.current.position.copy(state.shipPosition);
       shipGroupRef.current.quaternion.copy(state.shipRotation);
     }
@@ -992,7 +1503,8 @@ function GameScene({
       const boardingDistance = state.position.distanceTo(state.shipPosition);
       const canEnter = state.mode === 'space' && boardingDistance < BOARDING_DISTANCE_METERS;
       const canPilot = state.mode === 'interior' && state.interiorPosition.distanceTo(seatPosition) < SEAT_INTERACTION_DISTANCE_METERS;
-      const speed = state.mode === 'pilot' ? state.shipVelocity.length() : state.mode === 'space' ? state.velocity.length() : walkSpeed(state);
+      const shipSpeed = state.shipVelocity.length();
+      const speed = state.mode === 'pilot' ? shipSpeed : state.mode === 'space' ? state.velocity.length() : walkSpeed(state);
 
       let prompt = pointerLocked
         ? 'WASD to move, Space/Shift for vertical thrust. Momentum is preserved.'
@@ -1004,10 +1516,15 @@ function GameScene({
         prompt = 'Press E to enter your ship.';
       }
       if (state.mode === 'interior') {
-        prompt = canPilot ? 'Press F near the seat to pilot, or X to spacewalk.' : 'Explore the ship interior with WASD. Press X to exit.';
+        prompt = canPilot ? 'Press F near the seat to sit down, or use the autopilot panel to select a destination.' : 'Explore the ship interior with WASD. Use the autopilot panel or press X to exit.';
       }
       if (state.mode === 'pilot') {
-        prompt = 'Pilot engaged. Press X to stand up from the seat.';
+        prompt = autopilotActive && autopilotDestination
+          ? `Autopilot en route to ${autopilotDestination.name}. ETA ${autopilotEtaLabel}. Press X to stand up from the seat.`
+          : 'Pilot seat engaged. Select a destination in the autopilot panel, or press X to stand up.';
+      }
+      if (state.mode !== 'space' && autopilotActive && autopilotDestination) {
+        prompt = `Autopilot en route to ${autopilotDestination.name}. ETA ${autopilotEtaLabel}. Arrival threshold: ${AUTOPILOT_REACH_DISTANCE_METERS} m.`;
       }
       if (tabletOpen) {
         prompt = 'Space-Tablet open. Select any station in the network to fast travel.';
@@ -1017,6 +1534,7 @@ function GameScene({
         ...current,
         mode: state.mode,
         speed,
+        shipSpeed,
         prompt,
         playersOnline,
       }));
@@ -1026,12 +1544,13 @@ function GameScene({
 
   return (
     <>
-      <GalaxyBackdrop activeFrameOrigin={activeFrameOrigin} activeSystemId={activeSystemId} galaxy={galaxy} />
+      <GalaxyBackdrop activeFrameOrigin={activeFrameOrigin} activeSystemId={activeSystemId} galaxy={galaxy} highlightedAsteroidTargetId={highlightedAsteroidTargetId} />
+      <WarpSpeedEffect localStateRef={localStateRef} />
       <group ref={shipGroupRef}>
         <ShipExterior highlight />
       </group>
       <group ref={interiorGroupRef} visible={false}>
-        <ShipInterior />
+        <ShipInterior isPilot={mode === 'pilot'} />
       </group>
       {remotePlayers.map((player) => (
         <RemotePlayer key={player.socketId} player={player} viewerFrameOrigin={activeFrameOrigin} />
@@ -1042,6 +1561,160 @@ function GameScene({
 
 function walkSpeed(state: LocalGameState): number {
   return Math.sqrt(state.interiorVelocity.x ** 2 + state.interiorVelocity.z ** 2);
+}
+
+function AutopilotPanel({
+  active,
+  destinations,
+  onDestinationChange,
+  onEngage,
+  onStop,
+  selectedDestination,
+  selectedDestinationId,
+  selectedEtaLabel,
+  status,
+}: {
+  active: boolean;
+  destinations: AutopilotDestination[];
+  onDestinationChange: (destinationId: string) => void;
+  onEngage: () => void;
+  onStop: () => void;
+  selectedDestination: AutopilotDestination | null;
+  selectedDestinationId: string;
+  selectedEtaLabel: string;
+  status: string;
+}): ReactElement {
+  return (
+    <section className="autopilot-panel">
+      <div className="autopilot-panel-header">
+        <span>Shipboard Navigation</span>
+        <strong>Autopilot</strong>
+      </div>
+
+      <label className="autopilot-field">
+        <span>Destination</span>
+        <select value={selectedDestinationId} onChange={(event) => onDestinationChange(event.currentTarget.value)}>
+          {destinations.map((destination) => (
+            <option key={destination.id} value={destination.id}>
+              {destination.kind === 'asteroid-object'
+                ? `${destination.name} · ${Math.round(destination.distanceFromShip)} m`
+                : `${destination.name} · ${destination.kind} station`}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      {selectedDestination ? (
+        <div className="autopilot-meta">
+          <div>
+            <span>Type</span>
+            <strong>{selectedDestination.kind === 'asteroid-object' ? 'Single asteroid' : `${selectedDestination.kind} station`}</strong>
+          </div>
+          <div>
+            <span>Distance</span>
+            <strong>{Math.round(selectedDestination.distanceFromShip)} m</strong>
+          </div>
+          <div>
+            <span>ETA</span>
+            <strong>{selectedEtaLabel}</strong>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="autopilot-actions">
+        <button disabled={!selectedDestinationId || active} onClick={onEngage} type="button">
+          Engage
+        </button>
+        <button className="autopilot-stop" disabled={!active} onClick={onStop} type="button">
+          Stop
+        </button>
+      </div>
+
+      <p className="autopilot-status">{status}</p>
+    </section>
+  );
+}
+
+function WarpSpeedEffect({ localStateRef }: { localStateRef: MutableRefObject<LocalGameState> }): ReactElement {
+  const { camera } = useThree();
+  const groupRef = useRef<THREE.Group>(null);
+  const materialRef = useRef<THREE.LineBasicMaterial>(null);
+  const geometryRef = useRef<THREE.BufferGeometry>(null);
+  const streakCount = 72;
+  const streakStateRef = useRef(
+    Array.from({ length: streakCount }, () => ({
+      angle: Math.random() * Math.PI * 2,
+      radius: 0.35 + Math.random() * 1.9,
+      speed: 90 + Math.random() * 180,
+      z: -20 - Math.random() * 260,
+      length: 8 + Math.random() * 34,
+    })),
+  );
+  const positions = useMemo(() => new Float32Array(streakCount * 2 * 3), [streakCount]);
+
+  useFrame((_state, delta) => {
+    if (!groupRef.current || !materialRef.current || !geometryRef.current) {
+      return;
+    }
+
+    const shipSpeed = localStateRef.current.shipVelocity.length();
+    const intensity = getWarpEffectIntensity(shipSpeed);
+    groupRef.current.visible = intensity > 0.001 && localStateRef.current.mode !== 'space';
+
+    if (!groupRef.current.visible) {
+      materialRef.current.opacity = 0;
+      return;
+    }
+
+    groupRef.current.position.copy(camera.position);
+    groupRef.current.quaternion.copy(camera.quaternion);
+
+    streakStateRef.current.forEach((streak, index) => {
+      streak.z += streak.speed * delta * (0.4 + intensity * 3.4);
+      if (streak.z > -4) {
+        streak.angle = Math.random() * Math.PI * 2;
+        streak.radius = 0.35 + Math.random() * 2.2;
+        streak.speed = 90 + Math.random() * 220;
+        streak.z = -160 - Math.random() * 220;
+        streak.length = 12 + Math.random() * 42;
+      }
+
+      const x = Math.cos(streak.angle) * streak.radius;
+      const y = Math.sin(streak.angle) * streak.radius;
+      const headX = x * 0.1;
+      const headY = y * 0.1;
+      const startIndex = index * 6;
+
+      positions[startIndex] = x;
+      positions[startIndex + 1] = y;
+      positions[startIndex + 2] = streak.z;
+      positions[startIndex + 3] = headX;
+      positions[startIndex + 4] = headY;
+      positions[startIndex + 5] = streak.z + streak.length;
+    });
+
+    geometryRef.current.attributes.position.needsUpdate = true;
+    materialRef.current.opacity = 0.08 + intensity * 0.72;
+  });
+
+  return (
+    <group ref={groupRef} visible={false} renderOrder={1000}>
+      <lineSegments frustumCulled={false}>
+        <bufferGeometry ref={geometryRef}>
+          <bufferAttribute attach="attributes-position" args={[positions, 3]} usage={THREE.DynamicDrawUsage} />
+        </bufferGeometry>
+        <lineBasicMaterial
+          ref={materialRef}
+          color="#dbeafe"
+          transparent
+          opacity={0}
+          depthWrite={false}
+          depthTest={false}
+          blending={THREE.AdditiveBlending}
+        />
+      </lineSegments>
+    </group>
+  );
 }
 
 function hasOcclusionFlag(object: THREE.Object3D | null, flagName: string): boolean {
@@ -1704,10 +2377,12 @@ function GalaxyBackdrop({
   activeFrameOrigin,
   activeSystemId,
   galaxy,
+  highlightedAsteroidTargetId,
 }: {
   activeFrameOrigin: Vec3Tuple;
   activeSystemId: string;
   galaxy: GalaxyData;
+  highlightedAsteroidTargetId: string;
 }): ReactElement {
   const activeSystem = galaxy.systems.find((system) => system.id === activeSystemId) ?? galaxy.systems[0] ?? null;
   const activeSystemPosition = activeSystem?.mapPosition ?? [0, 0, 0];
@@ -1715,7 +2390,7 @@ function GalaxyBackdrop({
   return (
     <group>
       <GalaxyStarMarkers activeSystemId={activeSystemId} activeSystemPosition={activeSystemPosition} galaxy={galaxy} />
-      {activeSystem ? <StarSystem renderPosition={toFrameLocalPosition([0, 0, 0], activeFrameOrigin)} system={activeSystem} /> : null}
+      {activeSystem ? <StarSystem highlightedAsteroidTargetId={highlightedAsteroidTargetId} renderPosition={toFrameLocalPosition([0, 0, 0], activeFrameOrigin)} system={activeSystem} /> : null}
     </group>
   );
 }
@@ -1794,7 +2469,7 @@ function StarMarker({ position }: { position: Vec3Tuple }): ReactElement {
   );
 }
 
-function StarSystem({ renderPosition, system }: { renderPosition: Vec3Tuple; system: StarSystemData }): ReactElement {
+function StarSystem({ highlightedAsteroidTargetId, renderPosition, system }: { highlightedAsteroidTargetId: string; renderPosition: Vec3Tuple; system: StarSystemData }): ReactElement {
   const { camera, scene } = useThree();
   const haloRef = useRef<THREE.Mesh>(null);
   const raycaster = useMemo(() => new THREE.Raycaster(), []);
@@ -1856,7 +2531,7 @@ function StarSystem({ renderPosition, system }: { renderPosition: Vec3Tuple; sys
       ))}
 
       {system.asteroidGroups.map((asteroidGroup) => (
-        <AsteroidCluster key={asteroidGroup.id} group={asteroidGroup} physicalPosition={tupleAdd(renderPosition, asteroidGroup.position)} />
+        <AsteroidCluster key={asteroidGroup.id} group={asteroidGroup} highlightedAsteroidTargetId={highlightedAsteroidTargetId} physicalPosition={tupleAdd(renderPosition, asteroidGroup.position)} />
       ))}
     </>
   );
@@ -2146,7 +2821,15 @@ function DistanceVisibleGroup({
   );
 }
 
-function AsteroidCluster({ group, physicalPosition: physicalPositionTuple }: { group: AsteroidGroupData; physicalPosition: Vec3Tuple }): ReactElement {
+function AsteroidCluster({
+  group,
+  highlightedAsteroidTargetId,
+  physicalPosition: physicalPositionTuple,
+}: {
+  group: AsteroidGroupData;
+  highlightedAsteroidTargetId: string;
+  physicalPosition: Vec3Tuple;
+}): ReactElement {
   const { camera } = useThree();
   const groupRef = useRef<THREE.Group>(null);
   const physicalPosition = useMemo(() => new THREE.Vector3(...physicalPositionTuple), [physicalPositionTuple]);
@@ -2196,9 +2879,10 @@ function AsteroidCluster({ group, physicalPosition: physicalPositionTuple }: { g
       
       {showCluster && (
         <group>
+          <AsteroidDust dust={group.dust} physicalPosition={physicalPositionTuple} show={showCluster} />
           <SpaceStation station={group.station} physicalPosition={tupleAdd(physicalPositionTuple, group.station.position)} scale={ASTEROID_STATION_SCALE} />
           {asteroidsToRender.map((asteroid) => (
-            <AsteroidMesh key={asteroid.id} asteroid={asteroid} physicalPosition={tupleAdd(physicalPositionTuple, asteroid.position)} show={showCluster} />
+            <AsteroidMesh key={asteroid.id} asteroid={asteroid} highlightTarget={asteroid.id === highlightedAsteroidTargetId} physicalPosition={tupleAdd(physicalPositionTuple, asteroid.position)} show={showCluster} />
           ))}
         </group>
       )}
@@ -2231,26 +2915,122 @@ function SpaceStation({ station, physicalPosition, scale }: { station: StationDa
   );
 }
 
-function AsteroidMesh({ asteroid, physicalPosition, show }: { asteroid: AsteroidData; physicalPosition: Vec3Tuple; show: boolean }): ReactElement {
+function AsteroidDust({ dust, physicalPosition, show }: { dust: DustAsteroidData[]; physicalPosition: Vec3Tuple; show: boolean }): ReactElement {
+  const instancedMeshRef = useRef<THREE.InstancedMesh>(null);
+  const pointsRef = useRef<THREE.Points>(null);
+  const { camera } = useThree();
+  const physicalPositionVector = useMemo(() => new THREE.Vector3(...physicalPosition), [physicalPosition]);
+
+  const [positions, matrices] = useMemo(() => {
+    const _positions = new Float32Array(dust.length * 3);
+    const _matrices = new Float32Array(dust.length * 16);
+    const dummy = new THREE.Object3D();
+
+    dust.forEach((d, i) => {
+      _positions[i * 3] = d.position[0];
+      _positions[i * 3 + 1] = d.position[1];
+      _positions[i * 3 + 2] = d.position[2];
+
+      dummy.position.set(d.position[0], d.position[1], d.position[2]);
+      dummy.rotation.set(d.rotation[0], d.rotation[1], d.rotation[2]);
+      dummy.scale.set(d.size, d.size, d.size);
+      dummy.updateMatrix();
+      dummy.matrix.toArray(_matrices, i * 16);
+    });
+
+    return [_positions, _matrices];
+  }, [dust]);
+
+  useEffect(() => {
+    if (instancedMeshRef.current) {
+      instancedMeshRef.current.instanceMatrix.set(matrices);
+      instancedMeshRef.current.instanceMatrix.needsUpdate = true;
+    }
+  }, [matrices]);
+
+  useFrame(() => {
+    if (!show) return;
+    const distance = physicalPositionVector.distanceTo(camera.position);
+    const showMeshes = distance < 35_000;
+    
+    if (instancedMeshRef.current) instancedMeshRef.current.visible = showMeshes;
+    if (pointsRef.current) pointsRef.current.visible = !showMeshes;
+  });
+
+  return (
+    <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={SMALL_ASTEROID_VISIBILITY_RANGE * 2} linearDistance={ASTEROID_PROXY_LINEAR_DISTANCE} logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}>
+      <group visible={show}>
+        <instancedMesh ref={instancedMeshRef} args={[null as any, null as any, dust.length]}>
+          <dodecahedronGeometry args={[1, 0]} />
+          <meshStandardMaterial color="#64748b" roughness={0.96} metalness={0.06} />
+        </instancedMesh>
+        <points ref={pointsRef} visible={false}>
+          <bufferGeometry>
+            <bufferAttribute attach="attributes-position" args={[positions, 3]} />
+          </bufferGeometry>
+          <pointsMaterial size={2} sizeAttenuation={false} color="#64748b" depthWrite={false} transparent opacity={0.65} />
+        </points>
+      </group>
+    </PhysicalProxyGroup>
+  );
+}
+
+function AsteroidMesh({
+  asteroid,
+  highlightTarget = false,
+  physicalPosition,
+  show,
+}: {
+  asteroid: AsteroidData;
+  highlightTarget?: boolean;
+  physicalPosition: Vec3Tuple;
+  show: boolean;
+}): ReactElement {
   const visualScale: Vec3Tuple = [
     asteroid.scale[0] * ASTEROID_RENDER_SCALE_MULTIPLIER,
     asteroid.scale[1] * ASTEROID_RENDER_SCALE_MULTIPLIER,
     asteroid.scale[2] * ASTEROID_RENDER_SCALE_MULTIPLIER,
   ];
+  const outlineMaterialRef = useRef<THREE.MeshBasicMaterial>(null);
+
+  useFrame((state) => {
+    if (!outlineMaterialRef.current) {
+      return;
+    }
+
+    const shimmer = 0.35 + (Math.sin(state.clock.elapsedTime * TARGET_OUTLINE_PULSE_SPEED) * 0.5 + 0.5) * 0.65;
+    outlineMaterialRef.current.opacity = highlightTarget ? shimmer : 0;
+  });
 
   return (
     <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={SMALL_ASTEROID_VISIBILITY_RANGE * 2} linearDistance={ASTEROID_PROXY_LINEAR_DISTANCE} logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}>
-      {asteroid.shape === 'abstract' ? (
-        <mesh rotation={asteroid.rotation} scale={visualScale} visible={show}>
-          <icosahedronGeometry args={[1, 1]} />
-          <meshStandardMaterial color="#78716c" flatShading roughness={0.96} metalness={0.08} />
-        </mesh>
-      ) : (
-        <mesh rotation={asteroid.rotation} scale={visualScale} visible={show}>
-          <dodecahedronGeometry args={[1, 0]} />
-          <meshStandardMaterial color="#94a3b8" roughness={0.98} metalness={0.04} />
-        </mesh>
-      )}
+      <group rotation={asteroid.rotation} scale={visualScale} visible={show}>
+        {asteroid.shape === 'abstract' ? (
+          <mesh>
+            <icosahedronGeometry args={[1, 1]} />
+            <meshStandardMaterial color="#78716c" flatShading roughness={0.96} metalness={0.08} />
+          </mesh>
+        ) : (
+          <mesh>
+            <dodecahedronGeometry args={[1, 0]} />
+            <meshStandardMaterial color="#94a3b8" roughness={0.98} metalness={0.04} />
+          </mesh>
+        )}
+
+        {highlightTarget ? (
+          asteroid.shape === 'abstract' ? (
+            <mesh scale={[1.12, 1.12, 1.12]}>
+              <icosahedronGeometry args={[1, 1]} />
+              <meshBasicMaterial ref={outlineMaterialRef} color="#67e8f9" side={THREE.BackSide} transparent depthWrite={false} blending={THREE.AdditiveBlending} />
+            </mesh>
+          ) : (
+            <mesh scale={[1.12, 1.12, 1.12]}>
+              <dodecahedronGeometry args={[1, 0]} />
+              <meshBasicMaterial ref={outlineMaterialRef} color="#67e8f9" side={THREE.BackSide} transparent depthWrite={false} blending={THREE.AdditiveBlending} />
+            </mesh>
+          )
+        ) : null}
+      </group>
     </PhysicalProxyGroup>
   );
 }
@@ -2294,22 +3074,18 @@ function ShipExterior({ highlight = false }: { highlight?: boolean }): ReactElem
   );
 }
 
-function ShipInterior(): ReactElement {
+function ShipInterior({ isPilot = false }: { isPilot?: boolean }): ReactElement {
   return (
     <group>
-      <mesh position={[0, 1.6, 0]}>
-        <boxGeometry args={[6.6, 4.4, 12]} />
-        <meshStandardMaterial color="#0f172a" side={THREE.BackSide} metalness={0.15} roughness={0.72} />
-      </mesh>
       <mesh position={[0, -0.1, 0]} rotation={[-Math.PI / 2, 0, 0]}>
         <planeGeometry args={[6, 11]} />
         <meshStandardMaterial color="#111827" metalness={0.2} roughness={0.9} />
       </mesh>
-      <mesh position={[0, 0.35, -3.4]}>
+      <mesh position={[0, 0.35, -3.4]} visible={!isPilot}>
         <boxGeometry args={[1.2, 0.5, 1]} />
         <meshStandardMaterial color="#334155" metalness={0.25} roughness={0.65} />
       </mesh>
-      <mesh position={[0, 1, -3.8]}>
+      <mesh position={[0, 1, -3.8]} visible={!isPilot}>
         <boxGeometry args={[1.6, 1.1, 0.28]} />
         <meshStandardMaterial color="#38bdf8" emissive="#0ea5e9" emissiveIntensity={0.3} />
       </mesh>
@@ -2317,7 +3093,7 @@ function ShipInterior(): ReactElement {
         <boxGeometry args={[3.1, 1.7, 0.9]} />
         <meshStandardMaterial color="#1e293b" metalness={0.2} roughness={0.7} />
       </mesh>
-      <mesh position={[0, 2.65, -5.75]} rotation={[0, 0, 0]}>
+      <mesh position={[0, 2.65, -5.75]} rotation={[0, 0, 0]} visible={!isPilot}>
         <planeGeometry args={[1.8, 0.8]} />
         <meshBasicMaterial color="#22d3ee" transparent opacity={0.45} />
       </mesh>

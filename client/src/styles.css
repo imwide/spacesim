@@ -25,7 +25,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -210,6 +211,108 @@ button {
 
 .hud-bottom li + li {
   margin-top: 0.4rem;
+}
+
+.autopilot-panel {
+  position: absolute;
+  top: 8.2rem;
+  left: 1.25rem;
+  width: min(360px, calc(100vw - 2.5rem));
+  pointer-events: auto;
+  padding: 1rem 1.1rem;
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  border-radius: 18px;
+  background: rgba(2, 6, 23, 0.72);
+  backdrop-filter: blur(14px);
+  box-shadow: 0 20px 40px rgba(2, 6, 23, 0.35);
+}
+
+.autopilot-panel-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin-bottom: 0.85rem;
+}
+
+.autopilot-panel-header span {
+  color: #7dd3fc;
+  font-size: 0.76rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.autopilot-panel-header strong {
+  font-size: 1rem;
+}
+
+.autopilot-field {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.autopilot-field span {
+  color: #93c5fd;
+  font-size: 0.82rem;
+}
+
+.autopilot-field select {
+  width: 100%;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 14px;
+  padding: 0.8rem 0.9rem;
+  background: rgba(15, 23, 42, 0.88);
+  color: #fff;
+}
+
+.autopilot-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin-top: 0.9rem;
+}
+
+.autopilot-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin-top: 0.9rem;
+}
+
+.autopilot-meta div {
+  padding: 0.7rem 0.75rem;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.6);
+}
+
+.autopilot-meta span,
+.autopilot-meta strong {
+  display: block;
+}
+
+.autopilot-meta span {
+  color: #93c5fd;
+  font-size: 0.76rem;
+  margin-bottom: 0.24rem;
+}
+
+.autopilot-meta strong {
+  color: #eff6ff;
+  font-size: 0.88rem;
+  line-height: 1.35;
+}
+
+.autopilot-stop {
+  background: rgba(15, 23, 42, 0.95) !important;
+  border: 1px solid rgba(148, 163, 184, 0.24) !important;
+  box-shadow: none !important;
+}
+
+.autopilot-status {
+  margin: 0.9rem 0 0;
+  color: #cbd5e1;
+  font-size: 0.9rem;
+  line-height: 1.45;
 }
 
 .logout-button {
