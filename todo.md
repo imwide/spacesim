@@ -6,3 +6,5 @@ Zooming in opens the next "level" of the map. In this level you can see all the 
 Zooming in further will show the stations, moons, planets and single asteroids (big enough ones to travel to) in a asteroid group aswell as stations in asteroid groups. These can then be clicked but instead of zooming in the tooltip now has an option to engage autopilot towards this goal
 On each "zoom level" of the map there should be a indicator of the current location of the player.
 On each level it will simply highlight the object that the player is closest to.
+
+Increase the intensity of the glow around stars a bit to make them more visible from a distance. Also make this glow change size and intensity same for the lens flare based on how big the star is on the screen of the player so it feels really intense when you are close to a star but not blinding when you are far away

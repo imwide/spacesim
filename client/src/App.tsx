@@ -1848,10 +1848,7 @@ function SpaceTablet({
 }): ReactElement {
   const MAP_CANVAS_WIDTH = 1600;
   const MAP_CANVAS_HEIGHT = 1200;
-  const [mapMode, setMapMode] = useState<SpaceTabletMapMode>('system');
-  const [filter, setFilter] = useState<SpaceTabletFilter>('all');
-  const [query, setQuery] = useState('');
-  const [directoryTab, setDirectoryTab] = useState<'stations' | 'contacts'>('stations');
+  const [mapMode, setMapMode] = useState<SpaceTabletMapMode>('galaxy');
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [selectedSystemId, setSelectedSystemId] = useState(activeSystemId);
@@ -2118,8 +2115,13 @@ function SpaceTablet({
   );
 
   const systemOverviewMarkers = useMemo(
-    () => selectedSystemMarkers.filter((marker) => marker.kind !== 'asteroid-object'),
-    [selectedSystemMarkers],
+    () => selectedSystemMarkers.filter((marker) =>
+      marker.kind === 'star' ||
+      marker.kind === 'planet' ||
+      marker.kind === 'asteroid-belt' ||
+      marker.kind === 'ship'
+    ),
+    [selectedSystemMarkers]
   );
 
   const sectorFocusMarker = useMemo(() => {
@@ -2222,43 +2224,8 @@ function SpaceTablet({
     }
   }, [selectedMarker]);
 
-  const filteredVisibleMarkers = useMemo(() => {
-    const loweredQuery = query.trim().toLowerCase();
-    const matchesFilter = (marker: SpaceTabletMarker) => {
-      if (marker.kind === 'ship') {
-        return true;
-      }
-
-      if (filter === 'stations') {
-        return marker.kind === 'station' || marker.kind === 'system';
-      }
-
-      if (filter === 'bodies') {
-        return marker.kind === 'system' || marker.kind === 'star' || marker.kind === 'planet' || marker.kind === 'moon';
-      }
-
-      if (filter === 'asteroids') {
-        return marker.kind === 'asteroid-belt' || marker.kind === 'asteroid-object';
-      }
-
-      return true;
-    };
-
-    return visibleMarkers.filter((marker) => {
-      if (!matchesFilter(marker)) {
-        return marker.id === selectedStationId || marker.id === currentSystemMarkerId || marker.id === currentShipMarkerId;
-      }
-
-      if (!loweredQuery) {
-        return true;
-      }
-
-      return `${marker.name} ${marker.systemName} ${marker.subtitle}`.toLowerCase().includes(loweredQuery);
-    });
-  }, [currentShipMarkerId, currentSystemMarkerId, filter, query, selectedStationId, visibleMarkers]);
-
   const activeBounds = useMemo(() => {
-    const boundsSource = filteredVisibleMarkers.length > 0 ? filteredVisibleMarkers : visibleMarkers;
+    const boundsSource = visibleMarkers;
     const xs = boundsSource.map((marker) => marker.mapPosition[0]);
     const ys = boundsSource.map((marker) => marker.mapPosition[1]);
     const minX = Math.min(...xs, -50);
@@ -2274,7 +2241,7 @@ function SpaceTablet({
       minY: minY - paddingY,
       maxY: maxY + paddingY,
     };
-  }, [filteredVisibleMarkers, visibleMarkers]);
+  }, [visibleMarkers]);
 
   const project = useCallback(
     (position: [number, number]) => {
@@ -2327,8 +2294,8 @@ function SpaceTablet({
       return Array.from(routes.values());
     }
 
-    const lookup = new Map((filteredVisibleMarkers.length > 0 ? filteredVisibleMarkers : visibleMarkers).map((marker) => [marker.id, marker]));
-    const connections: Array<{ from: [number, number]; to: [number, number]; variant: 'network' | 'route' }> = (filteredVisibleMarkers.length > 0 ? filteredVisibleMarkers : visibleMarkers)
+    const lookup = new Map((visibleMarkers).map((marker) => [marker.id, marker]));
+    const connections: Array<{ from: [number, number]; to: [number, number]; variant: 'network' | 'route' }> = (visibleMarkers)
       .filter((marker) => marker.parentId && lookup.has(marker.parentId))
       .map((marker) => ({
         from: lookup.get(marker.parentId!)!.mapPosition,
@@ -2345,15 +2312,15 @@ function SpaceTablet({
     }
 
     return connections;
-  }, [activeSystemId, currentShipMarkerId, filteredVisibleMarkers, mapMode, network, selectedMarker, systemById, visibleMarkers]);
+  }, [activeSystemId, currentShipMarkerId, mapMode, network, selectedMarker, systemById, visibleMarkers]);
 
   const orbitRings = useMemo(() => {
     if (mapMode === 'galaxy') {
       return [] as Array<{ center: [number, number]; radius: number }>;
     }
 
-    const lookup = new Map((filteredVisibleMarkers.length > 0 ? filteredVisibleMarkers : visibleMarkers).map((marker) => [marker.id, marker]));
-    return (filteredVisibleMarkers.length > 0 ? filteredVisibleMarkers : visibleMarkers)
+    const lookup = new Map((visibleMarkers).map((marker) => [marker.id, marker]));
+    return (visibleMarkers)
       .filter((marker) => marker.parentId && lookup.has(marker.parentId) && marker.kind !== 'station' && marker.kind !== 'ship' && marker.kind !== 'asteroid-object')
       .map((marker) => {
         const parent = lookup.get(marker.parentId!)!;
@@ -2363,7 +2330,7 @@ function SpaceTablet({
         };
       })
       .filter((ring) => ring.radius > 14);
-  }, [filteredVisibleMarkers, mapMode, visibleMarkers]);
+  }, [mapMode, visibleMarkers]);
 
   const nearestContact = useMemo(() => {
     if (!shipAbsolutePosition) {
@@ -2434,7 +2401,7 @@ function SpaceTablet({
 
   useEffect(() => {
     resetView();
-  }, [mapMode, query, filter, selectedSystemId, selectedStationId, resetView]);
+  }, [mapMode, selectedSystemId, selectedStationId, resetView]);
 
   const handleWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -2493,8 +2460,7 @@ function SpaceTablet({
     selectedMarker?.stationNode ?? (selectedMarker?.kind === 'station' ? stationById.get(selectedMarker.id) : undefined);
   const selectedCanAutopilot = Boolean(
     selectedMarker &&
-      selectedMarker.kind !== 'system' &&
-      selectedMarker.kind !== 'ship' &&
+      (selectedMarker.kind === 'station' || selectedMarker.kind === 'asteroid-object') &&
       selectedMarker.systemId === activeSystemId &&
       selectedMarker.localPosition &&
       hudMode !== 'space',
@@ -2533,52 +2499,40 @@ function SpaceTablet({
     [shipAbsolutePosition],
   );
 
-  const stationDirectory = useMemo(() => {
-    const loweredQuery = query.trim().toLowerCase();
-    const directory = [...network]
-      .filter((station) => {
-        if (filter !== 'all' && filter !== 'stations') {
-          return false;
-        }
-
-        if (!loweredQuery) {
-          return true;
-        }
-
-        return `${station.name} ${station.systemName} ${station.kind}`.toLowerCase().includes(loweredQuery);
-      })
-      .sort((left, right) => {
-        const leftPriority = left.systemId === activeSystemId ? 0 : 1;
-        const rightPriority = right.systemId === activeSystemId ? 0 : 1;
-        if (leftPriority !== rightPriority) {
-          return leftPriority - rightPriority;
-        }
-
-        return left.name.localeCompare(right.name);
-      });
-    return loweredQuery ? directory.slice(0, 120) : directory.slice(0, 48);
-  }, [activeSystemId, filter, network, query]);
-
-  const contactDirectory = useMemo(() => {
-    const loweredQuery = query.trim().toLowerCase();
-    const source = mapMode === 'sector' ? sectorMarkers : systemOverviewMarkers;
-    const directory = [...source]
-      .filter((marker) => marker.kind !== 'ship' && marker.kind !== 'station' && marker.kind !== 'system')
-      .filter((marker) => (filter === 'stations' ? false : filter === 'asteroids' ? marker.kind === 'asteroid-belt' || marker.kind === 'asteroid-object' : true))
-      .filter((marker) => {
-        if (!loweredQuery) {
-          return true;
-        }
-
-        return `${marker.name} ${marker.subtitle}`.toLowerCase().includes(loweredQuery);
-      })
-      .sort((left, right) => left.name.localeCompare(right.name));
-    return loweredQuery ? directory.slice(0, 120) : directory.slice(0, mapMode === 'sector' ? 80 : 24);
-  }, [filter, mapMode, query, sectorMarkers, systemOverviewMarkers]);
-
   const selectedVisibleMarker = visibleMarkerLookup.get(selectedStationId) ?? visibleMarkerLookup.get(selectedMarker?.id ?? '');
-  const mapSurfaceMarkers = filteredVisibleMarkers.length > 0 ? filteredVisibleMarkers : visibleMarkers;
-  const activeDirectory = directoryTab === 'stations' ? stationDirectory : contactDirectory;
+  const mapSurfaceMarkers = visibleMarkers;
+
+  const closestMarkerId = useMemo(() => {
+    if (!shipAbsolutePosition) return null;
+    let bestId: string | null = null;
+    let bestDist = Infinity;
+    
+    for (const marker of mapSurfaceMarkers) {
+      if (marker.kind === 'ship') continue;
+      
+      let dist = Infinity;
+      if (mapMode === 'galaxy') {
+        const sys = systemById.get(marker.systemId);
+        const activeSys = systemById.get(activeSystemId);
+        if (sys && activeSys) {
+           dist = Math.hypot(sys.mapPosition[0] - activeSys.mapPosition[0], sys.mapPosition[2] - activeSys.mapPosition[2]);
+        }
+      } else {
+        if (marker.localPosition && marker.systemId === activeSystemId) {
+          const d = distanceBetweenPoints(shipAbsolutePosition, marker.localPosition);
+          if (d !== null) {
+            dist = d;
+          }
+        }
+      }
+      
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestId = marker.id;
+      }
+    }
+    return bestId;
+  }, [shipAbsolutePosition, mapSurfaceMarkers, mapMode, activeSystemId, systemById]);
 
 
   return (
@@ -2680,13 +2634,11 @@ function SpaceTablet({
                 {mapSurfaceMarkers.map((marker) => {
                   const projected = project(marker.mapPosition);
                   const selected = selectedVisibleMarker?.id === marker.id || selectedMarker?.id === marker.id;
-                  const isCurrent = marker.id === currentSystemMarkerId || marker.id === currentShipMarkerId || marker.id === nearestContact;
+                  const isCurrent = marker.id === closestMarkerId;
                   const shouldShowLabel = selected;
 
                   const markerDistance = marker.localPosition ? distanceBetweenPoints(shipAbsolutePosition, marker.localPosition) : null;
-                  const markerStationNode = marker.kind === 'station' ? stationById.get(marker.id) : marker.stationNode;
-                  const canTravel = Boolean(hudMode === 'space' && markerStationNode);
-                  const canAutopilot = Boolean(marker.kind !== 'system' && hudMode !== 'space' && marker.systemId === activeSystemId && typeof markerDistance === 'number' && markerDistance > 50);
+                  const canAutopilot = Boolean((marker.kind === 'station' || marker.kind === 'asteroid-object') && hudMode !== 'space' && marker.systemId === activeSystemId && typeof markerDistance === 'number' && markerDistance > 50);
                   const isAutopilotTarget = autopilotEngaged && autopilotDestinationId === marker.id;
 
                   return (
@@ -2710,27 +2662,22 @@ function SpaceTablet({
                         <div className="tablet-marker-label" onClick={(e) => e.stopPropagation()}>
                           <strong>{marker.name}</strong>
                           <small>{marker.subtitle}</small>
+                          {markerDistance !== null ? <small>{formatDistance(markerDistance)}</small> : null}
 
                           <div className="tablet-label-actions">
-                            {marker.kind === 'system' && mapMode === 'galaxy' ? (
-                              <button onClick={(e) => { e.stopPropagation(); setMapMode('system'); }} type="button">
-                                Zoom into Star System
+                            {mapMode === 'galaxy' ? (
+                              <button onClick={(e) => { e.stopPropagation(); focusMarker(marker.id, 'system'); }} type="button">
+                                Zoom in
                               </button>
                             ) : null}
 
-                            {marker.kind !== 'system' && marker.kind !== 'ship' && mapMode !== 'sector' && (marker.kind === 'planet' || marker.kind === 'moon' || marker.kind === 'asteroid-belt' || marker.kind === 'star') ? (
-                              <button onClick={(e) => { e.stopPropagation(); setMapMode('sector'); }} type="button">
-                                Zoom into Sector
+                            {mapMode === 'system' && (marker.kind === 'star' || marker.kind === 'planet' || marker.kind === 'asteroid-belt') ? (
+                              <button onClick={(e) => { e.stopPropagation(); focusMarker(marker.id, 'sector'); }} type="button">
+                                Zoom in
                               </button>
                             ) : null}
 
-                            {canTravel && markerStationNode ? (
-                              <button onClick={(e) => { e.stopPropagation(); onTravel(markerStationNode); }} type="button">
-                                Fast travel here
-                              </button>
-                            ) : null}
-
-                            {canAutopilot ? (
+                            {mapMode === 'sector' && canAutopilot ? (
                               <button
                                 onClick={(e) => {
                                   e.stopPropagation();
@@ -2745,7 +2692,7 @@ function SpaceTablet({
                                 }}
                                 type="button"
                               >
-                                {isAutopilotTarget ? 'Stop autopilot' : 'Set autopilot'}
+                                {isAutopilotTarget ? 'Stop autopilot' : 'Engage autopilot'}
                               </button>
                             ) : null}
                           </div>
@@ -2757,162 +2704,6 @@ function SpaceTablet({
               </div>
             </div>
           </div>
-
-          <aside className="tablet-sidebar">
-            <div className="tablet-selection tablet-panel-card">
-              <span className="tablet-eyebrow">Selection</span>
-              <h4>{selectedMarker?.name ?? 'No target selected'}</h4>
-              <p>{selectedMarker?.systemName ?? 'Select a node on the map'}</p>
-
-              {selectedMarker ? (
-                <>
-                  <div className="tablet-selection-meta">
-                    <span>{formatSpaceTabletKind(selectedMarker.kind)}</span>
-                    <span>{selectedMarker.subtitle}</span>
-                    {selectedMarker.count ? <span>{selectedMarker.count} tracked</span> : null}
-                    {selectedDistance !== null ? <span>{formatDistance(selectedDistance)}</span> : null}
-                    {selectedMarker.systemId === activeSystemId ? <span>In current system</span> : <span>Remote system</span>}
-                  </div>
-
-                  <div className="tablet-action-row">
-                    {selectedMarker.kind === 'system' ? (
-                      <button onClick={() => setMapMode('system')} type="button">
-                        Open system map
-                      </button>
-                    ) : null}
-
-                    {selectedCanTravel && selectedStationNode ? (
-                      <button onClick={() => onTravel(selectedStationNode)} type="button">
-                        Fast travel here
-                      </button>
-                    ) : null}
-
-                    {selectedCanAutopilot ? (
-                      <button
-                        onClick={() => {
-                          if (selectedAutopilotActive) {
-                            onStopAutopilot();
-                            return;
-                          }
-
-                          const destination = buildDestination(selectedMarker);
-                          if (destination) {
-                            onEngageAutopilot(destination);
-                          }
-                        }}
-                        type="button"
-                      >
-                        {selectedAutopilotActive ? 'Stop autopilot' : 'Set autopilot'}
-                      </button>
-                    ) : null}
-
-                    {selectedMarker.kind !== 'system' && selectedMarker.kind !== 'ship' ? (
-                      <button onClick={() => setMapMode('sector')} type="button">
-                        Focus sector
-                      </button>
-                    ) : null}
-                  </div>
-
-                  {hudMode !== 'space' && selectedMarker.systemId !== activeSystemId && selectedMarker.kind !== 'system' ? (
-                    <p className="tablet-selection-note">Travel to this system first to enable local autopilot routing.</p>
-                  ) : null}
-                </>
-              ) : null}
-            </div>
-
-            <div className="tablet-panel-card tablet-search-card">
-              <div className="tablet-sidebar-header">
-                <strong>Filters</strong>
-                <span>{mapMode}</span>
-              </div>
-              <input
-                className="tablet-search"
-                onChange={(event) => setQuery(event.currentTarget.value)}
-                placeholder="Search stations, planets, belts, moons..."
-                type="search"
-                value={query}
-              />
-              <div className="tablet-filter-row">
-                {(['all', 'stations', 'bodies', 'asteroids'] as SpaceTabletFilter[]).map((entry) => (
-                  <button
-                    className={filter === entry ? 'tablet-filter-chip tablet-filter-chip-active' : 'tablet-filter-chip'}
-                    key={entry}
-                    onClick={() => setFilter(entry)}
-                    type="button"
-                  >
-                    {entry}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="tablet-station-list tablet-panel-card tablet-directory-card">
-              <div className="tablet-sidebar-header">
-                <strong>{directoryTab === 'stations' ? 'Jump-capable stations' : 'Tracked contacts'}</strong>
-                <span>{activeDirectory.length}{query.trim() ? '' : '+'}</span>
-              </div>
-
-              <div className="tablet-tab-group tablet-directory-tabs">
-                <button
-                  className={directoryTab === 'stations' ? 'tablet-tab-active' : ''}
-                  onClick={() => setDirectoryTab('stations')}
-                  type="button"
-                >
-                  Stations
-                </button>
-                <button
-                  className={directoryTab === 'contacts' ? 'tablet-tab-active' : ''}
-                  onClick={() => setDirectoryTab('contacts')}
-                  type="button"
-                >
-                  Contacts
-                </button>
-              </div>
-
-              <div className="tablet-directory-scroll">
-                {directoryTab === 'stations'
-                  ? stationDirectory.map((station) => {
-                      const selected = station.id === selectedStationId;
-                      return (
-                        <button
-                          className={`tablet-list-item ${selected ? 'tablet-list-item-selected' : ''}`}
-                          key={station.id}
-                          onClick={() => {
-                            focusMarker(station.id, 'system');
-                          }}
-                          type="button"
-                        >
-                          <strong>{station.name}</strong>
-                          <small>
-                            {station.systemName} · {station.kind} station
-                          </small>
-                        </button>
-                      );
-                    })
-                  : contactDirectory.map((marker) => {
-                      const selected = marker.id === selectedStationId;
-                      return (
-                        <button
-                          className={`tablet-list-item ${selected ? 'tablet-list-item-selected' : ''}`}
-                          key={marker.id}
-                          onClick={() => {
-                            focusMarker(marker.id, marker.kind === 'system' ? 'galaxy' : 'system');
-                            if (marker.kind !== 'system') {
-                              setSelectedSystemId(marker.systemId);
-                            }
-                          }}
-                          type="button"
-                        >
-                          <strong>{marker.name}</strong>
-                          <small>
-                            {formatSpaceTabletKind(marker.kind)} · {marker.subtitle}
-                          </small>
-                        </button>
-                      );
-                    })}
-              </div>
-            </div>
-          </aside>
         </div>
       </div>
     </section>
