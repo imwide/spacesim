@@ -12,3 +12,4 @@ Increase the intensity of the glow around stars a bit to make them more visible 
 
 
 The slower the ship the weaker the force field so that its still possible to reach teh destination at all ad that its not blocked by a force field entireley. Only if an object is directly in the path of travel it should have a force field at all.
+

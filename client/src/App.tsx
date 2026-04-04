@@ -147,6 +147,18 @@ interface AutopilotObstacle {
   radius: number;
 }
 
+interface LocalAutopilotPlan {
+  desiredDirection: THREE.Vector3;
+  speedCap: number;
+}
+
+interface AutopilotCollisionResult {
+  obstacleLocalPosition: THREE.Vector3;
+  obstacleRadius: number;
+  normal: THREE.Vector3;
+  travelFraction: number;
+}
+
 interface LocalGameState {
   frameSystemId: string;
   frameOrigin: THREE.Vector3;
@@ -155,6 +167,7 @@ interface LocalGameState {
   position: THREE.Vector3;
   velocity: THREE.Vector3;
   rotation: THREE.Quaternion;
+  autopilotDirection: THREE.Vector3;
   shipPosition: THREE.Vector3;
   shipVelocity: THREE.Vector3;
   shipRotation: THREE.Quaternion;
@@ -170,10 +183,11 @@ const AUTH_STORAGE_KEY = 'spacesim.auth';
 const seatPosition = new THREE.Vector3(0, 1.2, -3.2);
 const pilotCameraOffset = new THREE.Vector3(0, 1.45, -3.05);
 const AUTOPILOT_REACH_DISTANCE_METERS = 250;
-const AUTOPILOT_TURN_RESPONSE = 0.06; // Softened for smooth but decisive rotation
+const AUTOPILOT_INTERSTELLAR_TURN_RATE = 0.22;
+const AUTOPILOT_LOCAL_TURN_RATE = 1.4;
 const METERS_PER_LIGHT_YEAR = 9_460_730_472_580_800;
-const AUTOPILOT_ACCELERATION = SHIP_THRUST_ACCELERATION * 1.18;
-const AUTOPILOT_BRAKE_DECELERATION = SHIP_THRUST_ACCELERATION * 1.4;
+const AUTOPILOT_LOCAL_MAX_ACCELERATION = SHIP_THRUST_ACCELERATION * 5;
+const AUTOPILOT_LOCAL_MAX_BRAKE_DECELERATION = SHIP_THRUST_ACCELERATION * 6.5;
 // ─── Autopilot tuning ────────────────────────────────────────────────────────
 const AUTOPILOT_MAX_SPEED_METERS_PER_SECOND = 0.1 * METERS_PER_LIGHT_YEAR;
 const AUTOPILOT_INTERSTELLAR_CRUISE_SPEED = AUTOPILOT_MAX_SPEED_METERS_PER_SECOND;
@@ -201,13 +215,21 @@ function getInterstellarTripSeconds(): number {
 // ─────────────────────────────────────────────────────────────────────────────
 // Warp-streak visual fires above this speed (10 % of interstellar cruise)
 const AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND = AUTOPILOT_INTERSTELLAR_CRUISE_SPEED * 0.1;
-const AUTOPILOT_AVOIDANCE_WEIGHT = 1.9;
 const AUTOPILOT_AVOIDANCE_BUFFER_METERS = 1_600;
 const AUTOPILOT_ASTEROID_OBSTACLE_LIMIT = 120;
 const AUTOPILOT_TARGET_ASTEROID_MIN_SIZE = 20;
 const AUTOPILOT_TARGET_SURFACE_BUFFER_METERS = 140;
 const TARGET_OUTLINE_PULSE_SPEED = 3.6;
-const AUTOPILOT_ACCELERATION_CURVE_AMPLITUDE = 650_000_000_000_000;
+const AUTOPILOT_LOCAL_MIN_SPEED = 18;
+const AUTOPILOT_LOCAL_CLEARANCE_BUFFER_METERS = 220;
+const AUTOPILOT_LOCAL_AVOIDANCE_WEIGHT = 1.35;
+const AUTOPILOT_LOCAL_LOOKAHEAD_MIN = 1_200;
+const AUTOPILOT_LOCAL_LOOKAHEAD_MAX = 18_000;
+const AUTOPILOT_LOCAL_VELOCITY_RESPONSE_SECONDS = 1.35;
+const AUTOPILOT_LOCAL_PATH_SMOOTHING = 1.4;
+const AUTOPILOT_LOCAL_SETTLE_TIME_SECONDS = 2.4;
+const AUTOPILOT_LOCAL_CLOSE_RANGE_SPEED_CAP = 180;
+const AUTOPILOT_LOCAL_COLLISION_MARGIN_METERS = 42;
 const AUTOPILOT_ETA_SIMULATION_STEP_SECONDS = 0.1;
 const AUTOPILOT_ETA_MAX_SIMULATION_STEPS = 120_000;
 
@@ -391,6 +413,10 @@ function getAutopilotCruiseSpeed(isInterSystem: boolean): number {
 }
 
 function getAutopilotAcceleration(isInterSystem: boolean, currentSpeed: number): number {
+  if (!isInterSystem) {
+    return AUTOPILOT_LOCAL_MAX_ACCELERATION;
+  }
+
   const maxCruise = isInterSystem ? AUTOPILOT_INTERSTELLAR_CRUISE_SPEED : AUTOPILOT_LOCAL_CRUISE_SPEED;
   
   // Base acceleration for a cinematic, slow departure (e.g., 50 m/s² allows you to see the station fade away)
@@ -408,8 +434,7 @@ function getAutopilotAcceleration(isInterSystem: boolean, currentSpeed: number):
 
 function getAutopilotBrakeDeceleration(isInterSystem: boolean): number {
   if (!isInterSystem) {
-    // Local: snap to proportional target immediately (same logic as acceleration)
-    return AUTOPILOT_LOCAL_CRUISE_SPEED;
+    return AUTOPILOT_LOCAL_MAX_BRAKE_DECELERATION;
   }
   // Interstellar: kinematic ramp — cruise → 0 in exactly AUTOPILOT_DECEL_TIME_SECONDS
   return AUTOPILOT_INTERSTELLAR_CRUISE_SPEED / AUTOPILOT_DECEL_TIME_SECONDS;
@@ -426,10 +451,22 @@ function getAutopilotTargetSpeed(distanceToDestination: number, arrivalDistance:
   if (remainingDistance <= 0) return 0;
 
   if (!isInterSystem) {
-    // Original proportional approach for all intra-system distances.
-    // Speed scales linearly with remaining distance → smooth natural arrival.
-    // The +25 floor ensures the ship always makes progress on the final approach.
-    return clamp((remainingDistance / 4.0) + 25.0, 0, AUTOPILOT_LOCAL_CRUISE_SPEED);
+    const brakingLimitedSpeed = Math.sqrt(2 * AUTOPILOT_LOCAL_MAX_BRAKE_DECELERATION * remainingDistance);
+    const settleLimitedSpeed = remainingDistance / AUTOPILOT_LOCAL_SETTLE_TIME_SECONDS;
+    const closeRangeCruiseCap = remainingDistance <= 12_000 ? AUTOPILOT_LOCAL_CLOSE_RANGE_SPEED_CAP : AUTOPILOT_LOCAL_CRUISE_SPEED;
+
+    if (remainingDistance <= AUTOPILOT_REACH_DISTANCE_METERS * 0.35) {
+      return 0;
+    }
+
+    return clamp(
+      Math.max(
+        AUTOPILOT_LOCAL_MIN_SPEED,
+        Math.min(brakingLimitedSpeed * 0.82, settleLimitedSpeed, closeRangeCruiseCap),
+      ),
+      0,
+      AUTOPILOT_LOCAL_CRUISE_SPEED,
+    );
   }
 
   // Interstellar: kinematic braking curve
@@ -570,6 +607,199 @@ function createShipFacingQuaternion(forward: THREE.Vector3): THREE.Quaternion {
   return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(xAxis, yAxis, zAxis));
 }
 
+function projectVectorOntoPlane(vector: THREE.Vector3, planeNormal: THREE.Vector3): THREE.Vector3 {
+  return vector.sub(planeNormal.clone().multiplyScalar(vector.dot(planeNormal)));
+}
+
+function getPreferredClearanceDirection(
+  pathDirection: THREE.Vector3,
+  toObstacle: THREE.Vector3,
+  shipVelocity: THREE.Vector3,
+): THREE.Vector3 {
+  const lateralVelocity = projectVectorOntoPlane(shipVelocity.clone(), pathDirection);
+  let preferred = lateralVelocity.lengthSq() > 1e-6 ? lateralVelocity.normalize() : projectVectorOntoPlane(new THREE.Vector3(0, 1, 0), pathDirection);
+
+  if (preferred.lengthSq() < 1e-6) {
+    preferred = projectVectorOntoPlane(new THREE.Vector3(1, 0, 0), pathDirection);
+  }
+
+  if (preferred.lengthSq() < 1e-6) {
+    preferred = new THREE.Vector3(1, 0, 0);
+  }
+
+  preferred.normalize();
+
+  if (preferred.dot(toObstacle) > 0) {
+    preferred.multiplyScalar(-1);
+  }
+
+  return preferred;
+}
+
+function buildLocalAutopilotPlan(
+  state: LocalGameState,
+  targetDirection: THREE.Vector3,
+  remainingDistance: number,
+  destination: AutopilotDestination,
+  frameOrigin: Vec3Tuple,
+  obstacles: AutopilotObstacle[],
+): LocalAutopilotPlan {
+  const currentSpeed = state.shipVelocity.length();
+  const lookaheadDistance = clamp(
+    Math.max(
+      AUTOPILOT_LOCAL_LOOKAHEAD_MIN,
+      currentSpeed * 4.5,
+      remainingDistance * 0.7,
+    ),
+    AUTOPILOT_LOCAL_LOOKAHEAD_MIN,
+    AUTOPILOT_LOCAL_LOOKAHEAD_MAX,
+  );
+  const steering = new THREE.Vector3();
+  let speedCap = AUTOPILOT_LOCAL_CRUISE_SPEED;
+
+  obstacles.forEach((obstacle) => {
+    if (obstacle.id === destination.id) {
+      return;
+    }
+
+    const obstacleLocalPosition = vectorFromTuple(toFrameLocalPosition(obstacle.position, frameOrigin));
+    const toObstacle = obstacleLocalPosition.sub(state.shipPosition);
+    const alongPath = toObstacle.dot(targetDirection);
+
+    if (alongPath <= -obstacle.radius || alongPath >= lookaheadDistance + obstacle.radius) {
+      return;
+    }
+
+    const corridorOffset = toObstacle.clone().sub(targetDirection.clone().multiplyScalar(alongPath));
+    const dynamicBuffer =
+      AUTOPILOT_LOCAL_CLEARANCE_BUFFER_METERS +
+      Math.min(1_200, currentSpeed * 0.45) +
+      obstacle.radius * 0.25;
+    const influenceRadius = obstacle.radius + dynamicBuffer;
+    const lateralDistance = corridorOffset.length();
+    const conflict = clamp(1 - lateralDistance / influenceRadius, 0, 1);
+
+    if (conflict <= 0) {
+      return;
+    }
+
+    const forwardWeight = clamp(1 - Math.max(alongPath, 0) / (lookaheadDistance + influenceRadius), 0, 1);
+    const urgency = conflict * Math.sqrt(forwardWeight);
+    let clearanceDirection = corridorOffset.lengthSq() > 1e-6
+      ? corridorOffset.normalize().multiplyScalar(-1)
+      : getPreferredClearanceDirection(targetDirection, toObstacle, state.shipVelocity);
+
+    if (clearanceDirection.lengthSq() < 1e-6) {
+      clearanceDirection = getPreferredClearanceDirection(targetDirection, toObstacle, state.shipVelocity);
+    }
+
+    const bypassOffset = influenceRadius + Math.min(1_400, currentSpeed * 0.6 + obstacle.radius * 0.3);
+    const forwardLead = Math.min(Math.max(obstacle.radius * 0.5, 80), 650);
+    const bypassPoint = obstacleLocalPosition
+      .clone()
+      .addScaledVector(clearanceDirection, bypassOffset)
+      .addScaledVector(targetDirection, forwardLead);
+    const bypassDirection = bypassPoint.sub(state.shipPosition);
+
+    if (bypassDirection.lengthSq() > 1e-6) {
+      bypassDirection.normalize();
+      const obstacleWeight = obstacle.kind === 'asteroid' ? 1.7 : obstacle.kind === 'moon' ? 1.25 : 1.05;
+      steering.addScaledVector(bypassDirection, urgency * obstacleWeight);
+    }
+
+    if (conflict > 0.35) {
+      const forwardClearance = Math.max(0, alongPath - influenceRadius * 0.65);
+      const obstacleSpeedCap = Math.min(
+        Math.sqrt(2 * AUTOPILOT_LOCAL_MAX_BRAKE_DECELERATION * forwardClearance) * 0.78,
+        forwardClearance / 2.1,
+      );
+      speedCap = Math.min(speedCap, Math.max(AUTOPILOT_LOCAL_MIN_SPEED * 1.5, obstacleSpeedCap));
+    }
+
+    if (toObstacle.length() < obstacle.radius + AUTOPILOT_LOCAL_CLEARANCE_BUFFER_METERS) {
+      speedCap = Math.min(speedCap, AUTOPILOT_LOCAL_MIN_SPEED * 1.2);
+      steering.addScaledVector(clearanceDirection, 1.8 * urgency);
+    }
+  });
+
+  const desiredDirection = targetDirection.clone();
+  if (steering.lengthSq() > 1e-8) {
+    desiredDirection.addScaledVector(steering, AUTOPILOT_LOCAL_AVOIDANCE_WEIGHT).normalize();
+  }
+
+  return {
+    desiredDirection,
+    speedCap,
+  };
+}
+
+function getAutopilotTurnRate(isInterSystem: boolean): number {
+  return isInterSystem ? AUTOPILOT_INTERSTELLAR_TURN_RATE : AUTOPILOT_LOCAL_TURN_RATE;
+}
+
+function smoothAutopilotDirection(
+  currentDirection: THREE.Vector3,
+  desiredDirection: THREE.Vector3,
+  dt: number,
+): THREE.Vector3 {
+  const safeCurrent = currentDirection.lengthSq() > 1e-8 ? currentDirection.clone().normalize() : desiredDirection.clone();
+  const blend = 1 - Math.exp(-AUTOPILOT_LOCAL_PATH_SMOOTHING * dt);
+  return safeCurrent.lerp(desiredDirection, blend).normalize();
+}
+
+function findAutopilotCollisionOnSegment(
+  start: THREE.Vector3,
+  end: THREE.Vector3,
+  destination: AutopilotDestination,
+  frameOrigin: Vec3Tuple,
+  obstacles: AutopilotObstacle[],
+): AutopilotCollisionResult | null {
+  const delta = end.clone().sub(start);
+  const lengthSq = delta.lengthSq();
+
+  if (lengthSq <= 1e-8) {
+    return null;
+  }
+
+  let nearestHit: AutopilotCollisionResult | null = null;
+
+  obstacles.forEach((obstacle) => {
+    if (obstacle.id === destination.id) {
+      return;
+    }
+
+    const obstacleLocalPosition = vectorFromTuple(toFrameLocalPosition(obstacle.position, frameOrigin));
+    const effectiveRadius = obstacle.radius + AUTOPILOT_LOCAL_COLLISION_MARGIN_METERS;
+    const projectedT = clamp(obstacleLocalPosition.clone().sub(start).dot(delta) / lengthSq, 0, 1);
+    const closestPoint = start.clone().addScaledVector(delta, projectedT);
+    const fromCenter = closestPoint.clone().sub(obstacleLocalPosition);
+    const centerDistance = fromCenter.length();
+
+    if (centerDistance >= effectiveRadius) {
+      return;
+    }
+
+    let normal = centerDistance > 1e-6
+      ? fromCenter.multiplyScalar(1 / centerDistance)
+      : start.clone().sub(obstacleLocalPosition).normalize();
+
+    if (normal.lengthSq() < 1e-6) {
+      normal = delta.clone().normalize().multiplyScalar(-1);
+    }
+
+    if (!nearestHit || projectedT < nearestHit.travelFraction) {
+      nearestHit = {
+        obstacleLocalPosition,
+        obstacleRadius: effectiveRadius,
+        normal,
+        travelFraction: projectedT,
+      };
+    }
+  });
+
+  return nearestHit;
+}
+
 function updateAutopilotShip(
   state: LocalGameState,
   dt: number,
@@ -608,88 +838,26 @@ function updateAutopilotShip(
   }
 
   const targetDirection = toTarget.clone().normalize();
-  const avoidance = new THREE.Vector3();
-
-  // No local-obstacle avoidance during interstellar flight — the ship is in open space
-  // between stars, and at cruise speed the avoidance radius would span the whole system.
-  if (isInterSystem) {
-    obstacles = [];
-  }
-
-  obstacles.forEach((obstacle) => {
-    if (obstacle.id === destination.id) {
-      return;
-    }
-
-    const obstacleLocalPosition = vectorFromTuple(toFrameLocalPosition(obstacle.position, frameOrigin));
-    const awayFromObstacle = state.shipPosition.clone().sub(obstacleLocalPosition);
-    const centerDistance = awayFromObstacle.length();
-    const surfaceDistance = centerDistance - obstacle.radius;
-    // Look ahead heavily based on current speed and base avoidance buffer to steer wide and early
-    const isAsteroid = obstacle.kind === 'asteroid';
-    
-    // Skip asteroids from steering evasion, we just push the ship away instead
-    if (isAsteroid) return;
-
-    const anticipationBuffer = Math.max(AUTOPILOT_AVOIDANCE_BUFFER_METERS * 20, currentSpeed * 1.5 + AUTOPILOT_AVOIDANCE_BUFFER_METERS * 5);
-    const influenceRadius = obstacle.radius + anticipationBuffer;
-
-    if (surfaceDistance >= anticipationBuffer || centerDistance >= influenceRadius) {
-      return;
-    }
-
-    const awayDirection = centerDistance > 1e-5 ? awayFromObstacle.clone().multiplyScalar(1 / centerDistance) : targetDirection.clone().multiplyScalar(-1);
-    const obstacleDirection = obstacleLocalPosition.clone().sub(state.shipPosition).normalize();
-    
-    let evasionDirection: THREE.Vector3;
-    // Find the tangential path around the obstacle that leads to the target
-    let tangentDirection = targetDirection.clone().sub(
-      obstacleDirection.clone().multiplyScalar(targetDirection.dot(obstacleDirection)),
-    );
-    
-    // If heading straight dead center into the obstacle, pick an arbitrary tangent
-    if (tangentDirection.lengthSq() < 1e-6) {
-      tangentDirection = new THREE.Vector3(0, 1, 0).cross(obstacleDirection);
-      if (tangentDirection.lengthSq() < 1e-6) {
-        tangentDirection = new THREE.Vector3(1, 0, 0).cross(obstacleDirection);
-      }
-    }
-    tangentDirection.normalize();
-
-    // Blend radial push (don't crash) with tangential push (slide around)
-    // Scale tangent weight based on how much speed we have (faster = steer wider)
-    evasionDirection = awayDirection.clone().addScaledVector(tangentDirection, 3.5).normalize();
-    
-    const closingBias = clamp((targetDirection.dot(obstacleDirection) + 1) * 0.5, 0.0, 1);
-    // Smoothly scale the avoidance strength as we enter the anticipation zone
-    const normalizedSurfaceDistance = Math.pow(clamp(1 - surfaceDistance / anticipationBuffer, 0, 1), 0.5);
-    const kindWeight = obstacle.kind === 'star' ? 6.0 : obstacle.kind === 'planet' ? 4.5 : obstacle.kind === 'moon' ? 3.0 : 8.0;
-    
-    avoidance.addScaledVector(evasionDirection, normalizedSurfaceDistance * normalizedSurfaceDistance * closingBias * kindWeight);
-  });
-
-  const desiredDirection = targetDirection.clone().addScaledVector(avoidance, AUTOPILOT_AVOIDANCE_WEIGHT);
-  if (desiredDirection.lengthSq() < 1e-8) {
-    desiredDirection.copy(targetDirection);
-  } else {
-    desiredDirection.normalize();
-  }
-
-  const desiredRotation = createShipFacingQuaternion(desiredDirection);
-  
-  let visualDesiredDirection = desiredDirection.clone();
-  if (!isInterSystem && currentSpeed > 10.0) {
-    visualDesiredDirection.lerp(state.shipVelocity.clone().normalize(), 0.35).normalize();
-  }
-  const visualDesiredRotation = createShipFacingQuaternion(visualDesiredDirection);
-  
-  state.shipRotation.slerp(visualDesiredRotation, 1 - Math.exp(-AUTOPILOT_TURN_RESPONSE * dt));
-    state.shipRotation.rotateTowards(visualDesiredRotation, 0.05 * dt); // Snaps the remaining tail end cleanly
-  state.rotation.copy(state.shipRotation);
-
   const acceleration = getAutopilotAcceleration(isInterSystem, currentSpeed);
   const brakeDeceleration = getAutopilotBrakeDeceleration(isInterSystem);
   let absoluteTargetSpeed = getAutopilotTargetSpeed(distance, arrivalDistance, isInterSystem);
+  let desiredDirection = targetDirection.clone();
+
+  if (!isInterSystem) {
+    const localPlan = buildLocalAutopilotPlan(state, targetDirection, remainingDistance, destination, frameOrigin, obstacles);
+    desiredDirection = smoothAutopilotDirection(state.autopilotDirection, localPlan.desiredDirection, dt);
+    state.autopilotDirection.copy(desiredDirection);
+    absoluteTargetSpeed = Math.min(absoluteTargetSpeed, localPlan.speedCap);
+  } else {
+    state.autopilotDirection.copy(targetDirection);
+  }
+
+  const lookDirection = currentSpeed > 4 && !isInterSystem
+    ? desiredDirection.clone().lerp(state.shipVelocity.clone().normalize(), 0.25).normalize()
+    : desiredDirection;
+  const desiredRotation = createShipFacingQuaternion(lookDirection);
+  state.shipRotation.rotateTowards(desiredRotation, getAutopilotTurnRate(isInterSystem) * dt);
+  state.rotation.copy(state.shipRotation);
 
   if (isInterSystem && destination.interstellarArrivalAt) {
     const timeLeft = (destination.interstellarArrivalAt - performance.now()) / 1000;
@@ -700,80 +868,83 @@ function updateAutopilotShip(
     }
   }
 
-  const currentForward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
-  const headingAlignment = Math.max(0, currentForward.dot(desiredDirection));
-  const throttlingFactor = headingAlignment * headingAlignment * headingAlignment * headingAlignment;
-  const targetSpeed = absoluteTargetSpeed * Math.max(0.005, throttlingFactor);
+  const cruiseSpeedCap = getAutopilotCruiseSpeed(isInterSystem);
+  if (isInterSystem) {
+    const currentForward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
+    const headingAlignment = Math.max(0, currentForward.dot(desiredDirection));
+    const throttlingFactor = headingAlignment * headingAlignment * headingAlignment * headingAlignment;
+    const targetSpeed = absoluteTargetSpeed * Math.max(0.005, throttlingFactor);
+    const forwardScalar = state.shipVelocity.dot(currentForward);
+    const forwardVelocity = currentForward.clone().multiplyScalar(forwardScalar);
+    const lateralVelocity = state.shipVelocity.clone().sub(forwardVelocity).multiplyScalar(Math.max(0, 1 - 1.5 * dt));
 
-  // Decompose velocity into forward movement and lateral sideways drift
-  const forwardScalar = state.shipVelocity.dot(currentForward);
-  const forwardVelocity = currentForward.clone().multiplyScalar(forwardScalar);
-  const lateralVelocity = state.shipVelocity.clone().sub(forwardVelocity);
-
-  // Aggressively kill sideways drift so the ship tracks flawlessly
-    // EXCEPT when we have large lateral velocity from asteroid forcefields
-    const sidewaysSpeed = lateralVelocity.length();
-    const lateralDamping = sidewaysSpeed > 0.1 
-      ? Math.max(0, 1 - 0.5 * dt) // Soft dampening if pushed by forcefields
-      : Math.max(0, 1 - 4.0 * dt); // Strict dampening otherwise
-    lateralVelocity.multiplyScalar(lateralDamping);
-
-// Accelerate or brake purely along the forward axis
     let nextForwardScalar = forwardScalar;
     if (targetSpeed < forwardScalar) {
       nextForwardScalar = Math.max(targetSpeed, forwardScalar - brakeDeceleration * dt);
     } else {
       nextForwardScalar = Math.min(targetSpeed, forwardScalar + acceleration * dt);
     }
-    nextForwardScalar = Math.max(0, nextForwardScalar);
 
-    // Apply cleanly recombined momentum
-  state.shipVelocity.copy(lateralVelocity).add(currentForward.clone().multiplyScalar(nextForwardScalar));
+    state.shipVelocity.copy(lateralVelocity).add(currentForward.clone().multiplyScalar(Math.max(0, nextForwardScalar)));
+  } else {
+    absoluteTargetSpeed = Math.min(absoluteTargetSpeed, cruiseSpeedCap);
+    const desiredVelocity = desiredDirection.clone().multiplyScalar(absoluteTargetSpeed);
+    const velocityError = desiredVelocity.sub(state.shipVelocity);
 
-  const cruiseSpeedCap = getAutopilotCruiseSpeed(isInterSystem);
+    if (velocityError.lengthSq() > 1e-8) {
+      const responseTime = clamp(
+        AUTOPILOT_LOCAL_VELOCITY_RESPONSE_SECONDS + currentSpeed / 4_000,
+        0.9,
+        1.8,
+      );
+      const requestedAcceleration = velocityError.multiplyScalar(1 / responseTime);
+      const accelerating = desiredVelocity.length() >= currentSpeed;
+      requestedAcceleration.clampLength(0, accelerating ? acceleration : brakeDeceleration);
+      state.shipVelocity.addScaledVector(requestedAcceleration, dt);
+    }
+  }
+
   if (state.shipVelocity.length() > cruiseSpeedCap) {
     state.shipVelocity.setLength(cruiseSpeedCap);
   }
 
-  // Safety net: if velocity would overshoot the arrival boundary in this frame,
-  // clamp it so the ship lands exactly on the boundary (remaining → 0).
-  // Using factor 1.0 (not 0.99) so we don't create an asymptotic approach.
-  if (state.shipVelocity.length() * dt > remainingDistance && remainingDistance > 0) {
+  if (isInterSystem && state.shipVelocity.length() * dt > remainingDistance && remainingDistance > 0) {
     const safeVelocity = remainingDistance / dt;
     state.shipVelocity.setLength(safeVelocity);
   }
 
   if (!isInterSystem) {
-    const pushVelocity = new THREE.Vector3();
-    obstacles.forEach((obstacle) => {
-      if (obstacle.kind !== 'asteroid' || obstacle.id === destination.id) return;
-      const obstacleLocalPosition = vectorFromTuple(toFrameLocalPosition(obstacle.position, frameOrigin));
-      const away = state.shipPosition.clone().sub(obstacleLocalPosition);
-      const dist = away.length();
-      
-        const forcefieldRadius = obstacle.radius + AUTOPILOT_AVOIDANCE_BUFFER_METERS * 0.8;
-        if (dist < forcefieldRadius && dist > 1e-5) {
-          const penetration = clamp(1.0 - (dist / forcefieldRadius), 0.0, 1.0);
-          
-          // Apply a gentle, limited push to smoothly slide around the asteroid
-          const maxPushSpeed = Math.min(30.0, currentSpeed * 0.4 + 5.0);
-          const strength = penetration * penetration * maxPushSpeed;
-          
-          // Push outward from the obstacle center
-          const pushDir = away.normalize();
-          
-          // Apply force using addScaledVector with dt to avoid ridiculous acceleration spikes
-          pushVelocity.addScaledVector(pushDir, strength * dt * 60.0); // scaled by 60 for 60fps equivalent logic but using dt
-        }
-      });
-      state.shipVelocity.add(pushVelocity);
-    }
+    const nextPosition = state.shipPosition.clone().addScaledVector(state.shipVelocity, dt);
+    const collision = findAutopilotCollisionOnSegment(state.shipPosition, nextPosition, destination, frameOrigin, obstacles);
 
+    if (collision) {
+      const safeFraction = clamp(collision.travelFraction - 0.03, 0, 1);
+      const travelDelta = nextPosition.sub(state.shipPosition).multiplyScalar(safeFraction);
+      state.shipPosition.add(travelDelta);
+
+      const toSurface = state.shipPosition.clone().sub(collision.obstacleLocalPosition);
+      if (toSurface.lengthSq() > 1e-8) {
+        state.shipPosition.copy(
+          collision.obstacleLocalPosition.clone().add(toSurface.normalize().multiplyScalar(collision.obstacleRadius + 1)),
+        );
+      }
+
+      const inwardSpeed = state.shipVelocity.dot(collision.normal);
+      if (inwardSpeed < 0) {
+        state.shipVelocity.addScaledVector(collision.normal, -inwardSpeed);
+      }
+      state.shipVelocity.multiplyScalar(0.72);
+    } else {
+      state.shipPosition.copy(nextPosition);
+    }
+  } else {
     state.shipPosition.addScaledVector(state.shipVelocity, dt);
-    state.position.copy(state.shipPosition);
-    state.velocity.copy(state.shipVelocity);
-    return { arrived: false, distance };
   }
+
+  state.position.copy(state.shipPosition);
+  state.velocity.copy(state.shipVelocity);
+  return { arrived: false, distance };
+}
 
 function settleShipVelocity(state: LocalGameState, dt: number): void {
   const shipDampFactor = Math.max(0, 1 - SHIP_LINEAR_DAMPING * dt);
@@ -796,6 +967,7 @@ function createLocalState(frameSystemId: string): LocalGameState {
     position: new THREE.Vector3(0, 0, 0),
     velocity: new THREE.Vector3(0, 0, 0),
     rotation: new THREE.Quaternion(),
+    autopilotDirection: new THREE.Vector3(0, 0, -1),
     shipPosition: new THREE.Vector3(SHIP_SPAWN_OFFSET_METERS, 0, 0),
     shipVelocity: new THREE.Vector3(0, 0, 0),
     shipRotation: new THREE.Quaternion(),
@@ -819,6 +991,7 @@ function hydrateLocalState(target: LocalGameState, snapshot: PlayerSnapshot): vo
   target.shipPosition.set(...snapshot.ship.position);
   target.shipVelocity.set(...snapshot.ship.velocity);
   target.shipRotation.set(...snapshot.ship.rotation);
+  target.autopilotDirection.set(0, 0, -1).applyQuaternion(target.shipRotation).normalize();
 
   const euler = new THREE.Euler().setFromQuaternion(target.rotation, 'YXZ');
   target.pitch = euler.x;
