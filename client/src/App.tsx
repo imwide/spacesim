@@ -122,7 +122,7 @@ interface StationNode {
   linkedStationIds: string[];
 }
 
-type AutopilotDestinationKind = StationKind | 'asteroid-object';
+type AutopilotDestinationKind = StationKind | 'asteroid-object' | 'moon';
 
 interface AutopilotDestination {
   id: string;
@@ -165,7 +165,7 @@ const AUTH_STORAGE_KEY = 'spacesim.auth';
 const seatPosition = new THREE.Vector3(0, 1.2, -3.2);
 const pilotCameraOffset = new THREE.Vector3(0, 1.45, -3.05);
 const AUTOPILOT_REACH_DISTANCE_METERS = 250;
-const AUTOPILOT_TURN_RESPONSE = 0.6; // Softened significantly for majestic, massive ship rotation
+const AUTOPILOT_TURN_RESPONSE = 0.15; // Softened significantly for majestic, massive ship rotation
 const METERS_PER_LIGHT_YEAR = 9_460_730_472_580_800;
 const AUTOPILOT_ACCELERATION = SHIP_THRUST_ACCELERATION * 1.18;
 const AUTOPILOT_BRAKE_DECELERATION = SHIP_THRUST_ACCELERATION * 1.4;
@@ -254,16 +254,35 @@ function buildStationNetwork(galaxy: GalaxyData): StationNode[] {
       linkedStationIds: [],
     };
 
-    const planetStations = system.planets.map((planet, index) => ({
-      id: planet.station.id,
-      name: `${system.name} Planet ${index + 1} Station`,
-      kind: planet.station.kind,
-      systemId: system.id,
-      systemName: system.name,
-      localPosition: tupleAdd(planet.position, planet.station.position),
-      mapPosition: [system.mapPosition[0] + planet.position[0] * 0.0000000014, system.mapPosition[2] + planet.position[2] * 0.0000000014] as [number, number],
-      linkedStationIds: [starStation.id],
-    } satisfies StationNode));
+    const planetStations = system.planets.flatMap((planet, index) => {
+      const mapPos = [system.mapPosition[0] + planet.position[0] * 0.0000000014, system.mapPosition[2] + planet.position[2] * 0.0000000014] as [number, number];
+      
+      const pStations = planet.stations.map((station, stationIndex) => ({
+        id: station.id,
+        name: `${system.name} Planet ${index + 1} Station ${stationIndex + 1}`,
+        kind: station.kind,
+        systemId: system.id,
+        systemName: system.name,
+        localPosition: tupleAdd(planet.position, station.position),
+        mapPosition: mapPos,
+        linkedStationIds: [starStation.id],
+      } satisfies StationNode));
+
+      const mStations = planet.moons.flatMap((moon, moonIndex) => 
+        moon.stations.map((station, stationIndex) => ({
+          id: station.id,
+          name: `${system.name} Planet ${index + 1} Moon ${moonIndex + 1} Station ${stationIndex + 1}`,
+          kind: station.kind,
+          systemId: system.id,
+          systemName: system.name,
+          localPosition: tupleAdd(planet.position, tupleAdd(moon.position, station.position)),
+          mapPosition: mapPos,
+          linkedStationIds: [starStation.id],
+        } satisfies StationNode))
+      );
+
+      return [...pStations, ...mStations];
+    });
 
     const asteroidStations = system.asteroidGroups.map((group, index) => ({
       id: group.station.id,
@@ -335,56 +354,6 @@ function buildAutopilotObstacles(system: StarSystemData): AutopilotObstacle[] {
     ]),
     ...asteroidObstacles,
   ];
-}
-
-function buildAutopilotDestinations(
-  system: StarSystemData | null,
-  stations: StationNode[],
-  shipPosition: THREE.Vector3,
-  frameOrigin: Vec3Tuple,
-): AutopilotDestination[] {
-  const stationDestinations: AutopilotDestination[] = [...stations].sort((left, right) => left.name.localeCompare(right.name)).map((station) => ({
-    id: station.id,
-    name: station.name,
-    kind: station.kind,
-    systemId: station.systemId,
-    systemName: station.systemName,
-    localPosition: station.localPosition,
-    approachRadius:
-      station.kind === 'star'
-        ? 180
-        : station.kind === 'planet'
-          ? 110
-          : 80,
-    distanceFromShip: shipPosition.distanceTo(vectorFromTuple(toFrameLocalPosition(station.localPosition, frameOrigin))),
-  }));
-
-  if (!system) {
-    return stationDestinations;
-  }
-
-  const asteroidDestinations: AutopilotDestination[] = system.asteroidGroups
-    .flatMap((group, groupIndex) =>
-      group.asteroids
-        .filter((asteroid) => asteroid.size >= AUTOPILOT_TARGET_ASTEROID_MIN_SIZE)
-        .map((asteroid, asteroidIndex) => {
-          const localPosition = tupleAdd(group.position, asteroid.position);
-          const distanceFromShip = shipPosition.distanceTo(vectorFromTuple(toFrameLocalPosition(localPosition, frameOrigin)));
-          return {
-            id: asteroid.id,
-            name: `${system.name} Asteroid G${groupIndex + 1}-${asteroidIndex + 1} · ${Math.round(asteroid.size)} m`,
-            kind: 'asteroid-object' as const,
-            systemId: system.id,
-            systemName: system.name,
-            localPosition,
-            approachRadius: Math.max(asteroid.size * 0.7, AUTOPILOT_TARGET_ASTEROID_MIN_SIZE * 0.6),
-            distanceFromShip,
-          } satisfies AutopilotDestination;
-        }),
-    )
-    .sort((left, right) => left.distanceFromShip - right.distanceFromShip);
-
-  return [...stationDestinations, ...asteroidDestinations];
 }
 
 function getAutopilotCurveBoost(currentSpeed: number): number {
@@ -497,12 +466,25 @@ function formatEta(seconds: number): string {
   return secs === 0 ? `${minutes}m` : `${minutes}m ${secs}s`;
 }
 
+function formatNumberSpacing(numStr: string): string {
+  const parts = numStr.split('.');
+  parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+  return parts.join('.');
+}
+
+function formatDistance(distance: number): string {
+  if (distance >= 1000) {
+    return `${formatNumberSpacing((distance / 1000).toFixed(1))} km`;
+  }
+  return `${formatNumberSpacing(distance.toFixed(0))} m`;
+}
+
 function formatSpeed(speed: number): string {
-  if (speed >= AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND * 0.1) {
-    return `${(speed / METERS_PER_LIGHT_YEAR).toFixed(speed >= AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND ? 4 : 6)} ly/s`;
+  if (speed >= 1000) {
+    return `${formatNumberSpacing((speed / 1000).toFixed(1))} km/s`;
   }
 
-  return `${speed.toFixed(1)} m/s`;
+  return `${formatNumberSpacing(speed.toFixed(1))} m/s`;
 }
 
 function createShipFacingQuaternion(forward: THREE.Vector3): THREE.Quaternion {
@@ -558,7 +540,10 @@ function updateAutopilotShip(
     const centerDistance = awayFromObstacle.length();
     const surfaceDistance = centerDistance - obstacle.radius;
     // Look ahead heavily based on current speed and base avoidance buffer to steer wide and early
-    const anticipationBuffer = Math.max(AUTOPILOT_AVOIDANCE_BUFFER_METERS * 20, currentSpeed * 1.5 + AUTOPILOT_AVOIDANCE_BUFFER_METERS * 5);
+    const isAsteroid = obstacle.kind === 'asteroid';
+    const anticipationBuffer = isAsteroid 
+      ? Math.max(AUTOPILOT_AVOIDANCE_BUFFER_METERS * 0.8, currentSpeed * 0.2 + AUTOPILOT_AVOIDANCE_BUFFER_METERS * 0.5)
+      : Math.max(AUTOPILOT_AVOIDANCE_BUFFER_METERS * 20, currentSpeed * 1.5 + AUTOPILOT_AVOIDANCE_BUFFER_METERS * 5);
     const influenceRadius = obstacle.radius + anticipationBuffer;
 
     if (surfaceDistance >= anticipationBuffer || centerDistance >= influenceRadius) {
@@ -568,29 +553,34 @@ function updateAutopilotShip(
     const awayDirection = centerDistance > 1e-5 ? awayFromObstacle.clone().multiplyScalar(1 / centerDistance) : targetDirection.clone().multiplyScalar(-1);
     const obstacleDirection = obstacleLocalPosition.clone().sub(state.shipPosition).normalize();
     
-    // Find the tangential path around the obstacle that leads to the target
-    let tangentDirection = targetDirection.clone().sub(
-      obstacleDirection.clone().multiplyScalar(targetDirection.dot(obstacleDirection)),
-    );
-    
-    // If heading straight dead center into the obstacle, pick an arbitrary tangent
-    if (tangentDirection.lengthSq() < 1e-6) {
-      tangentDirection = new THREE.Vector3(0, 1, 0).cross(obstacleDirection);
+    let evasionDirection: THREE.Vector3;
+    if (isAsteroid) {
+      evasionDirection = awayDirection.clone();
+    } else {
+      // Find the tangential path around the obstacle that leads to the target
+      let tangentDirection = targetDirection.clone().sub(
+        obstacleDirection.clone().multiplyScalar(targetDirection.dot(obstacleDirection)),
+      );
+      
+      // If heading straight dead center into the obstacle, pick an arbitrary tangent
       if (tangentDirection.lengthSq() < 1e-6) {
-        tangentDirection = new THREE.Vector3(1, 0, 0).cross(obstacleDirection);
+        tangentDirection = new THREE.Vector3(0, 1, 0).cross(obstacleDirection);
+        if (tangentDirection.lengthSq() < 1e-6) {
+          tangentDirection = new THREE.Vector3(1, 0, 0).cross(obstacleDirection);
+        }
       }
+      tangentDirection.normalize();
+
+      // Blend radial push (don't crash) with tangential push (slide around)
+      // Scale tangent weight based on how much speed we have (faster = steer wider)
+      evasionDirection = awayDirection.clone().addScaledVector(tangentDirection, 3.5).normalize();
     }
-    tangentDirection.normalize();
-
-    // Blend radial push (don't crash) with tangential push (slide around)
-    // Scale tangent weight based on how much speed we have (faster = steer wider)
-    const evasionDirection = awayDirection.clone().addScaledVector(tangentDirection, 3.5).normalize();
-
+    
     const closingBias = clamp((targetDirection.dot(obstacleDirection) + 1) * 0.5, 0.0, 1);
     // Smoothly scale the avoidance strength as we enter the anticipation zone
     const normalizedSurfaceDistance = Math.pow(clamp(1 - surfaceDistance / anticipationBuffer, 0, 1), 0.5);
-    const kindWeight = obstacle.kind === 'star' ? 6.0 : obstacle.kind === 'planet' ? 4.5 : obstacle.kind === 'moon' ? 3.0 : 1.5;
-
+    const kindWeight = obstacle.kind === 'star' ? 6.0 : obstacle.kind === 'planet' ? 4.5 : obstacle.kind === 'moon' ? 3.0 : 8.0;
+    
     avoidance.addScaledVector(evasionDirection, normalizedSurfaceDistance * normalizedSurfaceDistance * closingBias * kindWeight);
   });
 
@@ -603,31 +593,38 @@ function updateAutopilotShip(
 
   const desiredRotation = createShipFacingQuaternion(desiredDirection);
   state.shipRotation.slerp(desiredRotation, 1 - Math.exp(-AUTOPILOT_TURN_RESPONSE * dt));
+  state.shipRotation.rotateTowards(desiredRotation, 0.5 * dt); // Snaps the remaining tail end cleanly
   state.rotation.copy(state.shipRotation);
 
   const acceleration = getAutopilotAcceleration(currentSpeed);
   const brakeDeceleration = getAutopilotBrakeDeceleration(currentSpeed);
   const absoluteTargetSpeed = getAutopilotTargetSpeed(distance, arrivalDistance);
 
-  // Prevent ship from blasting at maximum velocity while facing entirely the wrong direction.
-  // We throttle the target speed exponentially based on how well the ship is aligned.
   const currentForward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
   const headingAlignment = Math.max(0, currentForward.dot(desiredDirection));
   const throttlingFactor = headingAlignment * headingAlignment * headingAlignment * headingAlignment;
   const targetSpeed = absoluteTargetSpeed * Math.max(0.005, throttlingFactor);
 
-  const desiredVelocity = desiredDirection.clone().multiplyScalar(targetSpeed);
-  const velocityDelta = desiredVelocity.sub(state.shipVelocity);
-  const braking = targetSpeed < currentSpeed;
-  const effectiveAcceleration = braking
-    ? brakeDeceleration
-    : Math.max(acceleration, brakeDeceleration * 0.2); // Provide extra turning authority
-  const maxVelocityStep = effectiveAcceleration * dt;
-  if (velocityDelta.length() > maxVelocityStep) {
-    velocityDelta.setLength(maxVelocityStep);
-  }
+  // Decompose velocity into forward movement and lateral sideways drift
+  const forwardScalar = state.shipVelocity.dot(currentForward);
+  const forwardVelocity = currentForward.clone().multiplyScalar(forwardScalar);
+  const lateralVelocity = state.shipVelocity.clone().sub(forwardVelocity);
 
-  state.shipVelocity.add(velocityDelta);
+  // Aggressively kill sideways drift so the ship tracks flawlessly
+  const lateralDamping = Math.max(0, 1 - 4.0 * dt);
+  lateralVelocity.multiplyScalar(lateralDamping);
+
+  // Accelerate or brake purely along the forward axis
+  let nextForwardScalar = forwardScalar;
+  if (targetSpeed < forwardScalar) {
+    nextForwardScalar = Math.max(targetSpeed, forwardScalar - brakeDeceleration * dt);
+  } else {
+    nextForwardScalar = Math.min(targetSpeed, forwardScalar + acceleration * dt);
+  }
+  nextForwardScalar = Math.max(0, nextForwardScalar);
+
+  // Apply cleanly recombined momentum
+  state.shipVelocity.copy(lateralVelocity).add(currentForward.clone().multiplyScalar(nextForwardScalar));
 
   if (state.shipVelocity.length() > AUTOPILOT_MAX_SPEED_METERS_PER_SECOND) {
     state.shipVelocity.setLength(AUTOPILOT_MAX_SPEED_METERS_PER_SECOND);
@@ -859,7 +856,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
   const [activeSystemId, setActiveSystemId] = useState(homeSystemId);
   const [activeFrameOrigin, setActiveFrameOrigin] = useState<Vec3Tuple>(homeStation?.localPosition ?? [0, 0, 0]);
   const [tabletOpen, setTabletOpen] = useState(false);
-  const [autopilotDestinationId, setAutopilotDestinationId] = useState('');
+  const [autopilotDestination, setAutopilotDestination] = useState<AutopilotDestination | null>(null);
   const [autopilotEngaged, setAutopilotEngaged] = useState(false);
   const [autopilotReachedDestinationId, setAutopilotReachedDestinationId] = useState('');
   const [autopilotStatus, setAutopilotStatus] = useState('Select a destination from inside the ship to engage autopilot.');
@@ -876,37 +873,51 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     [activeSystemId, galaxy.systems],
   );
   const localStateRef = useRef<LocalGameState>(createLocalState(homeSystemId));
+  const autopilotEtaRef = useRef<{ timestamp: number; eta: number } | null>(null);
   const shipPositionForSort = localStateRef.current.shipPosition;
   const currentSystemStations = useMemo(
     () => stationNetwork.filter((station) => station.systemId === activeSystemId),
     [activeSystemId, stationNetwork],
   );
-  const autopilotDestinations = useMemo(
-    () => buildAutopilotDestinations(activeSystem, currentSystemStations, shipPositionForSort, activeFrameOrigin),
-    [activeFrameOrigin, activeSystem, currentSystemStations, hud.shipSpeed, shipPositionForSort],
-  );
-  const autopilotDestination = useMemo(
-    () => autopilotDestinations.find((destination) => destination.id === autopilotDestinationId) ?? autopilotDestinations[0] ?? null,
-    [autopilotDestinationId, autopilotDestinations],
-  );
-  // Refresh the ETA countdown every 5 seconds (5000 milliseconds)
-  const currentTimestampForEta = Math.floor(Date.now() / 5000) * 5000;
+  
+  
+  // Refresh the ETA countdown every second (live countdown)
+  const currentTimestampForEta = Math.floor(Date.now() / 1000) * 1000;
   const autopilotEtaLabel = useMemo(() => {
     if (!autopilotDestination) {
+      autopilotEtaRef.current = null;
       return '—';
     }
 
-    const destinationLocalPosition = vectorFromTuple(toFrameLocalPosition(autopilotDestination.localPosition, activeFrameOrigin));
-    const liveDistance = destinationLocalPosition.distanceTo(localStateRef.current.shipPosition);
+    const now = Date.now();
+    let etaInfo = autopilotEtaRef.current;
 
-    return formatEta(
-      estimateAutopilotEtaSeconds(
+    // Recalculate ETA every 5 seconds if autopilot is engaged, otherwise just keep counting down
+    if (!etaInfo || now - etaInfo.timestamp > 5000) {
+      const destinationLocalPosition = vectorFromTuple(
+        toFrameLocalPosition(autopilotDestination.localPosition, activeFrameOrigin),
+      );
+      const liveDistance = destinationLocalPosition.distanceTo(localStateRef.current.shipPosition);
+
+      const calculatedEta = estimateAutopilotEtaSeconds(
         liveDistance,
         autopilotDestination.approachRadius,
         localStateRef.current.shipVelocity.length(),
-      ),
-    );
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+      );
+
+      etaInfo = {
+        timestamp: currentTimestampForEta,
+        eta: calculatedEta,
+      };
+      autopilotEtaRef.current = etaInfo;
+    }
+
+    // Tick down in between recalculations
+    const elapsedSeconds = Math.floor((currentTimestampForEta - etaInfo.timestamp) / 1000);
+    const displayedEta = Math.max(0, etaInfo.eta - elapsedSeconds);
+
+    return formatEta(displayedEta);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeFrameOrigin, autopilotDestination?.id, currentTimestampForEta]);
   const autopilotObstacles = useMemo(() => (activeSystem ? buildAutopilotObstacles(activeSystem) : []), [activeSystem]);
   const highlightedAsteroidTargetId =
@@ -930,20 +941,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     setActiveFrameOrigin(homeStation.localPosition);
   }, [homeStation]);
 
-  useEffect(() => {
-    setAutopilotDestinationId((current) => {
-      if (autopilotDestinations.some((destination) => destination.id === current)) {
-        return current;
-      }
-
-      return autopilotDestinations[0]?.id ?? '';
-    });
-
-    if (autopilotDestinations.length === 0) {
-      setAutopilotEngaged(false);
-      setAutopilotReachedDestinationId('');
-    }
-  }, [autopilotDestinations]);
+  
 
   useEffect(() => {
     if (hud.mode === 'space') {
@@ -1077,21 +1075,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     setAutopilotStatus(`Autopilot engaged for ${autopilotDestination.name}.`);
   }, [autopilotDestination, hud.mode]);
 
-  const handleAutopilotDestinationChange = useCallback(
-    (destinationId: string) => {
-      setAutopilotDestinationId(destinationId);
-      const destination = autopilotDestinations.find((entry) => entry.id === destinationId);
-      if (!destination) {
-        return;
-      }
 
-        setAutopilotReachedDestinationId('');
-      setAutopilotStatus(
-        autopilotEngaged ? `Autopilot retargeted to ${destination.name}.` : `Selected destination: ${destination.name}.`,
-      );
-    },
-    [autopilotDestinations, autopilotEngaged],
-  );
 
   const handleDisengageAutopilot = useCallback(() => {
     setAutopilotEngaged(false);
@@ -1184,20 +1168,6 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
 
         {!tabletOpen ? <div className="crosshair" /> : null}
 
-        {hud.mode !== 'space' && !tabletOpen ? (
-          <AutopilotPanel
-            active={autopilotEngaged}
-            destinations={autopilotDestinations}
-            onDestinationChange={handleAutopilotDestinationChange}
-            onEngage={handleEngageAutopilot}
-            onStop={handleDisengageAutopilot}
-            selectedDestination={autopilotDestination}
-            selectedDestinationId={autopilotDestination?.id ?? ''}
-            selectedEtaLabel={autopilotEtaLabel}
-            status={autopilotStatus}
-          />
-        ) : null}
-
         <div className="hud-bottom">
           <strong>Controls</strong>
           <ul>
@@ -1208,12 +1178,32 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
         </div>
 
         {tabletOpen ? (
-          <SpaceTablet
-            galaxy={galaxy}
-            network={stationNetwork}
-            onClose={() => setTabletOpen(false)}
-            onTravel={handleFastTravel}
-          />
+          
+        <SpaceTablet
+          frameOrigin={activeFrameOrigin}
+          shipPosition={localStateRef.current ? [localStateRef.current.shipPosition.x, localStateRef.current.shipPosition.y, localStateRef.current.shipPosition.z] as [number, number, number] : undefined}
+          activeSystemId={activeSystemId}
+          autopilotDestinationId={autopilotDestination?.id || ''}
+          autopilotEngaged={autopilotEngaged}
+          galaxy={galaxy}
+          hudMode={hud.mode}
+          lastTravelledId={autopilotReachedDestinationId}
+          network={stationNetwork}
+          onClose={() => setTabletOpen(false)}
+          onStopAutopilot={() => {
+            setAutopilotEngaged(false);
+            setAutopilotStatus('Autopilot disengaged.');
+          }}
+          onEngageAutopilot={(dest) => {
+            setAutopilotDestination(dest);
+            setAutopilotEngaged(true);
+            setAutopilotReachedDestinationId('');
+            setAutopilotStatus(`Autopilot engaged for ${dest.name}.`);
+            setTabletOpen(false);
+          }}
+          onTravel={handleFastTravel}
+        />
+
         ) : null}
       </div>
     </main>
@@ -1537,7 +1527,7 @@ function GameScene({
           : 'Pilot seat engaged. Select a destination in the autopilot panel, or press X to stand up.';
       }
       if (state.mode !== 'space' && autopilotActive && autopilotDestination) {
-        prompt = `Autopilot en route to ${autopilotDestination.name}. ETA ${autopilotEtaLabel}. Arrival threshold: ${AUTOPILOT_REACH_DISTANCE_METERS} m.`;
+        prompt = `Autopilot en route to ${autopilotDestination.name}. ETA ${autopilotEtaLabel}. Arrival threshold: ${formatDistance(AUTOPILOT_REACH_DISTANCE_METERS)}.`;
       }
       if (tabletOpen) {
         prompt = 'Space-Tablet open. Select any station in the network to fast travel.';
@@ -1610,7 +1600,7 @@ function AutopilotPanel({
           {destinations.map((destination) => (
             <option key={destination.id} value={destination.id}>
               {destination.kind === 'asteroid-object'
-                ? `${destination.name} · ${Math.round(destination.distanceFromShip)} m`
+                ? `${destination.name} · ${formatDistance(destination.distanceFromShip)}`
                 : `${destination.name} · ${destination.kind} station`}
             </option>
           ))}
@@ -1625,7 +1615,7 @@ function AutopilotPanel({
           </div>
           <div>
             <span>Distance</span>
-            <strong>{Math.round(selectedDestination.distanceFromShip)} m</strong>
+            <strong>{formatDistance(selectedDestination.distanceFromShip)}</strong>
           </div>
           <div>
             <span>ETA</span>
@@ -1775,203 +1765,516 @@ function isStarOccluded(
   return intersections.some((intersection) => !hasOcclusionFlag(intersection.object, ignoreFlagName));
 }
 
+
+type SpaceTabletMapMode = 'galaxy' | 'system' | 'sector';
+type SpaceTabletFilter = 'all' | 'stations' | 'bodies' | 'asteroids';
+type SpaceTabletMarkerKind = 'system' | 'star' | 'planet' | 'moon' | 'station' | 'asteroid-belt' | 'asteroid-object' | 'ship';
+
+interface SpaceTabletMarker {
+  id: string;
+  name: string;
+  kind: SpaceTabletMarkerKind;
+  systemId: string;
+  systemName: string;
+  mapPosition: [number, number];
+  localPosition?: Vec3Tuple;
+  approachRadius: number;
+  parentId: string | null;
+  stationNode?: StationNode;
+  subtitle: string;
+  accent: string;
+  count?: number;
+}
+
+function formatSpaceTabletKind(kind: SpaceTabletMarkerKind): string {
+  switch (kind) {
+    case 'system':
+      return 'Star system';
+    case 'asteroid-belt':
+      return 'Asteroid belt';
+    case 'asteroid-object':
+      return 'Asteroid';
+    case 'ship':
+      return 'Your ship';
+    default:
+      return kind.charAt(0).toUpperCase() + kind.slice(1);
+  }
+}
+
+function distanceBetweenPoints(left?: Vec3Tuple, right?: Vec3Tuple): number | null {
+  if (!left || !right) {
+    return null;
+  }
+
+  const dx = left[0] - right[0];
+  const dy = left[1] - right[1];
+  const dz = left[2] - right[2];
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+export function findPathToNode(galaxy: GalaxyData, targetId: string): string[] {
+  const system = galaxy.systems.find((entry) => entry.id === targetId || entry.station.id === targetId);
+  return system ? [system.id, system.station.id] : [];
+}
+
 function SpaceTablet({
+  frameOrigin,
+  shipPosition,
+  activeSystemId,
+  autopilotDestinationId,
+  autopilotEngaged,
   galaxy,
+  hudMode,
+  lastTravelledId,
   network,
   onClose,
+  onEngageAutopilot,
+  onStopAutopilot,
   onTravel,
 }: {
+  frameOrigin?: Vec3Tuple;
+  activeSystemId: string;
+  autopilotDestinationId: string;
+  autopilotEngaged: boolean;
   galaxy: GalaxyData;
+  hudMode: 'space' | 'interior' | 'pilot';
+  lastTravelledId: string;
   network: StationNode[];
   onClose: () => void;
+  onEngageAutopilot: (dest: AutopilotDestination) => void;
+  onStopAutopilot: () => void;
   onTravel: (station: StationNode) => void;
+  shipPosition?: [number, number, number];
 }): ReactElement {
   const MAP_CANVAS_WIDTH = 1600;
   const MAP_CANVAS_HEIGHT = 1200;
-  const [mapMode, setMapMode] = useState<'galaxy' | 'system'>('galaxy');
+  const [mapMode, setMapMode] = useState<SpaceTabletMapMode>('system');
+  const [filter, setFilter] = useState<SpaceTabletFilter>('all');
+  const [query, setQuery] = useState('');
+  const [directoryTab, setDirectoryTab] = useState<'stations' | 'contacts'>('stations');
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [selectedSystemId, setSelectedSystemId] = useState(activeSystemId);
   const [selectedStationId, setSelectedStationId] = useState<string>(
-    network.find((station) => station.kind === 'star')?.id ?? network[0]?.id ?? '',
+    autopilotDestinationId || lastTravelledId || `system:${activeSystemId}`,
   );
   const [dragState, setDragState] = useState<{ x: number; y: number } | null>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
-  const pendingSystemZoomRef = useRef(false);
+  const shipAbsolutePosition = useMemo<Vec3Tuple | undefined>(() => {
+    if (!shipPosition) {
+      return undefined;
+    }
 
-  const { lines, bounds, layoutById } = useMemo(() => {
-    const uniqueLines = new Map<string, { from: StationNode; to: StationNode }>();
-    const nodesById = new Map(network.map((node) => [node.id, node]));
-    const systems = new Map<string, StationNode[]>();
+    return frameOrigin ? tupleAdd(frameOrigin, shipPosition) : shipPosition;
+  }, [frameOrigin, shipPosition]);
 
-    network.forEach((node) => {
-      const entries = systems.get(node.systemId) ?? [];
-      entries.push(node);
-      systems.set(node.systemId, entries);
-    });
+  const stationById = useMemo(() => new Map(network.map((station) => [station.id, station])), [network]);
+  const systemById = useMemo(() => new Map(galaxy.systems.map((system) => [system.id, system])), [galaxy.systems]);
 
-    const layoutEntries = new Map<string, [number, number]>();
+  useEffect(() => {
+    if (autopilotDestinationId) {
+      setSelectedStationId(autopilotDestinationId);
+    }
+  }, [autopilotDestinationId]);
 
-    systems.forEach((stations) => {
-      const starStation = stations.find((station) => station.kind === 'star') ?? stations[0];
-      const childStations = stations.filter((station) => station.id !== starStation.id);
-      layoutEntries.set(starStation.id, starStation.mapPosition);
+  useEffect(() => {
+    setSelectedSystemId((current) => current || activeSystemId);
+  }, [activeSystemId]);
 
-      const ringRadius = 70 + Math.min(childStations.length * 8, 54);
-      childStations
-        .sort((left, right) => left.name.localeCompare(right.name))
-        .forEach((station, index) => {
-          const angle = (Math.PI * 2 * index) / Math.max(childStations.length, 1) - Math.PI / 2;
-          layoutEntries.set(station.id, [
-            starStation.mapPosition[0] + Math.cos(angle) * ringRadius,
-            starStation.mapPosition[1] + Math.sin(angle) * ringRadius,
-          ]);
-        });
-    });
+  const galaxyMarkers = useMemo<SpaceTabletMarker[]>(() => {
+    return galaxy.systems.map((system) => ({
+      id: `system:${system.id}`,
+      name: system.name,
+      kind: 'system',
+      systemId: system.id,
+      systemName: system.name,
+      mapPosition: [system.mapPosition[0], system.mapPosition[2]],
+      approachRadius: system.radius,
+      parentId: null,
+      subtitle: `${network.filter((station) => station.systemId === system.id).length} stations`,
+      accent: '#8ab4ff',
+      count: network.filter((station) => station.systemId === system.id).length,
+    }));
+  }, [galaxy.systems, network]);
 
-    network.forEach((node) => {
-      node.linkedStationIds.forEach((linkedId) => {
-        const linkedNode = nodesById.get(linkedId);
-        if (!linkedNode) {
-          return;
-        }
+  const galaxyMarkerLookup = useMemo(() => new Map(galaxyMarkers.map((marker) => [marker.id, marker])), [galaxyMarkers]);
 
-        const key = [node.id, linkedNode.id].sort().join(':');
-        if (!uniqueLines.has(key)) {
-          uniqueLines.set(key, { from: node, to: linkedNode });
-        }
+  const selectedSystem = systemById.get(selectedSystemId) ?? systemById.get(activeSystemId) ?? galaxy.systems[0] ?? null;
+
+  const selectedSystemMarkers = useMemo<SpaceTabletMarker[]>(() => {
+    if (!selectedSystem) {
+      return [];
+    }
+
+    const systemStations = network.filter((station) => station.systemId === selectedSystem.id);
+    const systemStationById = new Map(systemStations.map((station) => [station.id, station]));
+    const positions: Vec3Tuple[] = [[0, 0, 0]];
+
+    selectedSystem.planets.forEach((planet) => {
+      positions.push(planet.position);
+      planet.stations.forEach((station) => positions.push(tupleAdd(planet.position, station.position)));
+      planet.moons.forEach((moon) => {
+        const moonAbsolute = tupleAdd(planet.position, moon.position);
+        positions.push(moonAbsolute);
+        moon.stations.forEach((station) => positions.push(tupleAdd(moonAbsolute, station.position)));
       });
     });
 
-    const laidOut = network.map((node) => layoutEntries.get(node.id) ?? node.mapPosition);
-    const xs = laidOut.map((position) => position[0]);
-    const ys = laidOut.map((position) => position[1]);
-    return {
-      lines: Array.from(uniqueLines.values()),
-      layoutById: layoutEntries,
-      bounds: {
-        minX: Math.min(...xs),
-        maxX: Math.max(...xs),
-        minY: Math.min(...ys),
-        maxY: Math.max(...ys),
+    selectedSystem.asteroidGroups.forEach((group) => {
+      positions.push(group.position);
+      positions.push(tupleAdd(group.position, group.station.position));
+      group.asteroids.forEach((asteroid) => positions.push(tupleAdd(group.position, asteroid.position)));
+    });
+
+    if (shipAbsolutePosition && activeSystemId === selectedSystem.id) {
+      positions.push(shipAbsolutePosition);
+    }
+
+    const maxDistance = Math.max(1, ...positions.map((position) => Math.hypot(position[0], position[2])));
+    const mapRadius = 460;
+    const toMap = (position: Vec3Tuple): [number, number] => [
+      (position[0] / maxDistance) * mapRadius,
+      (position[2] / maxDistance) * mapRadius,
+    ];
+
+    const markers: SpaceTabletMarker[] = [
+      {
+        id: `star:${selectedSystem.id}`,
+        name: `${selectedSystem.name} Primary`,
+        kind: 'star',
+        systemId: selectedSystem.id,
+        systemName: selectedSystem.name,
+        mapPosition: [0, 0],
+        localPosition: [0, 0, 0],
+        approachRadius: selectedSystem.radius,
+        parentId: null,
+        subtitle: 'Primary star',
+        accent: '#f8f0a8',
       },
+    ];
+
+    const starStationNode = systemStationById.get(selectedSystem.station.id);
+    if (starStationNode) {
+      markers.push({
+        id: starStationNode.id,
+        name: starStationNode.name,
+        kind: 'station',
+        systemId: selectedSystem.id,
+        systemName: selectedSystem.name,
+        mapPosition: toMap(starStationNode.localPosition),
+        localPosition: starStationNode.localPosition,
+        approachRadius: 180,
+        parentId: `star:${selectedSystem.id}`,
+        stationNode: starStationNode,
+        subtitle: 'Prime station',
+        accent: '#9ee7ff',
+      });
+    }
+
+    selectedSystem.planets.forEach((planet) => {
+      markers.push({
+        id: planet.id,
+        name: planet.name,
+        kind: 'planet',
+        systemId: selectedSystem.id,
+        systemName: selectedSystem.name,
+        mapPosition: toMap(planet.position),
+        localPosition: planet.position,
+        approachRadius: Math.max(planet.radius * 1.2, 180),
+        parentId: `star:${selectedSystem.id}`,
+        subtitle: `${planet.moons.length} moons · ${planet.stations.length} stations`,
+        accent: planet.color,
+      });
+
+      planet.stations.forEach((station) => {
+        const absolute = tupleAdd(planet.position, station.position);
+        const node = systemStationById.get(station.id);
+        markers.push({
+          id: station.id,
+          name: node?.name ?? station.name,
+          kind: 'station',
+          systemId: selectedSystem.id,
+          systemName: selectedSystem.name,
+          mapPosition: toMap(absolute),
+          localPosition: absolute,
+          approachRadius: 60,
+          parentId: planet.id,
+          stationNode: node,
+          subtitle: 'Orbital station',
+          accent: '#8bf2ff',
+        });
+      });
+
+      planet.moons.forEach((moon) => {
+        const moonAbsolute = tupleAdd(planet.position, moon.position);
+        markers.push({
+          id: moon.id,
+          name: moon.name,
+          kind: 'moon',
+          systemId: selectedSystem.id,
+          systemName: selectedSystem.name,
+          mapPosition: toMap(moonAbsolute),
+          localPosition: moonAbsolute,
+          approachRadius: Math.max(moon.radius * 1.8, 120),
+          parentId: planet.id,
+          subtitle: `${moon.stations.length} stations`,
+          accent: moon.color,
+        });
+
+        moon.stations.forEach((station) => {
+          const absolute = tupleAdd(moonAbsolute, station.position);
+          const node = systemStationById.get(station.id);
+          markers.push({
+            id: station.id,
+            name: node?.name ?? station.name,
+            kind: 'station',
+            systemId: selectedSystem.id,
+            systemName: selectedSystem.name,
+            mapPosition: toMap(absolute),
+            localPosition: absolute,
+            approachRadius: 45,
+            parentId: moon.id,
+            stationNode: node,
+            subtitle: 'Moon station',
+            accent: '#8bf2ff',
+          });
+        });
+      });
+    });
+
+    selectedSystem.asteroidGroups.forEach((group, index) => {
+      markers.push({
+        id: group.id,
+        name: `Belt ${index + 1}`,
+        kind: 'asteroid-belt',
+        systemId: selectedSystem.id,
+        systemName: selectedSystem.name,
+        mapPosition: toMap(group.position),
+        localPosition: group.position,
+        approachRadius: Math.max(group.radius * 3, 900),
+        parentId: `star:${selectedSystem.id}`,
+        subtitle: `${group.asteroids.length} asteroids`,
+        accent: '#cbd5e1',
+        count: group.asteroids.length,
+      });
+
+      const beltStationAbsolute = tupleAdd(group.position, group.station.position);
+      const beltStationNode = systemStationById.get(group.station.id);
+      markers.push({
+        id: group.station.id,
+        name: beltStationNode?.name ?? group.station.name,
+        kind: 'station',
+        systemId: selectedSystem.id,
+        systemName: selectedSystem.name,
+        mapPosition: toMap(beltStationAbsolute),
+        localPosition: beltStationAbsolute,
+        approachRadius: 55,
+        parentId: group.id,
+        stationNode: beltStationNode,
+        subtitle: 'Belt station',
+        accent: '#8bf2ff',
+      });
+
+      group.asteroids.forEach((asteroid, asteroidIndex) => {
+        const absolute = tupleAdd(group.position, asteroid.position);
+        markers.push({
+          id: asteroid.id,
+          name: `Asteroid ${asteroidIndex + 1}`,
+          kind: 'asteroid-object',
+          systemId: selectedSystem.id,
+          systemName: selectedSystem.name,
+          mapPosition: toMap(absolute),
+          localPosition: absolute,
+          approachRadius: Math.max(asteroid.size * 2.2, 100),
+          parentId: group.id,
+          subtitle: asteroid.shape === 'abstract' ? 'Irregular mass' : 'Stable body',
+          accent: '#cbd5e1',
+        });
+      });
+    });
+
+    if (shipAbsolutePosition && activeSystemId === selectedSystem.id) {
+      markers.push({
+        id: `ship:${selectedSystem.id}`,
+        name: 'Your ship',
+        kind: 'ship',
+        systemId: selectedSystem.id,
+        systemName: selectedSystem.name,
+        mapPosition: toMap(shipAbsolutePosition),
+        localPosition: shipAbsolutePosition,
+        approachRadius: 0,
+        parentId: null,
+        subtitle: 'Current position',
+        accent: '#6ee7ff',
+      });
+    }
+
+    return markers;
+  }, [activeSystemId, network, selectedSystem, shipAbsolutePosition]);
+
+  const selectedSystemMarkerLookup = useMemo(
+    () => new Map(selectedSystemMarkers.map((marker) => [marker.id, marker])),
+    [selectedSystemMarkers],
+  );
+
+  const systemOverviewMarkers = useMemo(
+    () => selectedSystemMarkers.filter((marker) => marker.kind !== 'asteroid-object'),
+    [selectedSystemMarkers],
+  );
+
+  const sectorFocusMarker = useMemo(() => {
+    const current = selectedSystemMarkerLookup.get(selectedStationId);
+    if (!current) {
+      return null;
+    }
+
+    if (current.kind === 'station' || current.kind === 'asteroid-object') {
+      return current.parentId ? selectedSystemMarkerLookup.get(current.parentId) ?? current : current;
+    }
+
+    return current;
+  }, [selectedStationId, selectedSystemMarkerLookup]);
+
+  const sectorMarkers = useMemo<SpaceTabletMarker[]>(() => {
+    if (!selectedSystem || !sectorFocusMarker || !sectorFocusMarker.localPosition) {
+      return [];
+    }
+
+    const focusPosition = sectorFocusMarker.localPosition;
+    const included = selectedSystemMarkers.filter((marker) => {
+      if (marker.systemId !== selectedSystem.id) {
+        return false;
+      }
+      if (marker.id === sectorFocusMarker.id) {
+        return true;
+      }
+      if (marker.kind === 'ship') {
+        return activeSystemId === selectedSystem.id;
+      }
+      if (sectorFocusMarker.kind === 'planet') {
+        return marker.parentId === sectorFocusMarker.id || selectedSystemMarkerLookup.get(marker.parentId ?? '')?.parentId === sectorFocusMarker.id;
+      }
+      if (sectorFocusMarker.kind === 'moon') {
+        return marker.parentId === sectorFocusMarker.id;
+      }
+      if (sectorFocusMarker.kind === 'asteroid-belt') {
+        return marker.parentId === sectorFocusMarker.id;
+      }
+      return marker.parentId === sectorFocusMarker.id || marker.id === `star:${selectedSystem.id}`;
+    });
+
+    const relativePositions = included
+      .map((marker) => marker.localPosition)
+      .filter((position): position is Vec3Tuple => Boolean(position))
+      .map((position) => tupleSubtract(position, focusPosition));
+    relativePositions.push([0, 0, 0]);
+
+    const maxDistance = Math.max(1, ...relativePositions.map((position) => Math.hypot(position[0], position[2])));
+    const mapRadius = 380;
+    const toMap = (position: Vec3Tuple): [number, number] => [
+      (position[0] / maxDistance) * mapRadius,
+      (position[2] / maxDistance) * mapRadius,
+    ];
+
+    return included.map((marker) => ({
+      ...marker,
+      mapPosition: marker.localPosition ? toMap(tupleSubtract(marker.localPosition, focusPosition)) : [0, 0],
+      subtitle: marker.id === sectorFocusMarker.id ? `${marker.subtitle} · sector focus` : marker.subtitle,
+    }));
+  }, [activeSystemId, sectorFocusMarker, selectedSystem, selectedSystemMarkerLookup, selectedSystemMarkers]);
+
+  const currentSystemMarkerId = `system:${activeSystemId}`;
+  const currentShipMarkerId = `ship:${activeSystemId}`;
+  const visibleMarkers = useMemo(() => {
+    switch (mapMode) {
+      case 'system':
+        return systemOverviewMarkers;
+      case 'sector':
+        return sectorMarkers;
+      default:
+        return galaxyMarkers;
+    }
+  }, [galaxyMarkers, mapMode, sectorMarkers, systemOverviewMarkers]);
+
+  const visibleMarkerLookup = useMemo(() => new Map(visibleMarkers.map((marker) => [marker.id, marker])), [visibleMarkers]);
+  const combinedMarkerLookup = useMemo(
+    () => new Map([...galaxyMarkers, ...selectedSystemMarkers, ...sectorMarkers].map((marker) => [marker.id, marker])),
+    [galaxyMarkers, sectorMarkers, selectedSystemMarkers],
+  );
+
+  const selectedMarker =
+    combinedMarkerLookup.get(selectedStationId) ??
+    selectedSystemMarkerLookup.get(selectedStationId) ??
+    galaxyMarkerLookup.get(selectedStationId) ??
+    galaxyMarkerLookup.get(`system:${selectedSystemId}`) ??
+    visibleMarkers[0] ??
+    null;
+
+  useEffect(() => {
+    if (!selectedMarker) {
+      return;
+    }
+
+    if (selectedMarker.kind === 'system') {
+      setSelectedSystemId(selectedMarker.systemId);
+    } else if (selectedMarker.systemId) {
+      setSelectedSystemId(selectedMarker.systemId);
+    }
+  }, [selectedMarker]);
+
+  const filteredVisibleMarkers = useMemo(() => {
+    const loweredQuery = query.trim().toLowerCase();
+    const matchesFilter = (marker: SpaceTabletMarker) => {
+      if (marker.kind === 'ship') {
+        return true;
+      }
+
+      if (filter === 'stations') {
+        return marker.kind === 'station' || marker.kind === 'system';
+      }
+
+      if (filter === 'bodies') {
+        return marker.kind === 'system' || marker.kind === 'star' || marker.kind === 'planet' || marker.kind === 'moon';
+      }
+
+      if (filter === 'asteroids') {
+        return marker.kind === 'asteroid-belt' || marker.kind === 'asteroid-object';
+      }
+
+      return true;
     };
-  }, [network]);
 
-  const selectedStation = network.find((station) => station.id === selectedStationId) ?? network[0] ?? null;
-  const expandedSystemId = selectedStation?.systemId ?? network[0]?.systemId ?? '';
-  const selectedSystem = galaxy.systems.find((system) => system.id === expandedSystemId) ?? null;
-  const detailStationPositions = useMemo(() => {
-    const positions = new Map<string, [number, number]>();
+    return visibleMarkers.filter((marker) => {
+      if (!matchesFilter(marker)) {
+        return marker.id === selectedStationId || marker.id === currentSystemMarkerId || marker.id === currentShipMarkerId;
+      }
 
-    if (!selectedSystem) {
-      return positions;
-    }
+      if (!loweredQuery) {
+        return true;
+      }
 
-    const starStation = network.find((station) => station.systemId === selectedSystem.id && station.kind === 'star');
-    const center = starStation ? layoutById.get(starStation.id) ?? starStation.mapPosition : null;
-
-    if (!center) {
-      return positions;
-    }
-
-    const maxOrbit = Math.max(
-      1,
-      ...selectedSystem.planets.map((planet) => Math.hypot(planet.position[0], planet.position[2])),
-      ...selectedSystem.asteroidGroups.map((group) => Math.hypot(group.position[0], group.position[2])),
-    );
-    const detailRadius = 180;
-
-    selectedSystem.planets.forEach((planet, index) => {
-      const planetPosition: [number, number] = [
-        center[0] + (planet.position[0] / maxOrbit) * detailRadius,
-        center[1] + (planet.position[2] / maxOrbit) * detailRadius,
-      ];
-      const angle = (index / Math.max(selectedSystem.planets.length, 1)) * Math.PI * 2 - Math.PI / 2;
-      positions.set(planet.station.id, [planetPosition[0] + Math.cos(angle) * 22, planetPosition[1] + Math.sin(angle) * 22]);
+      return `${marker.name} ${marker.systemName} ${marker.subtitle}`.toLowerCase().includes(loweredQuery);
     });
-
-    selectedSystem.asteroidGroups.forEach((group, index) => {
-      const groupPosition: [number, number] = [
-        center[0] + (group.position[0] / maxOrbit) * detailRadius,
-        center[1] + (group.position[2] / maxOrbit) * detailRadius,
-      ];
-      const angle = (index / Math.max(selectedSystem.asteroidGroups.length, 1)) * Math.PI * 2 + Math.PI / 4;
-      positions.set(group.station.id, [groupPosition[0] + Math.cos(angle) * 18, groupPosition[1] + Math.sin(angle) * 18]);
-    });
-
-    return positions;
-  }, [layoutById, network, selectedSystem]);
-  const galaxyStations = useMemo(() => network.filter((station) => station.kind === 'star'), [network]);
-  const systemStations = useMemo(() => network.filter((station) => station.systemId === expandedSystemId), [expandedSystemId, network]);
-  const visibleStations = useMemo(
-    () => (mapMode === 'galaxy' ? galaxyStations : systemStations),
-    [galaxyStations, mapMode, systemStations],
-  );
-  const visibleStationIds = useMemo(() => new Set(visibleStations.map((station) => station.id)), [visibleStations]);
-  const visibleLines = useMemo(
-    () =>
-      lines.filter((line) => {
-        if (!visibleStationIds.has(line.from.id) || !visibleStationIds.has(line.to.id)) {
-          return false;
-        }
-
-        return mapMode === 'system' || (line.from.kind === 'star' && line.to.kind === 'star');
-      }),
-    [lines, mapMode, visibleStationIds],
-  );
-
-  const systemMapPositions = useMemo(() => {
-    const positions = new Map<string, [number, number]>();
-
-    if (!selectedSystem) {
-      return positions;
-    }
-
-    positions.set(selectedSystem.station.id, [0, 0]);
-
-    const maxOrbit = Math.max(
-      1,
-      ...selectedSystem.planets.map((planet) => Math.hypot(planet.position[0], planet.position[2])),
-      ...selectedSystem.asteroidGroups.map((group) => Math.hypot(group.position[0], group.position[2])),
-    );
-    const detailRadius = 260;
-
-    selectedSystem.planets.forEach((planet, index) => {
-      const bodyPosition: [number, number] = [
-        (planet.position[0] / maxOrbit) * detailRadius,
-        (planet.position[2] / maxOrbit) * detailRadius,
-      ];
-      const angle = (index / Math.max(selectedSystem.planets.length, 1)) * Math.PI * 2 - Math.PI / 2;
-      positions.set(planet.station.id, [bodyPosition[0] + Math.cos(angle) * 26, bodyPosition[1] + Math.sin(angle) * 26]);
-    });
-
-    selectedSystem.asteroidGroups.forEach((group, index) => {
-      const bodyPosition: [number, number] = [
-        (group.position[0] / maxOrbit) * detailRadius,
-        (group.position[2] / maxOrbit) * detailRadius,
-      ];
-      const angle = (index / Math.max(selectedSystem.asteroidGroups.length, 1)) * Math.PI * 2 + Math.PI / 4;
-      positions.set(group.station.id, [bodyPosition[0] + Math.cos(angle) * 22, bodyPosition[1] + Math.sin(angle) * 22]);
-    });
-
-    return positions;
-  }, [selectedSystem]);
+  }, [currentShipMarkerId, currentSystemMarkerId, filter, query, selectedStationId, visibleMarkers]);
 
   const activeBounds = useMemo(() => {
-    if (mapMode === 'galaxy') {
-      return bounds;
-    }
+    const boundsSource = filteredVisibleMarkers.length > 0 ? filteredVisibleMarkers : visibleMarkers;
+    const xs = boundsSource.map((marker) => marker.mapPosition[0]);
+    const ys = boundsSource.map((marker) => marker.mapPosition[1]);
+    const minX = Math.min(...xs, -50);
+    const maxX = Math.max(...xs, 50);
+    const minY = Math.min(...ys, -50);
+    const maxY = Math.max(...ys, 50);
+    const paddingX = Math.max((maxX - minX) * 0.18, 120);
+    const paddingY = Math.max((maxY - minY) * 0.18, 120);
 
-    const positions = systemStations.map((station) => systemMapPositions.get(station.id) ?? [0, 0]);
-    const xs = positions.map((position) => position[0]);
-    const ys = positions.map((position) => position[1]);
     return {
-      minX: Math.min(...xs, -1),
-      maxX: Math.max(...xs, 1),
-      minY: Math.min(...ys, -1),
-      maxY: Math.max(...ys, 1),
+      minX: minX - paddingX,
+      maxX: maxX + paddingX,
+      minY: minY - paddingY,
+      maxY: maxY + paddingY,
     };
-  }, [bounds, mapMode, systemMapPositions, systemStations]);
+  }, [filteredVisibleMarkers, visibleMarkers]);
 
   const project = useCallback(
     (position: [number, number]) => {
@@ -1985,91 +2288,156 @@ function SpaceTablet({
     [activeBounds, MAP_CANVAS_HEIGHT, MAP_CANVAS_WIDTH],
   );
 
+  const mapConnections = useMemo(() => {
+    if (mapMode === 'galaxy') {
+      const starStations = network.filter((station) => station.kind === 'star');
+      const byId = new Map(starStations.map((station) => [station.id, station]));
+      const routes = new Map<string, { from: [number, number]; to: [number, number]; variant: 'network' | 'route' }>();
+
+      starStations.forEach((station) => {
+        station.linkedStationIds.forEach((linkedId) => {
+          const linked = byId.get(linkedId);
+          if (!linked) {
+            return;
+          }
+
+          const key = [station.id, linked.id].sort().join(':');
+          if (!routes.has(key)) {
+            routes.set(key, {
+              from: station.mapPosition,
+              to: linked.mapPosition,
+              variant: 'network',
+            });
+          }
+        });
+      });
+
+      if (selectedMarker?.systemId && selectedMarker.systemId !== activeSystemId) {
+        const fromSystem = systemById.get(activeSystemId);
+        const toSystem = systemById.get(selectedMarker.systemId);
+        if (fromSystem && toSystem) {
+          routes.set('active-route', {
+            from: [fromSystem.mapPosition[0], fromSystem.mapPosition[2]],
+            to: [toSystem.mapPosition[0], toSystem.mapPosition[2]],
+            variant: 'route',
+          });
+        }
+      }
+
+      return Array.from(routes.values());
+    }
+
+    const lookup = new Map((filteredVisibleMarkers.length > 0 ? filteredVisibleMarkers : visibleMarkers).map((marker) => [marker.id, marker]));
+    const connections: Array<{ from: [number, number]; to: [number, number]; variant: 'network' | 'route' }> = (filteredVisibleMarkers.length > 0 ? filteredVisibleMarkers : visibleMarkers)
+      .filter((marker) => marker.parentId && lookup.has(marker.parentId))
+      .map((marker) => ({
+        from: lookup.get(marker.parentId!)!.mapPosition,
+        to: marker.mapPosition,
+        variant: 'network' as const,
+      }));
+
+    if (selectedMarker?.localPosition && selectedMarker.systemId === activeSystemId && lookup.has(currentShipMarkerId)) {
+      connections.push({
+        from: lookup.get(currentShipMarkerId)!.mapPosition,
+        to: selectedMarker.mapPosition,
+        variant: 'route',
+      });
+    }
+
+    return connections;
+  }, [activeSystemId, currentShipMarkerId, filteredVisibleMarkers, mapMode, network, selectedMarker, systemById, visibleMarkers]);
+
+  const orbitRings = useMemo(() => {
+    if (mapMode === 'galaxy') {
+      return [] as Array<{ center: [number, number]; radius: number }>;
+    }
+
+    const lookup = new Map((filteredVisibleMarkers.length > 0 ? filteredVisibleMarkers : visibleMarkers).map((marker) => [marker.id, marker]));
+    return (filteredVisibleMarkers.length > 0 ? filteredVisibleMarkers : visibleMarkers)
+      .filter((marker) => marker.parentId && lookup.has(marker.parentId) && marker.kind !== 'station' && marker.kind !== 'ship' && marker.kind !== 'asteroid-object')
+      .map((marker) => {
+        const parent = lookup.get(marker.parentId!)!;
+        return {
+          center: parent.mapPosition,
+          radius: Math.hypot(marker.mapPosition[0] - parent.mapPosition[0], marker.mapPosition[1] - parent.mapPosition[1]),
+        };
+      })
+      .filter((ring) => ring.radius > 14);
+  }, [filteredVisibleMarkers, mapMode, visibleMarkers]);
+
+  const nearestContact = useMemo(() => {
+    if (!shipAbsolutePosition) {
+      return currentSystemMarkerId;
+    }
+
+    const candidates = selectedSystemMarkers.filter(
+      (marker) => marker.kind !== 'ship' && marker.systemId === activeSystemId && marker.localPosition,
+    );
+    let bestId = currentSystemMarkerId;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    candidates.forEach((marker) => {
+      const nextDistance = distanceBetweenPoints(shipAbsolutePosition, marker.localPosition);
+      if (nextDistance !== null && nextDistance < bestDistance) {
+        bestId = marker.id;
+        bestDistance = nextDistance;
+      }
+    });
+
+    return bestId;
+  }, [activeSystemId, currentSystemMarkerId, selectedSystemMarkers, shipAbsolutePosition]);
+
+  const currentLocationName = useMemo(() => {
+    if (mapMode === 'galaxy') {
+      return systemById.get(activeSystemId)?.name ?? 'Unknown system';
+    }
+
+    return combinedMarkerLookup.get(nearestContact)?.name ?? systemById.get(activeSystemId)?.name ?? 'Unknown contact';
+  }, [activeSystemId, combinedMarkerLookup, mapMode, nearestContact, systemById]);
+
+  const focusMarker = useCallback(
+    (markerId: string, nextMode?: SpaceTabletMapMode) => {
+      const marker = combinedMarkerLookup.get(markerId) ?? galaxyMarkerLookup.get(markerId);
+      if (!marker) {
+        return;
+      }
+
+      setSelectedStationId(markerId);
+      setSelectedSystemId(marker.systemId);
+
+      if (nextMode) {
+        setMapMode(nextMode);
+      }
+    },
+    [combinedMarkerLookup, galaxyMarkerLookup],
+  );
+
   const resetView = useCallback(() => {
     const viewport = viewportRef.current;
-    if (!viewport || visibleStations.length === 0) {
+    if (!viewport) {
       setZoom(1);
       setPan({ x: 0, y: 0 });
       return;
     }
 
-    const positions = visibleStations.map((station) => project(layoutById.get(station.id) ?? station.mapPosition));
-    const xs = positions.map((position) => position.left);
-    const ys = positions.map((position) => position.top);
-    const minX = Math.min(...xs);
-    const maxX = Math.max(...xs);
-    const minY = Math.min(...ys);
-    const maxY = Math.max(...ys);
-    const contentWidth = Math.max(maxX - minX, 220);
-    const contentHeight = Math.max(maxY - minY, 220);
-    const padding = 140;
-    const nextZoom = clamp(
-      Math.min(viewport.clientWidth / (contentWidth + padding), viewport.clientHeight / (contentHeight + padding)),
-      0.6,
-      1.7,
-    );
-    const centerX = (minX + maxX) * 0.5;
-    const centerY = (minY + maxY) * 0.5;
+    const fitWidth = viewport.clientWidth / MAP_CANVAS_WIDTH;
+    const fitHeight = viewport.clientHeight / MAP_CANVAS_HEIGHT;
+    const baseZoom = Math.min(fitWidth, fitHeight) * 0.96;
+    const nextZoom = clamp(baseZoom, 0.52, mapMode === 'galaxy' ? 0.92 : 1.02);
 
     setZoom(nextZoom);
     setPan({
-      x: viewport.clientWidth * 0.5 - centerX * nextZoom,
-      y: viewport.clientHeight * 0.5 - centerY * nextZoom,
+      x: viewport.clientWidth * 0.5 - (MAP_CANVAS_WIDTH * nextZoom) * 0.5,
+      y: viewport.clientHeight * 0.5 - (MAP_CANVAS_HEIGHT * nextZoom) * 0.5,
     });
-  }, [layoutById, mapMode, project, systemMapPositions, visibleStations]);
-
-  const zoomToSystem = useCallback(
-    (systemId: string) => {
-      const viewport = viewportRef.current;
-      if (!viewport) {
-        return;
-      }
-
-      const nextSystemStations = network.filter((station) => station.systemId === systemId);
-      if (nextSystemStations.length === 0) {
-        return;
-      }
-
-      const positions = nextSystemStations.map((station) =>
-        project(systemMapPositions.get(station.id) ?? layoutById.get(station.id) ?? station.mapPosition),
-      );
-      const xs = positions.map((position) => position.left);
-      const ys = positions.map((position) => position.top);
-      const minX = Math.min(...xs);
-      const maxX = Math.max(...xs);
-      const minY = Math.min(...ys);
-      const maxY = Math.max(...ys);
-      const contentWidth = Math.max(maxX - minX, 180);
-      const contentHeight = Math.max(maxY - minY, 180);
-      const padding = 120;
-      const nextZoom = clamp(
-        Math.min(viewport.clientWidth / (contentWidth + padding), viewport.clientHeight / (contentHeight + padding)),
-        1.4,
-        2.4,
-      );
-      const centerX = (minX + maxX) * 0.5;
-      const centerY = (minY + maxY) * 0.5;
-
-      setZoom(nextZoom);
-      setPan({
-        x: viewport.clientWidth * 0.5 - centerX * nextZoom,
-        y: viewport.clientHeight * 0.5 - centerY * nextZoom,
-      });
-    },
-    [layoutById, network, project, systemMapPositions],
-  );
+  }, [MAP_CANVAS_HEIGHT, MAP_CANVAS_WIDTH, mapMode]);
 
   useEffect(() => {
-    if (pendingSystemZoomRef.current) {
-      pendingSystemZoomRef.current = false;
-      zoomToSystem(expandedSystemId);
-      return;
-    }
-
     resetView();
-  }, [expandedSystemId, mapMode, resetView, zoomToSystem]);
+  }, [mapMode, query, filter, selectedSystemId, selectedStationId, resetView]);
 
   const handleWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
     const viewport = viewportRef.current;
 
     if (!viewport) {
@@ -2120,83 +2488,98 @@ function SpaceTablet({
     setDragState(null);
   }, []);
 
-  const systemDetailMarkers = useMemo(() => {
-    if (!selectedSystem || mapMode !== 'system') {
-      return [] as Array<{ id: string; name: string; kind: 'star' | 'planet' | 'moon' | 'asteroid'; position: [number, number] }>;
-    }
+  const selectedDistance = selectedMarker?.localPosition ? distanceBetweenPoints(shipAbsolutePosition, selectedMarker.localPosition) : null;
+  const selectedStationNode =
+    selectedMarker?.stationNode ?? (selectedMarker?.kind === 'station' ? stationById.get(selectedMarker.id) : undefined);
+  const selectedCanAutopilot = Boolean(
+    selectedMarker &&
+      selectedMarker.kind !== 'system' &&
+      selectedMarker.kind !== 'ship' &&
+      selectedMarker.systemId === activeSystemId &&
+      selectedMarker.localPosition &&
+      hudMode !== 'space',
+  );
+  const selectedCanTravel = Boolean(hudMode === 'space' && selectedStationNode);
+  const selectedAutopilotActive = Boolean(autopilotEngaged && selectedMarker && autopilotDestinationId === selectedMarker.id);
 
-    const center = systemMapPositions.get(selectedSystem.station.id) ?? [0, 0];
-
-    if (!center) {
-      return [] as Array<{ id: string; name: string; kind: 'star' | 'planet' | 'moon' | 'asteroid'; position: [number, number] }>;
-    }
-
-    const maxOrbit = Math.max(
-      1,
-      ...selectedSystem.planets.map((planet) => Math.hypot(planet.position[0], planet.position[2])),
-      ...selectedSystem.asteroidGroups.map((group) => Math.hypot(group.position[0], group.position[2])),
-    );
-    const detailRadius = 180;
-    const markers: Array<{ id: string; name: string; kind: 'star' | 'planet' | 'moon' | 'asteroid'; position: [number, number] }> = [
-      { id: `${selectedSystem.id}-star`, name: selectedSystem.name, kind: 'star', position: center },
-    ];
-
-    selectedSystem.planets.forEach((planet, index) => {
-      const planetPosition: [number, number] = [
-        center[0] + (planet.position[0] / maxOrbit) * detailRadius,
-        center[1] + (planet.position[2] / maxOrbit) * detailRadius,
-      ];
-
-      markers.push({
-        id: planet.id,
-        name: `Planet ${index + 1}`,
-        kind: 'planet',
-        position: planetPosition,
-      });
-
-      const maxMoonOrbit = Math.max(1, ...planet.moons.map((moon) => Math.hypot(moon.position[0], moon.position[2])));
-      planet.moons.forEach((moon, moonIndex) => {
-        markers.push({
-          id: moon.id,
-          name: `Moon ${moonIndex + 1}`,
-          kind: 'moon',
-          position: [
-            planetPosition[0] + (moon.position[0] / maxMoonOrbit) * 26,
-            planetPosition[1] + (moon.position[2] / maxMoonOrbit) * 26,
-          ],
-        });
-      });
-    });
-
-    selectedSystem.asteroidGroups.forEach((group, index) => {
-      markers.push({
-        id: group.id,
-        name: `Belt ${index + 1}`,
-        kind: 'asteroid',
-        position: [
-          center[0] + (group.position[0] / maxOrbit) * detailRadius,
-          center[1] + (group.position[2] / maxOrbit) * detailRadius,
-        ],
-      });
-    });
-
-    return markers;
-  }, [mapMode, selectedSystem, systemMapPositions]);
-
-  const visibleDetailMarkers = useMemo(() => {
-    return systemDetailMarkers.filter((marker) => {
-      if (marker.kind === 'star') {
-        return zoom >= 0.95;
+  const buildDestination = useCallback(
+    (marker: SpaceTabletMarker): AutopilotDestination | null => {
+      if (!marker.localPosition) {
+        return null;
       }
-      if (marker.kind === 'planet') {
-        return zoom >= 1.05;
-      }
-      if (marker.kind === 'asteroid') {
-        return zoom >= 1.15;
-      }
-      return zoom >= 1.45;
-    });
-  }, [systemDetailMarkers, zoom]);
+
+      const destinationKind: AutopilotDestinationKind =
+        marker.kind === 'station'
+          ? marker.stationNode?.kind ?? 'planet'
+          : marker.kind === 'asteroid-belt' || marker.kind === 'asteroid-object'
+            ? 'asteroid-object'
+            : marker.kind === 'moon'
+              ? 'moon'
+              : marker.kind === 'star' || marker.kind === 'planet'
+                ? marker.kind
+                : 'planet';
+
+      return {
+        id: marker.id,
+        name: marker.name,
+        kind: destinationKind,
+        systemId: marker.systemId,
+        systemName: marker.systemName,
+        localPosition: marker.localPosition,
+        approachRadius: marker.approachRadius,
+        distanceFromShip: distanceBetweenPoints(shipAbsolutePosition, marker.localPosition) ?? 0,
+      };
+    },
+    [shipAbsolutePosition],
+  );
+
+  const stationDirectory = useMemo(() => {
+    const loweredQuery = query.trim().toLowerCase();
+    const directory = [...network]
+      .filter((station) => {
+        if (filter !== 'all' && filter !== 'stations') {
+          return false;
+        }
+
+        if (!loweredQuery) {
+          return true;
+        }
+
+        return `${station.name} ${station.systemName} ${station.kind}`.toLowerCase().includes(loweredQuery);
+      })
+      .sort((left, right) => {
+        const leftPriority = left.systemId === activeSystemId ? 0 : 1;
+        const rightPriority = right.systemId === activeSystemId ? 0 : 1;
+        if (leftPriority !== rightPriority) {
+          return leftPriority - rightPriority;
+        }
+
+        return left.name.localeCompare(right.name);
+      });
+    return loweredQuery ? directory.slice(0, 120) : directory.slice(0, 48);
+  }, [activeSystemId, filter, network, query]);
+
+  const contactDirectory = useMemo(() => {
+    const loweredQuery = query.trim().toLowerCase();
+    const source = mapMode === 'sector' ? sectorMarkers : systemOverviewMarkers;
+    const directory = [...source]
+      .filter((marker) => marker.kind !== 'ship' && marker.kind !== 'station' && marker.kind !== 'system')
+      .filter((marker) => (filter === 'stations' ? false : filter === 'asteroids' ? marker.kind === 'asteroid-belt' || marker.kind === 'asteroid-object' : true))
+      .filter((marker) => {
+        if (!loweredQuery) {
+          return true;
+        }
+
+        return `${marker.name} ${marker.subtitle}`.toLowerCase().includes(loweredQuery);
+      })
+      .sort((left, right) => left.name.localeCompare(right.name));
+    return loweredQuery ? directory.slice(0, 120) : directory.slice(0, mapMode === 'sector' ? 80 : 24);
+  }, [filter, mapMode, query, sectorMarkers, systemOverviewMarkers]);
+
+  const selectedVisibleMarker = visibleMarkerLookup.get(selectedStationId) ?? visibleMarkerLookup.get(selectedMarker?.id ?? '');
+  const mapSurfaceMarkers = filteredVisibleMarkers.length > 0 ? filteredVisibleMarkers : visibleMarkers;
+  const activeDirectory = directoryTab === 'stations' ? stationDirectory : contactDirectory;
+
 
   return (
     <section className="tablet-shell">
@@ -2204,8 +2587,13 @@ function SpaceTablet({
         <div className="tablet-header">
           <div>
             <span className="tablet-eyebrow">Space-Tablet</span>
-            <h3>Station Network</h3>
-            <p>Select any linked station node to fast travel there instantly.</p>
+            <h3>Galaxy Navigation Grid</h3>
+            <p>Modern tactical map for galaxy travel, in-system routing, and live object tracking.</p>
+            <div className="tablet-status-row">
+              <span className="tablet-status-chip">You are near {currentLocationName}</span>
+              <span className="tablet-status-chip">{hudMode === 'space' ? 'Fast-travel ready' : 'Autopilot routing online'}</span>
+              <span className="tablet-status-chip">{selectedSystem?.name ?? 'No system selected'}</span>
+            </div>
           </div>
           <button onClick={onClose} type="button">
             Close
@@ -2215,6 +2603,22 @@ function SpaceTablet({
         <div className="tablet-layout">
           <div className="tablet-map-panel">
             <div className="tablet-toolbar">
+              <div className="tablet-tab-group">
+                <button className={mapMode === 'galaxy' ? 'tablet-tab-active' : ''} onClick={() => setMapMode('galaxy')} type="button">
+                  Galaxy
+                </button>
+                <button className={mapMode === 'system' ? 'tablet-tab-active' : ''} onClick={() => setMapMode('system')} type="button">
+                  System
+                </button>
+                <button
+                  className={mapMode === 'sector' ? 'tablet-tab-active' : ''}
+                  disabled={!sectorFocusMarker}
+                  onClick={() => setMapMode('sector')}
+                  type="button"
+                >
+                  Sector
+                </button>
+              </div>
               <button onClick={() => setZoom((current) => clamp(current + 0.2, 0.55, 2.6))} type="button">
                 +
               </button>
@@ -2224,17 +2628,9 @@ function SpaceTablet({
               <button onClick={resetView} type="button">
                 Fit
               </button>
-              {mapMode === 'system' ? (
-                <button
-                  onClick={() => {
-                    setMapMode('galaxy');
-                    pendingSystemZoomRef.current = false;
-                  }}
-                  type="button"
-                >
-                  Galaxy
-                </button>
-              ) : null}
+              <button onClick={() => setPan({ x: 0, y: 0 })} type="button">
+                Center
+              </button>
               <span className="tablet-zoom">{Math.round(zoom * 100)}%</span>
             </div>
 
@@ -2248,27 +2644,30 @@ function SpaceTablet({
               onWheel={handleWheel}
               ref={viewportRef}
             >
+              <div className="tablet-map-hud">
+                <strong>{mapMode === 'galaxy' ? 'Galaxy overview' : mapMode === 'system' ? `${selectedSystem?.name ?? 'System'} map` : `${sectorFocusMarker?.name ?? 'Sector'} detail`}</strong>
+                <span>{mapMode === 'galaxy' ? 'All star systems and jump routes' : mapMode === 'system' ? 'Clean system overview with stations, worlds, belts, and your live position' : 'Detailed local sector with close-range contacts'}</span>
+              </div>
+
               <div
                 className="tablet-map-canvas"
                 style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
               >
-                <svg aria-hidden="true" className="tablet-lines" preserveAspectRatio="none" viewBox="0 0 1600 1200">
-                  {visibleLines.map((line) => {
-                    const fromPosition =
-                      mapMode === 'system'
-                        ? systemMapPositions.get(line.from.id) ?? [0, 0]
-                        : layoutById.get(line.from.id) ?? line.from.mapPosition;
-                    const toPosition =
-                      mapMode === 'system'
-                        ? systemMapPositions.get(line.to.id) ?? [0, 0]
-                        : layoutById.get(line.to.id) ?? line.to.mapPosition;
-                    const from = project(fromPosition);
-                    const to = project(toPosition);
+                <svg className="tablet-lines" viewBox={`0 0 ${MAP_CANVAS_WIDTH} ${MAP_CANVAS_HEIGHT}`}>
+                  {orbitRings.map((ring, index) => {
+                    const center = project(ring.center);
+                    const projectedEdge = project([ring.center[0] + ring.radius, ring.center[1]]);
+                    const radius = Math.abs(projectedEdge.left - center.left);
+                    return <circle className="tablet-orbit-ring" cx={center.left} cy={center.top} key={`ring-${index}`} r={radius} />;
+                  })}
+
+                  {mapConnections.map((connection, index) => {
+                    const from = project(connection.from);
+                    const to = project(connection.to);
                     return (
                       <line
-                        key={`${line.from.id}-${line.to.id}`}
-                        stroke="rgba(96, 165, 250, 0.26)"
-                        strokeWidth="3"
+                        className={`tablet-link tablet-link-${connection.variant}`}
+                        key={`line-${index}`}
                         x1={from.left}
                         x2={to.left}
                         y1={from.top}
@@ -2278,59 +2677,81 @@ function SpaceTablet({
                   })}
                 </svg>
 
-                {visibleStations.map((station) => {
-                  const projected = project(
-                    mapMode === 'system'
-                      ? systemMapPositions.get(station.id) ?? [0, 0]
-                      : layoutById.get(station.id) ?? station.mapPosition,
-                  );
-                  const selected = station.id === selectedStation?.id;
-                  const nodeScale = station.kind === 'star' ? 1 : selected ? 1.08 : 1;
+                {mapSurfaceMarkers.map((marker) => {
+                  const projected = project(marker.mapPosition);
+                  const selected = selectedVisibleMarker?.id === marker.id || selectedMarker?.id === marker.id;
+                  const isCurrent = marker.id === currentSystemMarkerId || marker.id === currentShipMarkerId || marker.id === nearestContact;
+                  const shouldShowLabel = selected;
+
+                  const markerDistance = marker.localPosition ? distanceBetweenPoints(shipAbsolutePosition, marker.localPosition) : null;
+                  const markerStationNode = marker.kind === 'station' ? stationById.get(marker.id) : marker.stationNode;
+                  const canTravel = Boolean(hudMode === 'space' && markerStationNode);
+                  const canAutopilot = Boolean(marker.kind !== 'system' && hudMode !== 'space' && marker.systemId === activeSystemId && typeof markerDistance === 'number' && markerDistance > 50);
+                  const isAutopilotTarget = autopilotEngaged && autopilotDestinationId === marker.id;
+
                   return (
                     <button
-                      className={`tablet-node tablet-node-${station.kind} ${selected ? 'tablet-node-selected' : ''}`}
-                      key={station.id}
+                      className={`tablet-marker tablet-marker-${marker.kind} ${selected ? 'tablet-marker-selected' : ''} ${isCurrent ? 'tablet-marker-current' : ''}`}
+                      key={marker.id}
                       onClick={() => {
-                        if (station.kind === 'star') {
-                          setMapMode('system');
-                          pendingSystemZoomRef.current = true;
-                        }
-                        setSelectedStationId(station.id);
+                        focusMarker(marker.id, undefined);
                       }}
                       style={{
                         left: `${projected.left}px`,
                         top: `${projected.top}px`,
                         ['--tablet-label-scale' as string]: `${1 / zoom}`,
-                        ['--tablet-node-scale' as string]: `${nodeScale}`,
+                        zIndex: selected ? 1000 : undefined
                       }}
                       type="button"
                     >
-                      <span className="tablet-node-core" />
-                      {selected && station.kind !== 'star' ? (
-                        <span className="tablet-node-label">
-                          <strong>{station.name}</strong>
-                          <small>{station.systemName}</small>
-                        </span>
+                      <span className="tablet-marker-ping" />
+                      <span className="tablet-marker-core" />
+                      {shouldShowLabel ? (
+                        <div className="tablet-marker-label" onClick={(e) => e.stopPropagation()}>
+                          <strong>{marker.name}</strong>
+                          <small>{marker.subtitle}</small>
+
+                          <div className="tablet-label-actions">
+                            {marker.kind === 'system' && mapMode === 'galaxy' ? (
+                              <button onClick={(e) => { e.stopPropagation(); setMapMode('system'); }} type="button">
+                                Zoom into Star System
+                              </button>
+                            ) : null}
+
+                            {marker.kind !== 'system' && marker.kind !== 'ship' && mapMode !== 'sector' && (marker.kind === 'planet' || marker.kind === 'moon' || marker.kind === 'asteroid-belt' || marker.kind === 'star') ? (
+                              <button onClick={(e) => { e.stopPropagation(); setMapMode('sector'); }} type="button">
+                                Zoom into Sector
+                              </button>
+                            ) : null}
+
+                            {canTravel && markerStationNode ? (
+                              <button onClick={(e) => { e.stopPropagation(); onTravel(markerStationNode); }} type="button">
+                                Fast travel here
+                              </button>
+                            ) : null}
+
+                            {canAutopilot ? (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (isAutopilotTarget) {
+                                    onStopAutopilot();
+                                  } else {
+                                    const dest = buildDestination(marker);
+                                    if (dest) {
+                                      onEngageAutopilot(dest);
+                                    }
+                                  }
+                                }}
+                                type="button"
+                              >
+                                {isAutopilotTarget ? 'Stop autopilot' : 'Set autopilot'}
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
                       ) : null}
                     </button>
-                  );
-                })}
-
-                {visibleDetailMarkers.map((marker) => {
-                  const projected = project(marker.position);
-                  return (
-                    <div
-                      className={`tablet-body tablet-body-${marker.kind}`}
-                      key={marker.id}
-                      style={{
-                        left: `${projected.left}px`,
-                        top: `${projected.top}px`,
-                        ['--tablet-label-scale' as string]: `${1 / zoom}`,
-                      }}
-                    >
-                      <span className="tablet-body-core" />
-                      <span className="tablet-body-label">{marker.name}</span>
-                    </div>
                   );
                 })}
               </div>
@@ -2338,26 +2759,167 @@ function SpaceTablet({
           </div>
 
           <aside className="tablet-sidebar">
-            {selectedStation ? (
-              <div className="tablet-selection">
-                <span className="tablet-eyebrow">Selected station</span>
-                <h4>{selectedStation.name}</h4>
-                <p>{selectedStation.systemName}</p>
-                <div className="tablet-selection-meta">
-                  <span>{selectedStation.kind} station</span>
-                  <span>{selectedStation.linkedStationIds.length} links</span>
-                </div>
-                <button onClick={() => onTravel(selectedStation)} type="button">
-                  Fast travel
+            <div className="tablet-selection tablet-panel-card">
+              <span className="tablet-eyebrow">Selection</span>
+              <h4>{selectedMarker?.name ?? 'No target selected'}</h4>
+              <p>{selectedMarker?.systemName ?? 'Select a node on the map'}</p>
+
+              {selectedMarker ? (
+                <>
+                  <div className="tablet-selection-meta">
+                    <span>{formatSpaceTabletKind(selectedMarker.kind)}</span>
+                    <span>{selectedMarker.subtitle}</span>
+                    {selectedMarker.count ? <span>{selectedMarker.count} tracked</span> : null}
+                    {selectedDistance !== null ? <span>{formatDistance(selectedDistance)}</span> : null}
+                    {selectedMarker.systemId === activeSystemId ? <span>In current system</span> : <span>Remote system</span>}
+                  </div>
+
+                  <div className="tablet-action-row">
+                    {selectedMarker.kind === 'system' ? (
+                      <button onClick={() => setMapMode('system')} type="button">
+                        Open system map
+                      </button>
+                    ) : null}
+
+                    {selectedCanTravel && selectedStationNode ? (
+                      <button onClick={() => onTravel(selectedStationNode)} type="button">
+                        Fast travel here
+                      </button>
+                    ) : null}
+
+                    {selectedCanAutopilot ? (
+                      <button
+                        onClick={() => {
+                          if (selectedAutopilotActive) {
+                            onStopAutopilot();
+                            return;
+                          }
+
+                          const destination = buildDestination(selectedMarker);
+                          if (destination) {
+                            onEngageAutopilot(destination);
+                          }
+                        }}
+                        type="button"
+                      >
+                        {selectedAutopilotActive ? 'Stop autopilot' : 'Set autopilot'}
+                      </button>
+                    ) : null}
+
+                    {selectedMarker.kind !== 'system' && selectedMarker.kind !== 'ship' ? (
+                      <button onClick={() => setMapMode('sector')} type="button">
+                        Focus sector
+                      </button>
+                    ) : null}
+                  </div>
+
+                  {hudMode !== 'space' && selectedMarker.systemId !== activeSystemId && selectedMarker.kind !== 'system' ? (
+                    <p className="tablet-selection-note">Travel to this system first to enable local autopilot routing.</p>
+                  ) : null}
+                </>
+              ) : null}
+            </div>
+
+            <div className="tablet-panel-card tablet-search-card">
+              <div className="tablet-sidebar-header">
+                <strong>Filters</strong>
+                <span>{mapMode}</span>
+              </div>
+              <input
+                className="tablet-search"
+                onChange={(event) => setQuery(event.currentTarget.value)}
+                placeholder="Search stations, planets, belts, moons..."
+                type="search"
+                value={query}
+              />
+              <div className="tablet-filter-row">
+                {(['all', 'stations', 'bodies', 'asteroids'] as SpaceTabletFilter[]).map((entry) => (
+                  <button
+                    className={filter === entry ? 'tablet-filter-chip tablet-filter-chip-active' : 'tablet-filter-chip'}
+                    key={entry}
+                    onClick={() => setFilter(entry)}
+                    type="button"
+                  >
+                    {entry}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="tablet-station-list tablet-panel-card tablet-directory-card">
+              <div className="tablet-sidebar-header">
+                <strong>{directoryTab === 'stations' ? 'Jump-capable stations' : 'Tracked contacts'}</strong>
+                <span>{activeDirectory.length}{query.trim() ? '' : '+'}</span>
+              </div>
+
+              <div className="tablet-tab-group tablet-directory-tabs">
+                <button
+                  className={directoryTab === 'stations' ? 'tablet-tab-active' : ''}
+                  onClick={() => setDirectoryTab('stations')}
+                  type="button"
+                >
+                  Stations
+                </button>
+                <button
+                  className={directoryTab === 'contacts' ? 'tablet-tab-active' : ''}
+                  onClick={() => setDirectoryTab('contacts')}
+                  type="button"
+                >
+                  Contacts
                 </button>
               </div>
-            ) : null}
+
+              <div className="tablet-directory-scroll">
+                {directoryTab === 'stations'
+                  ? stationDirectory.map((station) => {
+                      const selected = station.id === selectedStationId;
+                      return (
+                        <button
+                          className={`tablet-list-item ${selected ? 'tablet-list-item-selected' : ''}`}
+                          key={station.id}
+                          onClick={() => {
+                            focusMarker(station.id, 'system');
+                          }}
+                          type="button"
+                        >
+                          <strong>{station.name}</strong>
+                          <small>
+                            {station.systemName} · {station.kind} station
+                          </small>
+                        </button>
+                      );
+                    })
+                  : contactDirectory.map((marker) => {
+                      const selected = marker.id === selectedStationId;
+                      return (
+                        <button
+                          className={`tablet-list-item ${selected ? 'tablet-list-item-selected' : ''}`}
+                          key={marker.id}
+                          onClick={() => {
+                            focusMarker(marker.id, marker.kind === 'system' ? 'galaxy' : 'system');
+                            if (marker.kind !== 'system') {
+                              setSelectedSystemId(marker.systemId);
+                            }
+                          }}
+                          type="button"
+                        >
+                          <strong>{marker.name}</strong>
+                          <small>
+                            {formatSpaceTabletKind(marker.kind)} · {marker.subtitle}
+                          </small>
+                        </button>
+                      );
+                    })}
+              </div>
+            </div>
           </aside>
         </div>
       </div>
     </section>
   );
 }
+
+
 
 function createLensFlareTexture(): THREE.CanvasTexture {
   const size = 256;
@@ -2784,7 +3346,9 @@ function PlanetBody({ physicalPosition, planet }: { physicalPosition: Vec3Tuple;
         </mesh>
       </PhysicalProxyGroup>
 
-      <SpaceStation station={planet.station} physicalPosition={tupleAdd(physicalPosition, planet.station.position)} scale={PLANET_STATION_SCALE} />
+      {planet.stations.map((station) => (
+        <SpaceStation key={station.id} station={station} physicalPosition={tupleAdd(physicalPosition, station.position)} scale={PLANET_STATION_SCALE} />
+      ))}
 
       {planet.moons.map((moon) => (
         <MoonBody key={moon.id} physicalPosition={tupleAdd(physicalPosition, moon.position)} moon={moon} />
@@ -2795,12 +3359,18 @@ function PlanetBody({ physicalPosition, planet }: { physicalPosition: Vec3Tuple;
 
 function MoonBody({ moon, physicalPosition }: { moon: MoonData; physicalPosition: Vec3Tuple }): ReactElement {
   return (
-    <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={PLANET_VISIBILITY_RANGE}>
-      <mesh>
-        <sphereGeometry args={[moon.radius, 16, 16]} />
-        <meshStandardMaterial color={moon.color} roughness={0.97} metalness={0.04} />
-      </mesh>
-    </PhysicalProxyGroup>
+    <>
+      <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={PLANET_VISIBILITY_RANGE}>
+        <mesh>
+          <sphereGeometry args={[moon.radius, 16, 16]} />
+          <meshStandardMaterial color={moon.color} roughness={0.97} metalness={0.04} />
+        </mesh>
+      </PhysicalProxyGroup>
+
+      {moon.stations.map((station) => (
+        <SpaceStation key={station.id} station={station} physicalPosition={tupleAdd(physicalPosition, station.position)} scale={PLANET_STATION_SCALE} />
+      ))}
+    </>
   );
 }
 
@@ -2930,20 +3500,12 @@ function SpaceStation({ station, physicalPosition, scale }: { station: StationDa
 
 function AsteroidDust({ dust, physicalPosition, show }: { dust: DustAsteroidData[]; physicalPosition: Vec3Tuple; show: boolean }): ReactElement {
   const instancedMeshRef = useRef<THREE.InstancedMesh>(null);
-  const pointsRef = useRef<THREE.Points>(null);
-  const { camera } = useThree();
-  const physicalPositionVector = useMemo(() => new THREE.Vector3(...physicalPosition), [physicalPosition]);
-
-  const [positions, matrices] = useMemo(() => {
-    const _positions = new Float32Array(dust.length * 3);
+  
+  const matrices = useMemo(() => {
     const _matrices = new Float32Array(dust.length * 16);
     const dummy = new THREE.Object3D();
 
     dust.forEach((d, i) => {
-      _positions[i * 3] = d.position[0];
-      _positions[i * 3 + 1] = d.position[1];
-      _positions[i * 3 + 2] = d.position[2];
-
       dummy.position.set(d.position[0], d.position[1], d.position[2]);
       dummy.rotation.set(d.rotation[0], d.rotation[1], d.rotation[2]);
       dummy.scale.set(d.size, d.size, d.size);
@@ -2951,7 +3513,7 @@ function AsteroidDust({ dust, physicalPosition, show }: { dust: DustAsteroidData
       dummy.matrix.toArray(_matrices, i * 16);
     });
 
-    return [_positions, _matrices];
+    return _matrices;
   }, [dust]);
 
   useEffect(() => {
@@ -2961,28 +3523,13 @@ function AsteroidDust({ dust, physicalPosition, show }: { dust: DustAsteroidData
     }
   }, [matrices]);
 
-  useFrame(() => {
-    if (!show) return;
-    const distance = physicalPositionVector.distanceTo(camera.position);
-    const showMeshes = distance < 35_000;
-    
-    if (instancedMeshRef.current) instancedMeshRef.current.visible = showMeshes;
-    if (pointsRef.current) pointsRef.current.visible = !showMeshes;
-  });
-
   return (
     <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={SMALL_ASTEROID_VISIBILITY_RANGE * 2} linearDistance={ASTEROID_PROXY_LINEAR_DISTANCE} logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}>
       <group visible={show}>
-        <instancedMesh ref={instancedMeshRef} args={[null as any, null as any, dust.length]}>
+        <instancedMesh ref={instancedMeshRef} raycast={() => null} args={[null as any, null as any, dust.length]}>
           <dodecahedronGeometry args={[1, 0]} />
           <meshStandardMaterial color="#64748b" roughness={0.96} metalness={0.06} />
         </instancedMesh>
-        <points ref={pointsRef} visible={false}>
-          <bufferGeometry>
-            <bufferAttribute attach="attributes-position" args={[positions, 3]} />
-          </bufferGeometry>
-          <pointsMaterial size={2} sizeAttenuation={false} color="#64748b" depthWrite={false} transparent opacity={0.65} />
-        </points>
       </group>
     </PhysicalProxyGroup>
   );
@@ -3010,9 +3557,16 @@ function AsteroidMesh({
     if (!outlineMaterialRef.current) {
       return;
     }
+    
+    if (!highlightTarget) {
+      if (outlineMaterialRef.current.opacity !== 0) {
+        outlineMaterialRef.current.opacity = 0;
+      }
+      return;
+    }
 
     const shimmer = 0.35 + (Math.sin(state.clock.elapsedTime * TARGET_OUTLINE_PULSE_SPEED) * 0.5 + 0.5) * 0.65;
-    outlineMaterialRef.current.opacity = highlightTarget ? shimmer : 0;
+    outlineMaterialRef.current.opacity = shimmer;
   });
 
   return (

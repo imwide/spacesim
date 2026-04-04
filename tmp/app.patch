@@ -1,0 +1,7 @@
+--- a/client/src/App.tsx
++++ b/client/src/App.tsx
+@@ -2313,2 +2313,31 @@
+-                        <span className="tablet-node-label">
+-                          <strong>{station.name}</strong>
+-                          <small>{station.systemName}</small>
+-                        </span>

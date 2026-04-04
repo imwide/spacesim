@@ -11,18 +11,21 @@ export interface StationData {
 
 export interface MoonData {
   id: string;
+  name: string;
   position: GalaxyVec3;
   radius: number;
   color: string;
+  stations: StationData[];
 }
 
 export interface PlanetData {
   id: string;
+  name: string;
   position: GalaxyVec3;
   radius: number;
   color: string;
   moons: MoonData[];
-  station: StationData;
+  stations: StationData[];
 }
 
 export interface AsteroidData {
@@ -74,7 +77,7 @@ export const MOON_VISIBILITY_RANGE = 40_000_000;
 export const ASTEROID_GROUP_VISIBILITY_RANGE = 3_000_000_000;
 export const SMALL_ASTEROID_VISIBILITY_RANGE = 1_200_000_000;
 
-const STAR_COUNT = 16;
+const STAR_COUNT = 32;
 const MIN_PLANET_ORBIT_RADIUS = 0.38 * METERS_PER_ASTRONOMICAL_UNIT;
 const MAX_PLANET_ORBIT_RADIUS = 5.2 * METERS_PER_ASTRONOMICAL_UNIT;
 const MAX_MOON_ORBIT_RADIUS = 1_600_000_000;
@@ -150,28 +153,22 @@ function buildPlanetOrbits(random: () => number, count: number): number[] {
 }
 
 function buildMoonCount(random: () => number): number {
-  if (random() > 0.3) {
+  if (random() > 0.6) {
     return 0;
   }
 
-  let count = 1;
-  if (random() <= 0.3) {
-    count += 1;
-  }
-  if (random() <= 0.05) {
-    count += 1;
-  }
-
+  let count = randomIntFromNormal(random, 1, 5, 2, 1.5);
   return count;
 }
 
-function buildMoonOrbits(random: () => number, count: number): number[] {
-  const start = 220_000_000 + random() * 280_000_000;
+function buildMoonOrbits(random: () => number, count: number, planetRadius: number): number[] {
+  // Start moons much further out so there's room for stations etc
+  const start = planetRadius * 4 + 220_000_000 + random() * 280_000_000;
   return Array.from({ length: count }, (_, index) =>
     clamp(
       start + index * (260_000_000 + random() * 320_000_000),
-      120_000_000,
-      MAX_MOON_ORBIT_RADIUS,
+      planetRadius * 4 + 120_000_000,
+      MAX_MOON_ORBIT_RADIUS * 5, // Expanded max to fit more moons
     ),
   );
 }
@@ -207,31 +204,55 @@ function createPlanet(random: () => number, id: string, orbitRadius: number): Pl
   const position: GalaxyVec3 = [Math.cos(angle) * orbitRadius, 0, Math.sin(angle) * orbitRadius];
   const radius = 2_400_000 + Math.pow(random(), 0.62) * 68_000_000;
   const moonCount = buildMoonCount(random);
-  const moonOrbits = buildMoonOrbits(random, moonCount);
+  const moonOrbits = buildMoonOrbits(random, moonCount, radius);
 
   const moons = moonOrbits.map((moonOrbit, index) => {
     const moonAngle = random() * Math.PI * 2;
+    const moonRadius = clamp(radius * (0.08 + random() * 0.16), 120_000, 3_200_000);
+    const moonId = `${id}-moon-${index + 1}`;
+    
+    // Moons now also get 2-4 stations, like close-moons
+    const stationCount = 2 + Math.floor(random() * 3);
+    const stations = Array.from({ length: stationCount }, (_, stationIndex) =>
+      createStation(
+        random,
+        `${moonId}-station-${stationIndex + 1}`,
+        buildStationName(`Moon ${index + 1} Station`, `${stationIndex + 1}`),
+        'planet', // Use planet type to get identical mechanics/looks to a standard station
+        moonRadius + 180_000_000 + random() * 120_000_000,
+      )
+    );
+
     return {
-      id: `${id}-moon-${index + 1}`,
+      id: moonId,
+      name: `Moon ${index + 1}`,
       position: [Math.cos(moonAngle) * moonOrbit, 0, Math.sin(moonAngle) * moonOrbit] as GalaxyVec3,
-      radius: clamp(radius * (0.08 + random() * 0.16), 120_000, 3_200_000),
+      radius: moonRadius,
       color: pick(planetColors, random),
+      stations,
     } satisfies MoonData;
   });
 
+  // Planet gets 2-4 stations stationed away from surface like close-moons
+  const stationCount = 2 + Math.floor(random() * 3);
+  const stations = Array.from({ length: stationCount }, (_, stationIndex) =>
+    createStation(
+      random,
+      `${id}-station-${stationIndex + 1}`,
+      buildStationName(id.split('-').slice(-1)[0] ?? 'Planet', `Station ${stationIndex + 1}`),
+      'planet',
+      radius + 180_000_000 + random() * 120_000_000,
+    )
+  );
+
   return {
     id,
+    name: `Planet ${id.split('-').slice(-1)[0]}`,
     position,
     radius,
     color: pick(planetColors, random),
     moons,
-    station: createStation(
-      random,
-      `${id}-station`,
-      buildStationName(id.split('-').slice(-1)[0] ?? 'Planet', 'Station'),
-      'planet',
-      radius + PLANET_STATION_STANDOFF + random() * 3_500_000,
-    ),
+    stations,
   };
 }
 
@@ -297,9 +318,9 @@ function createAsteroidGroup(random: () => number, id: string): AsteroidGroupDat
 }
 
 function createStarSystem(random: () => number, index: number, mapPosition: GalaxyVec3): StarSystemData {
-  const planetCount = randomIntFromNormal(random, 1, 8, 4.1, 1.15);
+  const planetCount = randomIntFromNormal(random, 2, 12, 6.2, 1.85);
   const planetOrbits = buildPlanetOrbits(random, planetCount);
-  const asteroidGroupCount = randomIntFromNormal(random, 3, 10, 6, 1.85);
+  const asteroidGroupCount = randomIntFromNormal(random, 5, 15, 8.5, 2.25);
   const name = buildSystemName(index);
   const radius = 320_000_000 + Math.pow(random(), 0.55) * 1_050_000_000;
 
