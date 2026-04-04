@@ -9,3 +9,6 @@ On each level it will simply highlight the object that the player is closest to.
 
 Increase the intensity of the glow around stars a bit to make them more visible from a distance. Also make this glow change size and intensity same for the lens flare based on how big the star is on the screen of the player so it feels really intense when you are close to a star but not blinding when you are far away
 
+
+
+The slower the ship the weaker the force field so that its still possible to reach teh destination at all ad that its not blocked by a force field entireley. Only if an object is directly in the path of travel it should have a force field at all.

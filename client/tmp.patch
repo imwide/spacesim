@@ -1,0 +1,35 @@
+--- src/App.tsx
++++ src/App.tsx
+@@ -732,34 +732,24 @@
+ 
+     if (!isInterSystem) {
+       const pushVelocity = new THREE.Vector3();
+       obstacles.forEach((obstacle) => {
+         if (obstacle.kind !== 'asteroid' || obstacle.id === destination.id) return;
+         const obstacleLocalPosition = vectorFromTuple(toFrameLocalPosition(obstacle.position, frameOrigin));
+         const away = state.shipPosition.clone().sub(obstacleLocalPosition);
+         const dist = away.length();
+         
+         const forcefieldRadius = obstacle.radius + AUTOPILOT_AVOIDANCE_BUFFER_METERS * 0.8;
+         if (dist < forcefieldRadius && dist > 1e-5) {
+           const penetration = clamp(1.0 - (dist / forcefieldRadius), 0.0, 1.0);
+           
+           // Apply a gentle, limited push to smoothly slide around the asteroid
+           const maxPushSpeed = Math.min(30.0, currentSpeed * 0.4 + 5.0);
+           const strength = penetration * penetration * maxPushSpeed;
+           
+           // Push outward from the obstacle center
+           const pushDir = away.normalize();
+           
+           // Apply force using addScaledVector with dt to avoid ridiculous acceleration spikes
+           pushVelocity.addScaledVector(pushDir, strength * dt * 60.0); // scaled by 60 for 60fps equivalent logic but using dt
+         }
+       });
+       state.shipVelocity.add(pushVelocity);
+     }
+ 
+     state.shipPosition.addScaledVector(state.shipVelocity, dt);
+     state.position.copy(state.shipPosition);
+     state.velocity.copy(state.shipVelocity);
+     return { arrived: false, distance };
+   }

@@ -967,3 +967,60 @@ button {
   background: linear-gradient(135deg, rgba(34, 211, 238, 0.95), rgba(59, 130, 246, 0.95));
   box-shadow: -2px 2px 8px rgba(34, 211, 238, 0.4);
 }
+
+.teleport-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  pointer-events: none;
+  background: black;
+  color: #fff;
+  animation: teleport-fade 2s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+.teleport-glow {
+  width: 100vw;
+  height: 50vh;
+  background: linear-gradient(transparent, #38bdf8, #8b5cf6, transparent);
+  mix-blend-mode: screen;
+  animation: teleport-expand 1.2s ease-in-out forwards;
+}
+
+@keyframes teleport-fade {
+  0% { opacity: 0; background: transparent; }
+  15% { opacity: 1; background: rgba(0,0,0,0.4); }
+  50% { opacity: 1; background: #fff; }
+  85% { opacity: 1; background: rgba(0,0,0,0.8); }
+  100% { opacity: 0; background: transparent; }
+}
+
+@keyframes teleport-expand {
+  0% { transform: scaleY(0); opacity: 0; }
+  30% { transform: scaleY(1); opacity: 1; }
+  80% { transform: scaleY(10); opacity: 0; }
+  100% { transform: scaleY(20); opacity: 0; }
+}
+
+.teleport-text {
+  position: absolute;
+  font-family: inherit;
+  font-size: 2.5rem;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: white;
+  text-shadow: 0 0 20px #38bdf8;
+  animation: teleport-text-fade 2s ease-in-out forwards;
+}
+
+@keyframes teleport-text-fade {
+  0% { opacity: 0; transform: scale(0.9); }
+  25% { opacity: 1; transform: scale(1); }
+  60% { opacity: 1; transform: scale(1.05); }
+  100% { opacity: 0; transform: scale(1.1); }
+}
+
