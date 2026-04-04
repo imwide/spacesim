@@ -63,6 +63,18 @@ const INTERIOR_GRAVITY_METERS_PER_SECOND = 9.81 * METERS_PER_WORLD_UNIT;
 const SHIP_THRUST_ACCELERATION = 14 * METERS_PER_WORLD_UNIT;
 const SHIP_MAX_SPEED_METERS_PER_SECOND = 240 * METERS_PER_WORLD_UNIT;
 const SHIP_LINEAR_DAMPING = 0.18;
+const SHIP_MANUAL_ANGULAR_ACCELERATION = 2.8;
+const SHIP_MANUAL_MAX_ANGULAR_SPEED = 1.85;
+const SHIP_MANUAL_ANGULAR_DAMPING = 2.4;
+const SHIP_MANUAL_FORWARD_THRUST = SHIP_THRUST_ACCELERATION * 1.45;
+const SHIP_MANUAL_REVERSE_THRUST = SHIP_THRUST_ACCELERATION * 1.1;
+const SHIP_MANUAL_STRAFE_THRUST = SHIP_THRUST_ACCELERATION * 1.05;
+const SHIP_MANUAL_COAST_DAMPING = 0.16;
+const SHIP_MANUAL_LATERAL_DAMPING = 0.5;
+const SHIP_MANUAL_TURN_LATERAL_DAMPING = 1.35;
+const PLAYER_COLLISION_RADIUS = 0.46;
+const SHIP_COLLISION_RADIUS = 5.15;
+const STATION_COLLISION_RADIUS_FACTOR = 4.25;
 const SHIP_SPAWN_OFFSET_METERS = 18 * METERS_PER_WORLD_UNIT;
 const BOARDING_DISTANCE_METERS = 8 * METERS_PER_WORLD_UNIT;
 const SEAT_INTERACTION_DISTANCE_METERS = 1.15 * METERS_PER_WORLD_UNIT;
@@ -73,6 +85,20 @@ const SHIP_INTERIOR_CLAMP_Z_METERS = 5 * METERS_PER_WORLD_UNIT;
 const STAR_STATION_SCALE = 6;
 const PLANET_STATION_SCALE = 4.5;
 const ASTEROID_STATION_SCALE = 3.8;
+const PLANET_TEXTURE_FILES = [
+  '4k_ceres_fictional.jpg',
+  '4k_eris_fictional.jpg',
+  '4k_haumea_fictional.jpg',
+  '4k_makemake_fictional.jpg',
+  '4k_planet.jpg',
+  '4k_planet2.jpg',
+  '4k_venus_atmosphere.jpg',
+  'dhnz12a-9b72a75c-92bc-4a91-abc4-db3300e3de90.jpg',
+] as const;
+const PLANET_TEXTURE_URLS = PLANET_TEXTURE_FILES.map((fileName) => new URL(`../../planet_textures/${fileName}`, import.meta.url).href);
+
+let cachedPlanetTextureLibrary: THREE.Texture[] | null = null;
+let cachedPlanetTextureLibraryPromise: Promise<THREE.Texture[]> | null = null;
 
 interface ShipSnapshot {
   position: Vec3Tuple;
@@ -100,6 +126,11 @@ interface AuthSession {
     id: string;
     username: string;
   };
+}
+
+interface InventorySlotData {
+  id: string;
+  itemName: string | null;
 }
 
 interface HudState {
@@ -159,6 +190,21 @@ interface AutopilotCollisionResult {
   travelFraction: number;
 }
 
+interface SceneCollider {
+  id: string;
+  kind: 'star' | 'planet' | 'moon' | 'asteroid' | 'station' | 'ship';
+  position: Vec3Tuple;
+  radius: number;
+  ownerId?: string;
+}
+
+interface MotionCollisionResult {
+  collider: SceneCollider;
+  colliderLocalPosition: THREE.Vector3;
+  normal: THREE.Vector3;
+  travelFraction: number;
+}
+
 interface LocalGameState {
   frameSystemId: string;
   frameOrigin: THREE.Vector3;
@@ -170,6 +216,7 @@ interface LocalGameState {
   autopilotDirection: THREE.Vector3;
   shipPosition: THREE.Vector3;
   shipVelocity: THREE.Vector3;
+  shipAngularVelocity: THREE.Vector3;
   shipRotation: THREE.Quaternion;
   interiorPosition: THREE.Vector3;
   interiorVelocity: THREE.Vector3;
@@ -271,6 +318,118 @@ function compressProxyDistance(distance: number, linearDistance: number, logarit
   }
 
   return linearDistance + Math.log1p((distance - linearDistance) / linearDistance) * logarithmicFactor;
+}
+
+function hashString(value: string): number {
+  let hash = 2166136261;
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return hash >>> 0;
+}
+
+function createSeededRandom(seed: number): () => number {
+  let state = seed >>> 0;
+
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function finalizeSurfaceTexture(texture: THREE.Texture): THREE.Texture {
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = 8;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function createColorizedTextureVariant(baseTexture: THREE.Texture, seedKey: string): THREE.Texture {
+  const random = createSeededRandom(hashString(seedKey));
+  const source = baseTexture.image as CanvasImageSource & { width?: number; height?: number };
+  const width = source.width ?? 2048;
+  const height = source.height ?? 1024;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d');
+
+  if (!context) {
+    return finalizeSurfaceTexture(baseTexture.clone());
+  }
+
+  const hueRotation = (random() - 0.5) * 90;
+  const saturation = 1.05 + random() * 0.65;
+  const brightness = 0.88 + random() * 0.28;
+  const contrast = 0.92 + random() * 0.22;
+  const tintHue = Math.floor(random() * 360);
+  const tintAlpha = 0.16 + random() * 0.12;
+
+  context.filter = `hue-rotate(${hueRotation}deg) saturate(${saturation}) brightness(${brightness}) contrast(${contrast})`;
+  context.drawImage(source, 0, 0, width, height);
+  context.filter = 'none';
+  context.globalCompositeOperation = 'soft-light';
+  context.fillStyle = `hsla(${tintHue}, ${55 + random() * 20}%, ${48 + random() * 12}%, ${tintAlpha})`;
+  context.fillRect(0, 0, width, height);
+  context.globalCompositeOperation = 'source-over';
+
+  const variantTexture = new THREE.CanvasTexture(canvas);
+  return finalizeSurfaceTexture(variantTexture);
+}
+
+function usePlanetTextureLibrary(): THREE.Texture[] {
+  const [textures, setTextures] = useState<THREE.Texture[]>(cachedPlanetTextureLibrary ?? []);
+
+  useEffect(() => {
+    if (cachedPlanetTextureLibrary) {
+      setTextures(cachedPlanetTextureLibrary);
+      return;
+    }
+
+    if (!cachedPlanetTextureLibraryPromise) {
+      const loader = new THREE.TextureLoader();
+      cachedPlanetTextureLibraryPromise = Promise.all(PLANET_TEXTURE_URLS.map((url) => loader.loadAsync(url))).then((baseTextures) => {
+        const originals = baseTextures.map((texture) => finalizeSurfaceTexture(texture.clone()));
+        const variants = baseTextures.map((texture, index) => createColorizedTextureVariant(texture, `${PLANET_TEXTURE_FILES[index]}-variant`));
+        cachedPlanetTextureLibrary = [...originals, ...variants];
+        return cachedPlanetTextureLibrary;
+      });
+    }
+
+    let cancelled = false;
+    cachedPlanetTextureLibraryPromise
+      .then((loadedTextures) => {
+        if (!cancelled) {
+          setTextures(loadedTextures);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setTextures([]);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return textures;
+}
+
+function pickBodySurfaceTexture(textures: THREE.Texture[], bodyId: string): THREE.Texture | undefined {
+  if (textures.length === 0) {
+    return undefined;
+  }
+
+  return textures[hashString(bodyId) % textures.length] ?? textures[0];
 }
 
 function createStationSnapshot(state: LocalGameState): PlayerSnapshot {
@@ -406,6 +565,273 @@ function buildAutopilotObstacles(system: StarSystemData): AutopilotObstacle[] {
     ]),
     ...asteroidObstacles,
   ];
+}
+
+function getStationCollisionRadius(scale: number): number {
+  return scale * STATION_COLLISION_RADIUS_FACTOR;
+}
+
+function buildStationSceneColliders(id: string, position: Vec3Tuple, scale: number): SceneCollider[] {
+  const basePosition = vectorFromTuple(position);
+  const colliderSpecs = [
+    { offset: new THREE.Vector3(0, 0, 0), radius: scale * 1.05 },
+    { offset: new THREE.Vector3(0, scale * 1.6, 0), radius: scale * 0.72 },
+    { offset: new THREE.Vector3(0, -scale * 1.6, 0), radius: scale * 0.72 },
+    { offset: new THREE.Vector3(scale * 2.25, 0, 0), radius: scale * 1.05 },
+    { offset: new THREE.Vector3(-scale * 2.25, 0, 0), radius: scale * 1.05 },
+    { offset: new THREE.Vector3(0, 0, scale * 2.25), radius: scale * 1.05 },
+    { offset: new THREE.Vector3(0, 0, -scale * 2.25), radius: scale * 1.05 },
+  ];
+
+  return colliderSpecs.map((spec, index) => ({
+    id: `${id}:part-${index}`,
+    ownerId: id,
+    kind: 'station' as const,
+    position: tupleFromVector(basePosition.clone().add(spec.offset)),
+    radius: spec.radius,
+  }));
+}
+
+function buildShipSceneColliders(id: string, position: Vec3Tuple, rotation: QuatTuple | THREE.Quaternion): SceneCollider[] {
+  const basePosition = vectorFromTuple(position);
+  const quaternion = rotation instanceof THREE.Quaternion ? rotation.clone() : new THREE.Quaternion(...rotation);
+  const colliderSpecs = [
+    { offset: new THREE.Vector3(0, 0, -1.2), radius: 1.35 },
+    { offset: new THREE.Vector3(0, 0, 1.65), radius: 1.15 },
+    { offset: new THREE.Vector3(0, 0, 3.9), radius: 0.82 },
+    { offset: new THREE.Vector3(2.35, 0, 0.45), radius: 0.92 },
+    { offset: new THREE.Vector3(-2.35, 0, 0.45), radius: 0.92 },
+  ];
+
+  return colliderSpecs.map((spec, index) => ({
+    id: `${id}:part-${index}`,
+    ownerId: id,
+    kind: 'ship' as const,
+    position: tupleFromVector(basePosition.clone().add(spec.offset.clone().applyQuaternion(quaternion))),
+    radius: spec.radius,
+  }));
+}
+
+function buildSystemSceneColliders(system: StarSystemData): SceneCollider[] {
+  const colliders: SceneCollider[] = [
+    {
+      id: `${system.id}-star-core`,
+      kind: 'star',
+      position: [0, 0, 0],
+      radius: system.radius,
+    },
+    ...buildStationSceneColliders(system.station.id, system.station.position, STAR_STATION_SCALE),
+  ];
+
+  system.planets.forEach((planet) => {
+    colliders.push({
+      id: planet.id,
+      kind: 'planet',
+      position: planet.position,
+      radius: planet.radius,
+    });
+
+    planet.stations.forEach((station) => {
+      colliders.push(...buildStationSceneColliders(station.id, tupleAdd(planet.position, station.position), PLANET_STATION_SCALE));
+    });
+
+    planet.moons.forEach((moon) => {
+      const moonPosition = tupleAdd(planet.position, moon.position);
+      colliders.push({
+        id: moon.id,
+        kind: 'moon',
+        position: moonPosition,
+        radius: moon.radius,
+      });
+
+      moon.stations.forEach((station) => {
+        colliders.push(...buildStationSceneColliders(station.id, tupleAdd(moonPosition, station.position), PLANET_STATION_SCALE));
+      });
+    });
+  });
+
+  system.asteroidGroups.forEach((group) => {
+    colliders.push(...buildStationSceneColliders(group.station.id, tupleAdd(group.position, group.station.position), ASTEROID_STATION_SCALE));
+
+    group.asteroids.forEach((asteroid) => {
+      colliders.push({
+        id: asteroid.id,
+        kind: 'asteroid',
+        position: tupleAdd(group.position, asteroid.position),
+        radius: Math.max(Math.max(asteroid.scale[0], asteroid.scale[1], asteroid.scale[2]) * 0.52, 14),
+      });
+    });
+  });
+
+  return colliders;
+}
+
+function buildRemoteShipColliders(remotePlayers: PlayerSnapshot[], viewerFrameOrigin: Vec3Tuple): SceneCollider[] {
+  return remotePlayers.flatMap((player) =>
+    buildShipSceneColliders(
+      `ship:${player.socketId}`,
+      tupleAdd(player.ship.position, tupleSubtract(player.frameOrigin, viewerFrameOrigin)),
+      player.ship.rotation,
+    ),
+  );
+}
+
+function mapSceneCollidersToFrame(colliders: SceneCollider[], frameOrigin: Vec3Tuple): SceneCollider[] {
+  return colliders.map((collider) => ({
+    ...collider,
+    position: toFrameLocalPosition(collider.position, frameOrigin),
+  }));
+}
+
+function findSceneCollisionOnSegment(
+  start: THREE.Vector3,
+  end: THREE.Vector3,
+  actorRadius: number,
+  colliders: SceneCollider[],
+  ignoredColliderIds: Set<string>,
+): MotionCollisionResult | null {
+  const delta = end.clone().sub(start);
+  const lengthSq = delta.lengthSq();
+
+  if (lengthSq <= 1e-8) {
+    return null;
+  }
+
+  let nearestHit: MotionCollisionResult | null = null;
+
+  colliders.forEach((collider) => {
+    if (ignoredColliderIds.has(collider.id) || (collider.ownerId && ignoredColliderIds.has(collider.ownerId))) {
+      return;
+    }
+
+    const colliderLocalPosition = vectorFromTuple(collider.position);
+    const expandedRadius = collider.radius + actorRadius;
+    const projectedT = clamp(colliderLocalPosition.clone().sub(start).dot(delta) / lengthSq, 0, 1);
+    const closestPoint = start.clone().addScaledVector(delta, projectedT);
+    const fromCenter = closestPoint.clone().sub(colliderLocalPosition);
+    const centerDistance = fromCenter.length();
+
+    if (centerDistance >= expandedRadius) {
+      return;
+    }
+
+    let normal = centerDistance > 1e-6
+      ? fromCenter.multiplyScalar(1 / centerDistance)
+      : start.clone().sub(colliderLocalPosition).normalize();
+
+    if (normal.lengthSq() < 1e-6) {
+      normal = delta.clone().normalize().multiplyScalar(-1);
+    }
+
+    if (!nearestHit || projectedT < nearestHit.travelFraction) {
+      nearestHit = {
+        collider,
+        colliderLocalPosition,
+        normal,
+        travelFraction: projectedT,
+      };
+    }
+  });
+
+  return nearestHit;
+}
+
+function resolveStaticColliderOverlaps(
+  position: THREE.Vector3,
+  velocity: THREE.Vector3,
+  actorRadius: number,
+  colliders: SceneCollider[],
+  ignoredColliderIds: Set<string>,
+): void {
+  for (let iteration = 0; iteration < 3; iteration += 1) {
+    let corrected = false;
+
+    for (const collider of colliders) {
+      if (ignoredColliderIds.has(collider.id) || (collider.ownerId && ignoredColliderIds.has(collider.ownerId))) {
+        continue;
+      }
+
+      const colliderLocalPosition = vectorFromTuple(collider.position);
+      const separation = position.clone().sub(colliderLocalPosition);
+      const minDistance = actorRadius + collider.radius;
+      const distance = separation.length();
+
+      if (distance >= minDistance || minDistance <= 0) {
+        continue;
+      }
+
+      const normal = distance > 1e-6 ? separation.multiplyScalar(1 / distance) : new THREE.Vector3(0, 1, 0);
+      position.copy(colliderLocalPosition).addScaledVector(normal, minDistance + 0.02);
+      const inwardSpeed = velocity.dot(normal);
+      if (inwardSpeed < 0) {
+        velocity.addScaledVector(normal, -inwardSpeed);
+      }
+      corrected = true;
+    }
+
+    if (!corrected) {
+      break;
+    }
+  }
+}
+
+function moveBodyWithSceneColliders(
+  position: THREE.Vector3,
+  velocity: THREE.Vector3,
+  dt: number,
+  actorRadius: number,
+  colliders: SceneCollider[],
+  ignoredIds: string[] = [],
+): void {
+  const ignoredColliderIds = new Set(ignoredIds);
+  let remainingFraction = 1;
+
+  for (let iteration = 0; iteration < 3 && remainingFraction > 1e-4; iteration += 1) {
+    const nextPosition = position.clone().addScaledVector(velocity, dt * remainingFraction);
+    const collision = findSceneCollisionOnSegment(position, nextPosition, actorRadius, colliders, ignoredColliderIds);
+
+    if (!collision) {
+      position.copy(nextPosition);
+      break;
+    }
+
+    const safeFraction = clamp(collision.travelFraction - 0.02, 0, 1);
+    const partialDelta = nextPosition.sub(position).multiplyScalar(safeFraction);
+    position.add(partialDelta);
+    position.copy(collision.colliderLocalPosition).addScaledVector(collision.normal, actorRadius + collision.collider.radius + 0.02);
+
+    const inwardSpeed = velocity.dot(collision.normal);
+    if (inwardSpeed < 0) {
+      velocity.addScaledVector(collision.normal, -inwardSpeed);
+    }
+
+    remainingFraction *= Math.max(0, 1 - safeFraction);
+  }
+
+  resolveStaticColliderOverlaps(position, velocity, actorRadius, colliders, ignoredColliderIds);
+}
+
+function integrateShipAngularVelocity(state: LocalGameState, dt: number, angularDamping: number): void {
+  if (state.shipAngularVelocity.lengthSq() <= 1e-8) {
+    state.shipAngularVelocity.set(0, 0, 0);
+    return;
+  }
+
+  const deltaRotation = new THREE.Quaternion().setFromEuler(
+    new THREE.Euler(
+      state.shipAngularVelocity.x * dt,
+      state.shipAngularVelocity.y * dt,
+      state.shipAngularVelocity.z * dt,
+      'XYZ',
+    ),
+  );
+  state.shipRotation.multiply(deltaRotation).normalize();
+
+  const angularDampFactor = Math.max(0, 1 - angularDamping * dt);
+  state.shipAngularVelocity.multiplyScalar(angularDampFactor);
+  if (state.shipAngularVelocity.length() < 0.01) {
+    state.shipAngularVelocity.set(0, 0, 0);
+  }
 }
 
 function getAutopilotCruiseSpeed(isInterSystem: boolean): number {
@@ -806,6 +1232,7 @@ function updateAutopilotShip(
   destination: AutopilotDestination,
   frameOrigin: Vec3Tuple,
   obstacles: AutopilotObstacle[],
+  sceneColliders: SceneCollider[],
 ): { arrived: boolean; distance: number } {
   const isInterSystem = destination.systemId !== state.frameSystemId;
   // For inter-system travel the localPosition is in the *destination* system's frame and is
@@ -831,6 +1258,7 @@ function updateAutopilotShip(
 
   if (distance <= arrivalDistance) {
     state.shipVelocity.set(0, 0, 0);
+    state.shipAngularVelocity.set(0, 0, 0);
     state.position.copy(state.shipPosition);
     state.velocity.copy(state.shipVelocity);
     state.rotation.copy(state.shipRotation);
@@ -856,6 +1284,7 @@ function updateAutopilotShip(
     ? desiredDirection.clone().lerp(state.shipVelocity.clone().normalize(), 0.25).normalize()
     : desiredDirection;
   const desiredRotation = createShipFacingQuaternion(lookDirection);
+  state.shipAngularVelocity.set(0, 0, 0);
   state.shipRotation.rotateTowards(desiredRotation, getAutopilotTurnRate(isInterSystem) * dt);
   state.rotation.copy(state.shipRotation);
 
@@ -914,29 +1343,7 @@ function updateAutopilotShip(
   }
 
   if (!isInterSystem) {
-    const nextPosition = state.shipPosition.clone().addScaledVector(state.shipVelocity, dt);
-    const collision = findAutopilotCollisionOnSegment(state.shipPosition, nextPosition, destination, frameOrigin, obstacles);
-
-    if (collision) {
-      const safeFraction = clamp(collision.travelFraction - 0.03, 0, 1);
-      const travelDelta = nextPosition.sub(state.shipPosition).multiplyScalar(safeFraction);
-      state.shipPosition.add(travelDelta);
-
-      const toSurface = state.shipPosition.clone().sub(collision.obstacleLocalPosition);
-      if (toSurface.lengthSq() > 1e-8) {
-        state.shipPosition.copy(
-          collision.obstacleLocalPosition.clone().add(toSurface.normalize().multiplyScalar(collision.obstacleRadius + 1)),
-        );
-      }
-
-      const inwardSpeed = state.shipVelocity.dot(collision.normal);
-      if (inwardSpeed < 0) {
-        state.shipVelocity.addScaledVector(collision.normal, -inwardSpeed);
-      }
-      state.shipVelocity.multiplyScalar(0.72);
-    } else {
-      state.shipPosition.copy(nextPosition);
-    }
+    moveBodyWithSceneColliders(state.shipPosition, state.shipVelocity, dt, SHIP_COLLISION_RADIUS, sceneColliders, [destination.id]);
   } else {
     state.shipPosition.addScaledVector(state.shipVelocity, dt);
   }
@@ -946,13 +1353,18 @@ function updateAutopilotShip(
   return { arrived: false, distance };
 }
 
-function settleShipVelocity(state: LocalGameState, dt: number): void {
+function settleShipVelocity(state: LocalGameState, dt: number, sceneColliders?: SceneCollider[]): void {
+  integrateShipAngularVelocity(state, dt, SHIP_MANUAL_ANGULAR_DAMPING);
   const shipDampFactor = Math.max(0, 1 - SHIP_LINEAR_DAMPING * dt);
   state.shipVelocity.multiplyScalar(shipDampFactor);
   if (state.shipVelocity.length() < 0.2) {
     state.shipVelocity.set(0, 0, 0);
   }
-  state.shipPosition.addScaledVector(state.shipVelocity, dt);
+  if (sceneColliders) {
+    moveBodyWithSceneColliders(state.shipPosition, state.shipVelocity, dt, SHIP_COLLISION_RADIUS, sceneColliders);
+  } else {
+    state.shipPosition.addScaledVector(state.shipVelocity, dt);
+  }
   state.position.copy(state.shipPosition);
   state.velocity.copy(state.shipVelocity);
   state.rotation.copy(state.shipRotation);
@@ -970,6 +1382,7 @@ function createLocalState(frameSystemId: string): LocalGameState {
     autopilotDirection: new THREE.Vector3(0, 0, -1),
     shipPosition: new THREE.Vector3(SHIP_SPAWN_OFFSET_METERS, 0, 0),
     shipVelocity: new THREE.Vector3(0, 0, 0),
+    shipAngularVelocity: new THREE.Vector3(0, 0, 0),
     shipRotation: new THREE.Quaternion(),
     interiorPosition: new THREE.Vector3(0, SHIP_INTERIOR_FLOOR_HEIGHT_METERS, 2.5),
     interiorVelocity: new THREE.Vector3(0, 0, 0),
@@ -990,6 +1403,7 @@ function hydrateLocalState(target: LocalGameState, snapshot: PlayerSnapshot): vo
   target.rotation.set(...snapshot.rotation);
   target.shipPosition.set(...snapshot.ship.position);
   target.shipVelocity.set(...snapshot.ship.velocity);
+  target.shipAngularVelocity.set(0, 0, 0);
   target.shipRotation.set(...snapshot.ship.rotation);
   target.autopilotDirection.set(0, 0, -1).applyQuaternion(target.shipRotation).normalize();
 
@@ -1147,6 +1561,14 @@ function AuthScreen({
 function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () => void }): ReactElement {
   const galaxy = useMemo(() => generateGalaxy(42), []);
   const stationNetwork = useMemo(() => buildStationNetwork(galaxy), [galaxy]);
+  const inventorySlots = useMemo<InventorySlotData[]>(
+    () => [
+      { id: 'slot-1', itemName: null },
+      { id: 'slot-2', itemName: null },
+      { id: 'slot-3', itemName: null },
+    ],
+    [],
+  );
   const homeSystemId = galaxy.systems[0]?.id ?? 'system-1';
   const homeStation = useMemo(
     () =>
@@ -1351,6 +1773,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
       state.frameOrigin.copy(base);
       state.shipPosition.copy(shipOffset);
       state.shipVelocity.set(0, 0, 0);
+      state.shipAngularVelocity.set(0, 0, 0);
       state.shipRotation.identity();
       state.velocity.set(0, 0, 0);
 
@@ -1410,9 +1833,9 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
         ];
       case 'pilot':
         return [
-          'The pilot seat now operates autopilot only; the ship handles turning and thrust automatically.',
-          'Pick a destination in the autopilot panel and the ship will fly there, slowing itself near arrival.',
-          'Press X to stand up and return to the interior. Press T for the Space-Tablet.',
+          'Manual flight: arrow keys rotate the ship with inertia instead of snapping instantly.',
+          'W/S thrust forward and backward, A/D thrust left and right. The ship naturally bleeds off sideways drift.',
+          'Shift exits the pilot seat. Mouse and Space do nothing here. Press T for the Space-Tablet.',
         ];
       default:
         return [
@@ -1508,6 +1931,8 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
             ))}
           </ul>
         </div>
+
+        <InventoryHud slots={inventorySlots} />
 
         {teleporting && (
           <div className="teleport-overlay">
@@ -1606,6 +2031,26 @@ function GameScene({
   const actionQueue = useRef(new Set<string>());
   const shipGroupRef = useRef<THREE.Group>(null);
   const interiorGroupRef = useRef<THREE.Group>(null);
+  const activeSystem = useMemo(
+    () => galaxy.systems.find((system) => system.id === activeSystemId) ?? null,
+    [activeSystemId, galaxy.systems],
+  );
+  const environmentColliders = useMemo(
+    () => (activeSystem ? buildSystemSceneColliders(activeSystem) : []),
+    [activeSystem],
+  );
+  const localEnvironmentColliders = useMemo(
+    () => mapSceneCollidersToFrame(environmentColliders, activeFrameOrigin),
+    [activeFrameOrigin, environmentColliders],
+  );
+  const remoteShipColliders = useMemo(
+    () => buildRemoteShipColliders(remotePlayers, activeFrameOrigin),
+    [activeFrameOrigin, remotePlayers],
+  );
+  const shipSceneColliders = useMemo(
+    () => [...localEnvironmentColliders, ...remoteShipColliders],
+    [localEnvironmentColliders, remoteShipColliders],
+  );
 
   useEffect(() => {
     const downHandler = (event: KeyboardEvent) => {
@@ -1678,6 +2123,11 @@ function GameScene({
     const movementEnabled = !tabletOpen;
     const lookRotation = new THREE.Quaternion().setFromEuler(new THREE.Euler(state.pitch, state.yaw, 0, 'YXZ'));
     const autopilotAvailable = autopilotActive && Boolean(autopilotDestination) && state.mode !== 'space';
+    const playerSceneColliders = [
+      ...localEnvironmentColliders,
+      ...remoteShipColliders,
+      ...buildShipSceneColliders('local-ship', tupleFromVector(state.shipPosition), state.shipRotation),
+    ];
 
     if (state.mode === 'space') {
       state.rotation.copy(lookRotation);
@@ -1728,7 +2178,7 @@ function GameScene({
         }
       }
 
-      state.position.addScaledVector(state.velocity, dt);
+      moveBodyWithSceneColliders(state.position, state.velocity, dt, PLAYER_COLLISION_RADIUS, playerSceneColliders);
       camera.position.copy(state.position);
       camera.quaternion.copy(state.rotation);
 
@@ -1749,7 +2199,7 @@ function GameScene({
         ) {
           onInterstellarArrival(autopilotDestination);
         } else {
-          const autopilotStep = updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles);
+          const autopilotStep = updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles, shipSceneColliders);
           if (autopilotStep.arrived) {
             if (autopilotDestination.interstellarWaypoint) {
               onInterstellarArrival(autopilotDestination);
@@ -1761,7 +2211,7 @@ function GameScene({
           }
         }
       } else {
-        settleShipVelocity(state, dt);
+        settleShipVelocity(state, dt, shipSceneColliders);
       }
 
       const localLook = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, state.yaw, 0, 'YXZ'));
@@ -1814,6 +2264,7 @@ function GameScene({
       if (consumeAction('KeyF') && state.interiorPosition.distanceTo(seatPosition) < SEAT_INTERACTION_DISTANCE_METERS) {
         state.mode = 'pilot';
         state.insideShip = true;
+        state.shipAngularVelocity.set(0, 0, 0);
         const pilotEuler = new THREE.Euler().setFromQuaternion(state.shipRotation, 'YXZ');
         state.pitch = pilotEuler.x;
         state.yaw = pilotEuler.y;
@@ -1829,7 +2280,83 @@ function GameScene({
         onAutopilotStatusChange('Autopilot disengaged.');
       }
     } else {
-      if (autopilotAvailable && autopilotDestination) {
+      const exitPilotSeat = consumeAction('ShiftLeft') || consumeAction('ShiftRight') || consumeAction('KeyX');
+      const pitchInput =
+        (movementEnabled && keys.has('ArrowUp') ? 1 : 0) -
+        (movementEnabled && keys.has('ArrowDown') ? 1 : 0);
+      const yawInput =
+        (movementEnabled && keys.has('ArrowLeft') ? 1 : 0) -
+        (movementEnabled && keys.has('ArrowRight') ? 1 : 0);
+      const forwardInput =
+        (movementEnabled && keys.has('KeyW') ? 1 : 0) -
+        (movementEnabled && keys.has('KeyS') ? 1 : 0);
+      const lateralInput =
+        (movementEnabled && keys.has('KeyD') ? 1 : 0) -
+        (movementEnabled && keys.has('KeyA') ? 1 : 0);
+      const hasTurningInput = pitchInput !== 0 || yawInput !== 0;
+      const hasThrustInput = forwardInput !== 0 || lateralInput !== 0;
+      const hasManualPilotInput = hasTurningInput || hasThrustInput;
+
+      if (exitPilotSeat) {
+        state.mode = 'interior';
+        state.interiorPosition.copy(seatPosition).add(new THREE.Vector3(0, 0, 0.8));
+        state.interiorVelocity.set(0, 0, 0);
+        state.shipAngularVelocity.set(0, 0, 0);
+      } else if (hasManualPilotInput) {
+        if (autopilotAvailable) {
+          onAutopilotToggle(false);
+          onAutopilotStatusChange('Autopilot disengaged. Manual control active.');
+        }
+
+        state.shipAngularVelocity.x = clamp(
+          state.shipAngularVelocity.x + pitchInput * SHIP_MANUAL_ANGULAR_ACCELERATION * dt,
+          -SHIP_MANUAL_MAX_ANGULAR_SPEED,
+          SHIP_MANUAL_MAX_ANGULAR_SPEED,
+        );
+        state.shipAngularVelocity.y = clamp(
+          state.shipAngularVelocity.y + yawInput * SHIP_MANUAL_ANGULAR_ACCELERATION * dt,
+          -SHIP_MANUAL_MAX_ANGULAR_SPEED,
+          SHIP_MANUAL_MAX_ANGULAR_SPEED,
+        );
+        integrateShipAngularVelocity(state, dt, SHIP_MANUAL_ANGULAR_DAMPING);
+        state.rotation.copy(state.shipRotation);
+
+        const shipForward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
+        const shipRight = new THREE.Vector3(1, 0, 0).applyQuaternion(state.shipRotation);
+
+        if (forwardInput > 0) {
+          state.shipVelocity.addScaledVector(shipForward, SHIP_MANUAL_FORWARD_THRUST * dt);
+        }
+        if (forwardInput < 0) {
+          state.shipVelocity.addScaledVector(shipForward, -SHIP_MANUAL_REVERSE_THRUST * dt);
+        }
+        if (lateralInput !== 0) {
+          state.shipVelocity.addScaledVector(shipRight, lateralInput * SHIP_MANUAL_STRAFE_THRUST * dt);
+        }
+
+        const forwardVelocity = shipForward.clone().multiplyScalar(state.shipVelocity.dot(shipForward));
+        const lateralVelocity = state.shipVelocity.clone().sub(forwardVelocity);
+        const lateralDamping = hasTurningInput ? SHIP_MANUAL_TURN_LATERAL_DAMPING : SHIP_MANUAL_LATERAL_DAMPING;
+        lateralVelocity.multiplyScalar(Math.max(0, 1 - lateralDamping * dt));
+        state.shipVelocity.copy(forwardVelocity).add(lateralVelocity);
+
+        const shipSpeed = state.shipVelocity.length();
+        if (shipSpeed > SHIP_MAX_SPEED_METERS_PER_SECOND) {
+          state.shipVelocity.setLength(SHIP_MAX_SPEED_METERS_PER_SECOND);
+        }
+
+        if (!hasThrustInput) {
+          const dampFactor = Math.max(0, 1 - SHIP_MANUAL_COAST_DAMPING * dt);
+          state.shipVelocity.multiplyScalar(dampFactor);
+          if (state.shipVelocity.length() < 0.1) {
+            state.shipVelocity.set(0, 0, 0);
+          }
+        }
+
+        moveBodyWithSceneColliders(state.shipPosition, state.shipVelocity, dt, SHIP_COLLISION_RADIUS, shipSceneColliders);
+        state.position.copy(state.shipPosition);
+        state.velocity.copy(state.shipVelocity);
+      } else if (autopilotAvailable && autopilotDestination) {
         // Time-based interstellar arrival (pilot mode)
         if (
           autopilotDestination.interstellarWaypoint &&
@@ -1838,7 +2365,7 @@ function GameScene({
         ) {
           onInterstellarArrival(autopilotDestination);
         } else {
-          const autopilotStep = updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles);
+          const autopilotStep = updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles, shipSceneColliders);
           if (autopilotStep.arrived) {
             if (autopilotDestination.interstellarWaypoint) {
               onInterstellarArrival(autopilotDestination);
@@ -1850,18 +2377,12 @@ function GameScene({
           }
         }
       } else {
-        settleShipVelocity(state, dt);
+        settleShipVelocity(state, dt, shipSceneColliders);
       }
 
       const cockpitOffset = pilotCameraOffset.clone().applyQuaternion(state.shipRotation);
       camera.position.copy(state.shipPosition).add(cockpitOffset);
       camera.quaternion.copy(state.shipRotation);
-
-      if (consumeAction('KeyX')) {
-        state.mode = 'interior';
-        state.interiorPosition.copy(seatPosition).add(new THREE.Vector3(0, 0, 0.8));
-        state.interiorVelocity.set(0, 0, 0);
-      }
     }
 
     if (shipGroupRef.current) {
@@ -1902,8 +2423,8 @@ function GameScene({
       }
       if (state.mode === 'pilot') {
         prompt = autopilotActive && autopilotDestination
-          ? `Autopilot en route to ${autopilotDestination.name}. ETA ${autopilotEtaLabel}. Press X to stand up from the seat.`
-          : 'Pilot seat engaged. Select a destination in the autopilot panel, or press X to stand up.';
+          ? `Autopilot en route to ${autopilotDestination.name}. ETA ${autopilotEtaLabel}. Use arrow keys or WASD to take over. Shift exits the seat.`
+          : 'Pilot seat engaged. Arrow keys rotate, WASD thrusts, Shift exits the seat. Mouse and Space do nothing.';
       }
       if (state.mode !== 'space' && autopilotActive && autopilotDestination) {
         prompt = `Autopilot en route to ${autopilotDestination.name}. ETA ${autopilotEtaLabel}. Arrival threshold: ${formatDistance(AUTOPILOT_REACH_DISTANCE_METERS)}.`;
@@ -2096,6 +2617,31 @@ function WarpSpeedEffect({ localStateRef }: { localStateRef: MutableRefObject<Lo
         />
       </lineSegments>
     </group>
+  );
+}
+
+function InventoryHud({ slots }: { slots: InventorySlotData[] }): ReactElement {
+  return (
+    <section className="inventory-hud" aria-label="Inventory">
+      <div className="inventory-header">
+        <span>Cargo</span>
+        <strong>Inventory</strong>
+      </div>
+      <div className="inventory-slots">
+        {slots.map((slot, index) => {
+          const empty = !slot.itemName;
+
+          return (
+            <div key={slot.id} className={`inventory-slot${empty ? ' inventory-slot-empty' : ''}`}>
+              <span className="inventory-slot-index">{index + 1}</span>
+              <div className="inventory-slot-core">
+                <span>{slot.itemName ?? 'Empty'}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -3337,9 +3883,25 @@ function StarMarker({ position }: { position: Vec3Tuple }): ReactElement {
   );
 }
 
+function getStarScreenRadiusNdc(camera: THREE.Camera, distance: number, starRadius: number): number {
+  const perspectiveCamera = camera as THREE.PerspectiveCamera;
+
+  if (!('isPerspectiveCamera' in perspectiveCamera) || !perspectiveCamera.isPerspectiveCamera) {
+    return THREE.MathUtils.clamp(starRadius * 0.002, 0.001, 1.5);
+  }
+
+  if (distance <= 1e-4) {
+    return 1.5;
+  }
+
+  const halfFovTangent = Math.tan(THREE.MathUtils.degToRad(perspectiveCamera.fov * 0.5));
+  return THREE.MathUtils.clamp(starRadius / (distance * halfFovTangent), 0.001, 1.5);
+}
+
 function StarSystem({ highlightedAsteroidTargetId, renderPosition, system }: { highlightedAsteroidTargetId: string; renderPosition: Vec3Tuple; system: StarSystemData }): ReactElement {
   const { camera, scene } = useThree();
   const haloRef = useRef<THREE.Mesh>(null);
+  const haloMaterialRef = useRef<THREE.MeshBasicMaterial>(null);
   const raycaster = useMemo(() => new THREE.Raycaster(), []);
   const intersections = useMemo<THREE.Intersection[]>(() => [], []);
   const worldPosition = useMemo(() => new THREE.Vector3(...renderPosition), [renderPosition]);
@@ -3348,7 +3910,7 @@ function StarSystem({ highlightedAsteroidTargetId, renderPosition, system }: { h
   const haloVisibleRef = useRef(true);
 
   useFrame((state) => {
-    if (!haloRef.current) {
+    if (!haloRef.current || !haloMaterialRef.current) {
       return;
     }
 
@@ -3369,6 +3931,17 @@ function StarSystem({ highlightedAsteroidTargetId, renderPosition, system }: { h
     }
 
     haloRef.current.visible = haloVisibleRef.current;
+
+    if (haloVisibleRef.current) {
+      const distanceFactor = THREE.MathUtils.clamp(1 - distance / LOCAL_STAR_BODY_VISIBILITY_RANGE, 0, 1);
+      const screenRadiusNdc = getStarScreenRadiusNdc(camera, distance, system.radius);
+      const screenFactor = THREE.MathUtils.clamp(Math.pow(screenRadiusNdc / 0.035, 0.55), 0.55, 3.2);
+      const haloScale = 1.95 + distanceFactor * 0.45 + screenFactor * 0.7;
+      const haloOpacity = THREE.MathUtils.clamp(0.11 + distanceFactor * 0.08 + screenFactor * 0.045, 0.1, 0.34);
+
+      haloRef.current.scale.setScalar(haloScale);
+      haloMaterialRef.current.opacity = haloOpacity;
+    }
   });
 
   return (
@@ -3387,7 +3960,7 @@ function StarSystem({ highlightedAsteroidTargetId, renderPosition, system }: { h
           </mesh>
           <mesh ref={haloRef} scale={1.85} userData={{ ignoreStarOcclusion: true }}>
             <sphereGeometry args={[system.radius, 20, 20]} />
-            <meshBasicMaterial color={system.color} transparent opacity={0.07} />
+            <meshBasicMaterial ref={haloMaterialRef} color={system.color} transparent opacity={0.11} />
           </mesh>
         </group>
       </PhysicalProxyGroup>
@@ -3496,21 +4069,23 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
 
     const distanceFactor = 1 - distance / STAR_LENS_FLARE_RANGE;
     const viewFactor = 1 - Math.min(1, Math.sqrt(projectedPosition.x ** 2 + projectedPosition.y ** 2));
-    const opacity = THREE.MathUtils.clamp(distanceFactor * viewFactor * 0.22, 0.01, 0.16);
+    const screenRadiusNdc = getStarScreenRadiusNdc(camera, distance, starRadius);
+    const screenFactor = THREE.MathUtils.clamp(Math.pow(screenRadiusNdc / 0.028, 0.6), 0.7, 4.5);
+    const opacity = THREE.MathUtils.clamp((0.05 + distanceFactor * 0.18) * viewFactor * (0.6 + screenFactor * 0.32), 0.018, 0.34);
 
     coreMaterialRef.current.opacity = opacity;
-    haloMaterialRef.current.opacity = opacity * 0.35;
-    ghostOneMaterialRef.current.opacity = opacity * 0.4;
-    ghostTwoMaterialRef.current.opacity = opacity * 0.26;
-    ghostThreeMaterialRef.current.opacity = opacity * 0.18;
+    haloMaterialRef.current.opacity = opacity * 0.55;
+    ghostOneMaterialRef.current.opacity = opacity * 0.48;
+    ghostTwoMaterialRef.current.opacity = opacity * 0.32;
+    ghostThreeMaterialRef.current.opacity = opacity * 0.24;
 
     const starScale = THREE.MathUtils.clamp(starRadius * 0.00012, 0.045, 0.12);
-    const flareScale = starScale * (1 + distanceFactor * 1.6);
+    const flareScale = starScale * (1.25 + distanceFactor * 1.35 + screenFactor * 0.55);
     coreSpriteRef.current.scale.setScalar(flareScale);
-    haloSpriteRef.current.scale.setScalar(flareScale * 2.8);
-    ghostOneRef.current.scale.setScalar(flareScale * 0.8);
-    ghostTwoRef.current.scale.setScalar(flareScale * 1.25);
-    ghostThreeRef.current.scale.setScalar(flareScale * 0.55);
+    haloSpriteRef.current.scale.setScalar(flareScale * 3.4);
+    ghostOneRef.current.scale.setScalar(flareScale * 0.95);
+    ghostTwoRef.current.scale.setScalar(flareScale * 1.4);
+    ghostThreeRef.current.scale.setScalar(flareScale * 0.65);
   });
 
   return (
@@ -3630,12 +4205,15 @@ function PhysicalProxyGroup({
 }
 
 function PlanetBody({ physicalPosition, planet }: { physicalPosition: Vec3Tuple; planet: PlanetData }): ReactElement {
+  const textureLibrary = usePlanetTextureLibrary();
+  const surfaceTexture = useMemo(() => pickBodySurfaceTexture(textureLibrary, planet.id), [planet.id, textureLibrary]);
+
   return (
     <>
       <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={PLANET_VISIBILITY_RANGE}>
         <mesh>
           <sphereGeometry args={[planet.radius, 20, 20]} />
-          <meshStandardMaterial color={planet.color} roughness={0.92} metalness={0.08} />
+          <meshStandardMaterial color={planet.color} map={surfaceTexture} roughness={0.96} metalness={0.04} />
         </mesh>
       </PhysicalProxyGroup>
 
@@ -3651,12 +4229,15 @@ function PlanetBody({ physicalPosition, planet }: { physicalPosition: Vec3Tuple;
 }
 
 function MoonBody({ moon, physicalPosition }: { moon: MoonData; physicalPosition: Vec3Tuple }): ReactElement {
+  const textureLibrary = usePlanetTextureLibrary();
+  const surfaceTexture = useMemo(() => pickBodySurfaceTexture(textureLibrary, moon.id), [moon.id, textureLibrary]);
+
   return (
     <>
       <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={PLANET_VISIBILITY_RANGE}>
         <mesh>
           <sphereGeometry args={[moon.radius, 16, 16]} />
-          <meshStandardMaterial color={moon.color} roughness={0.97} metalness={0.04} />
+          <meshStandardMaterial color={moon.color} map={surfaceTexture} roughness={0.98} metalness={0.03} />
         </mesh>
       </PhysicalProxyGroup>
 
