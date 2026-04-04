@@ -133,6 +133,11 @@ interface AutopilotDestination {
   localPosition: Vec3Tuple;
   approachRadius: number;
   distanceFromShip: number;
+  // For inter-system travel only: a waypoint far away in the destination's direction.
+  // The ship flies to this point for visuals; fast-travel fires when interstellarArrivalAt elapses.
+  interstellarWaypoint?: Vec3Tuple;
+  // performance.now() timestamp (ms) at which fast-travel should trigger.
+  interstellarArrivalAt?: number;
 }
 
 interface AutopilotObstacle {
@@ -169,8 +174,33 @@ const AUTOPILOT_TURN_RESPONSE = 0.15; // Softened significantly for majestic, ma
 const METERS_PER_LIGHT_YEAR = 9_460_730_472_580_800;
 const AUTOPILOT_ACCELERATION = SHIP_THRUST_ACCELERATION * 1.18;
 const AUTOPILOT_BRAKE_DECELERATION = SHIP_THRUST_ACCELERATION * 1.4;
+// ─── Autopilot tuning ────────────────────────────────────────────────────────
 const AUTOPILOT_MAX_SPEED_METERS_PER_SECOND = 0.1 * METERS_PER_LIGHT_YEAR;
-const AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND = 0.01 * METERS_PER_LIGHT_YEAR;
+const AUTOPILOT_INTERSTELLAR_CRUISE_SPEED = AUTOPILOT_MAX_SPEED_METERS_PER_SECOND;
+// Local (intra-system) travel uses the proportional formula
+const AUTOPILOT_LOCAL_CRUISE_SPEED = AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 0.1;
+// Time in seconds to ramp from 0 → cruise (interstellar only)
+const AUTOPILOT_ACCEL_TIME_SECONDS = 20;
+// Time in seconds to ramp from cruise → 0 (interstellar only)
+const AUTOPILOT_DECEL_TIME_SECONDS = 20;
+// Distances below this use short-range proportional approach
+const AUTOPILOT_LOCAL_RANGE_THRESHOLD_METERS = 100_000; // 100 km
+// Distance of the interstellar waypoint. 3 Light Years provides a realistic warp duration
+const INTERSTELLAR_WAYPOINT_DISTANCE = 3 * METERS_PER_LIGHT_YEAR;
+// Arrival radius for the interstellar waypoint (physics fallback only).
+// Very large to handle float32 precision error and overshoot.
+const AUTOPILOT_WARP_ARRIVAL_RADIUS = 300_000_000_000;
+// Interstellar trip duration in seconds. Computed from accel + cruise + decel phases.
+// Used by the timer-based arrival trigger (independent of physics convergence).
+function getInterstellarTripSeconds(): number {
+  const accelDist = 0.5 * AUTOPILOT_INTERSTELLAR_CRUISE_SPEED * AUTOPILOT_ACCEL_TIME_SECONDS;
+  const decelDist = 0.5 * AUTOPILOT_INTERSTELLAR_CRUISE_SPEED * AUTOPILOT_DECEL_TIME_SECONDS;
+  const cruiseDist = Math.max(0, INTERSTELLAR_WAYPOINT_DISTANCE - accelDist - decelDist);
+  return AUTOPILOT_ACCEL_TIME_SECONDS + AUTOPILOT_DECEL_TIME_SECONDS + cruiseDist / AUTOPILOT_INTERSTELLAR_CRUISE_SPEED;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Warp-streak visual fires above this speed (10 % of interstellar cruise)
+const AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND = AUTOPILOT_INTERSTELLAR_CRUISE_SPEED * 0.1;
 const AUTOPILOT_AVOIDANCE_WEIGHT = 1.9;
 const AUTOPILOT_AVOIDANCE_BUFFER_METERS = 1_600;
 const AUTOPILOT_ASTEROID_OBSTACLE_LIMIT = 120;
@@ -356,30 +386,53 @@ function buildAutopilotObstacles(system: StarSystemData): AutopilotObstacle[] {
   ];
 }
 
-function getAutopilotCurveBoost(currentSpeed: number): number {
-  return 0; // Deprecated by proportional logic
+function getAutopilotCruiseSpeed(isInterSystem: boolean): number {
+  return isInterSystem ? AUTOPILOT_INTERSTELLAR_CRUISE_SPEED : AUTOPILOT_LOCAL_CRUISE_SPEED;
 }
 
-function getAutopilotAcceleration(currentSpeed: number): number {
-  // Base thruster acceleration (50 m/s^2) plus warp multiplier (exponential scaling)
-  return 50.0 + currentSpeed * 0.6;
+function getAutopilotAcceleration(isInterSystem: boolean): number {
+  if (!isInterSystem) {
+    // Local travel uses the proportional formula — allow the ship to match the
+    // proportional target speed almost instantly (within a couple of frames).
+    return AUTOPILOT_LOCAL_CRUISE_SPEED;
+  }
+  // Interstellar: kinematic ramp — 0 → cruise in exactly AUTOPILOT_ACCEL_TIME_SECONDS
+  return AUTOPILOT_INTERSTELLAR_CRUISE_SPEED / AUTOPILOT_ACCEL_TIME_SECONDS;
 }
 
-function getAutopilotBrakeDeceleration(currentSpeed: number): number {
-  // Base retro-thruster (100 m/s^2) plus warp braking capability
-  return 100.0 + currentSpeed * 1.2;
+function getAutopilotBrakeDeceleration(isInterSystem: boolean): number {
+  if (!isInterSystem) {
+    // Local: snap to proportional target immediately (same logic as acceleration)
+    return AUTOPILOT_LOCAL_CRUISE_SPEED;
+  }
+  // Interstellar: kinematic ramp — cruise → 0 in exactly AUTOPILOT_DECEL_TIME_SECONDS
+  return AUTOPILOT_INTERSTELLAR_CRUISE_SPEED / AUTOPILOT_DECEL_TIME_SECONDS;
 }
 
-function getAutopilotTargetSpeed(distanceToDestination: number, arrivalDistance: number): number {
+function getAutopilotBrakingDistance(): number {
+  // v² = 2·a·d  →  d = cruise · decelTime / 2  (interstellar only)
+  return (AUTOPILOT_INTERSTELLAR_CRUISE_SPEED * AUTOPILOT_INTERSTELLAR_CRUISE_SPEED) /
+    (2 * (AUTOPILOT_INTERSTELLAR_CRUISE_SPEED / AUTOPILOT_DECEL_TIME_SECONDS));
+}
+
+function getAutopilotTargetSpeed(distanceToDestination: number, arrivalDistance: number, isInterSystem: boolean): number {
   const remainingDistance = Math.max(0, distanceToDestination - arrivalDistance);
   if (remainingDistance <= 0) return 0;
-  
-  // Proportional kinematic controller sets speed limit: v = distance / time_constant.
-  // This guarantees a smooth, exponential slide into the destination without overshooting.
-  // We add 25 m/s base speed so the final 100m isn't agonizingly slow.
-  const approachSpeed = (remainingDistance / 4.0) + 25.0;
-  
-  return clamp(approachSpeed, 0, AUTOPILOT_MAX_SPEED_METERS_PER_SECOND);
+
+  if (!isInterSystem) {
+    // Original proportional approach for all intra-system distances.
+    // Speed scales linearly with remaining distance → smooth natural arrival.
+    // The +25 floor ensures the ship always makes progress on the final approach.
+    return clamp((remainingDistance / 4.0) + 25.0, 0, AUTOPILOT_LOCAL_CRUISE_SPEED);
+  }
+
+  // Interstellar: kinematic braking curve
+  const brakingDistance = getAutopilotBrakingDistance();
+  if (remainingDistance >= brakingDistance) {
+    return AUTOPILOT_INTERSTELLAR_CRUISE_SPEED;
+  }
+  const aBrake = getAutopilotBrakeDeceleration(true);
+  return clamp(Math.sqrt(2 * aBrake * remainingDistance), 0, AUTOPILOT_INTERSTELLAR_CRUISE_SPEED);
 }
 
 function getWarpEffectIntensity(currentSpeed: number): number {
@@ -391,7 +444,12 @@ function getWarpEffectIntensity(currentSpeed: number): number {
   );
 }
 
-function estimateAutopilotEtaSeconds(distanceToDestination: number, approachRadius: number, currentSpeed: number): number {
+function estimateAutopilotEtaSeconds(
+  distanceToDestination: number,
+  approachRadius: number,
+  currentSpeed: number,
+  isInterSystem: boolean,
+): number {
   const arrivalDistance = Math.max(
     AUTOPILOT_REACH_DISTANCE_METERS,
     approachRadius + AUTOPILOT_TARGET_SURFACE_BUFFER_METERS,
@@ -402,6 +460,7 @@ function estimateAutopilotEtaSeconds(distanceToDestination: number, approachRadi
     return 0;
   }
 
+  const cruise = isInterSystem ? AUTOPILOT_INTERSTELLAR_CRUISE_SPEED : AUTOPILOT_LOCAL_CRUISE_SPEED;
   let simulatedSpeed = Math.max(0, currentSpeed);
   let elapsed = 0;
 
@@ -410,10 +469,10 @@ function estimateAutopilotEtaSeconds(distanceToDestination: number, approachRadi
       simulatedSpeed > AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND * 0.5
         ? 0.25
         : AUTOPILOT_ETA_SIMULATION_STEP_SECONDS;
-    const targetSpeed = getAutopilotTargetSpeed(remainingDistance + arrivalDistance, arrivalDistance);
+    const targetSpeed = getAutopilotTargetSpeed(remainingDistance + arrivalDistance, arrivalDistance, isInterSystem);
     const accelerating = targetSpeed >= simulatedSpeed;
     const maxVelocityStep =
-      (accelerating ? getAutopilotAcceleration(simulatedSpeed) : getAutopilotBrakeDeceleration(simulatedSpeed)) * dt;
+      (accelerating ? getAutopilotAcceleration(isInterSystem) : getAutopilotBrakeDeceleration(isInterSystem)) * dt;
     const speedDelta = targetSpeed - simulatedSpeed;
 
     if (Math.abs(speedDelta) <= maxVelocityStep) {
@@ -422,19 +481,16 @@ function estimateAutopilotEtaSeconds(distanceToDestination: number, approachRadi
       simulatedSpeed += Math.sign(speedDelta) * maxVelocityStep;
     }
 
-    simulatedSpeed = clamp(simulatedSpeed, 0, AUTOPILOT_MAX_SPEED_METERS_PER_SECOND);
+    simulatedSpeed = clamp(simulatedSpeed, 0, cruise);
 
-    if (
-      simulatedSpeed >= AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 0.999 &&
-      targetSpeed >= AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 0.999
-    ) {
-      // With proportional speed logic: targetSpeed < MAX_SPEED when remainingDistance / 4.0 < MAX_SPEED
-      const brakingDistance = AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 4.0;
-      if (remainingDistance > brakingDistance + AUTOPILOT_MAX_SPEED_METERS_PER_SECOND * 2) {
-        const cruiseDistance = remainingDistance - brakingDistance;
-        const cruiseTime = cruiseDistance / simulatedSpeed;
-        elapsed += cruiseTime;
-        remainingDistance = brakingDistance;
+    if (isInterSystem && simulatedSpeed >= cruise * 0.999 && targetSpeed >= cruise * 0.999) {
+      // Skip ahead through the interstellar cruise phase in one step
+      const brakingDistance = getAutopilotBrakingDistance();
+      const skipThreshold = Math.max(brakingDistance, AUTOPILOT_LOCAL_RANGE_THRESHOLD_METERS);
+      if (remainingDistance > skipThreshold + cruise * 2) {
+        const cruiseDistance = remainingDistance - skipThreshold;
+        elapsed += cruiseDistance / simulatedSpeed;
+        remainingDistance = skipThreshold;
         continue;
       }
     }
@@ -509,13 +565,25 @@ function updateAutopilotShip(
   frameOrigin: Vec3Tuple,
   obstacles: AutopilotObstacle[],
 ): { arrived: boolean; distance: number } {
-  const destinationLocalPosition = vectorFromTuple(toFrameLocalPosition(destination.localPosition, frameOrigin));
-  const toTarget = destinationLocalPosition.sub(state.shipPosition);
+  const isInterSystem = destination.systemId !== state.frameSystemId;
+  // For inter-system travel the localPosition is in the *destination* system's frame and is
+  // meaningless here. Use the precomputed interstellarWaypoint (a real far-away point in the
+  // departure system's coordinate space) instead.
+  const destinationLocalPosition = (isInterSystem && destination.interstellarWaypoint)
+    ? vectorFromTuple(destination.interstellarWaypoint)
+    : vectorFromTuple(toFrameLocalPosition(destination.localPosition, frameOrigin));
+  const toTarget = destinationLocalPosition.clone().sub(state.shipPosition);
   const distance = toTarget.length();
-  const arrivalDistance = Math.max(
-    AUTOPILOT_REACH_DISTANCE_METERS,
-    destination.approachRadius + AUTOPILOT_TARGET_SURFACE_BUFFER_METERS,
-  );
+  // For waypoint-based interstellar trips the waypoint is a virtual trigger point —
+  // not a physical object. Use a flat generous radius so the arrival fires reliably
+  // inside the kinematic deceleration curve, and the physical approach radius of the
+  // real destination (which may be star-sized) is irrelevant here.
+  const arrivalDistance = destination.interstellarWaypoint
+    ? AUTOPILOT_WARP_ARRIVAL_RADIUS
+    : Math.max(
+        AUTOPILOT_REACH_DISTANCE_METERS,
+        destination.approachRadius + AUTOPILOT_TARGET_SURFACE_BUFFER_METERS,
+      );
   const remainingDistance = Math.max(0, distance - arrivalDistance);
   const currentSpeed = state.shipVelocity.length();
 
@@ -527,8 +595,14 @@ function updateAutopilotShip(
     return { arrived: true, distance };
   }
 
-  const targetDirection = toTarget.normalize();
+  const targetDirection = toTarget.clone().normalize();
   const avoidance = new THREE.Vector3();
+
+  // No local-obstacle avoidance during interstellar flight — the ship is in open space
+  // between stars, and at cruise speed the avoidance radius would span the whole system.
+  if (isInterSystem) {
+    obstacles = [];
+  }
 
   obstacles.forEach((obstacle) => {
     if (obstacle.id === destination.id) {
@@ -596,9 +670,9 @@ function updateAutopilotShip(
   state.shipRotation.rotateTowards(desiredRotation, 0.5 * dt); // Snaps the remaining tail end cleanly
   state.rotation.copy(state.shipRotation);
 
-  const acceleration = getAutopilotAcceleration(currentSpeed);
-  const brakeDeceleration = getAutopilotBrakeDeceleration(currentSpeed);
-  const absoluteTargetSpeed = getAutopilotTargetSpeed(distance, arrivalDistance);
+  const acceleration = getAutopilotAcceleration(isInterSystem);
+  const brakeDeceleration = getAutopilotBrakeDeceleration(isInterSystem);
+  const absoluteTargetSpeed = getAutopilotTargetSpeed(distance, arrivalDistance, isInterSystem);
 
   const currentForward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
   const headingAlignment = Math.max(0, currentForward.dot(desiredDirection));
@@ -626,13 +700,16 @@ function updateAutopilotShip(
   // Apply cleanly recombined momentum
   state.shipVelocity.copy(lateralVelocity).add(currentForward.clone().multiplyScalar(nextForwardScalar));
 
-  if (state.shipVelocity.length() > AUTOPILOT_MAX_SPEED_METERS_PER_SECOND) {
-    state.shipVelocity.setLength(AUTOPILOT_MAX_SPEED_METERS_PER_SECOND);
+  const cruiseSpeedCap = getAutopilotCruiseSpeed(isInterSystem);
+  if (state.shipVelocity.length() > cruiseSpeedCap) {
+    state.shipVelocity.setLength(cruiseSpeedCap);
   }
 
-  // Safety net to smoothly finish the final millimeter without snapping past the destination
-  if (state.shipVelocity.length() * dt > remainingDistance) {
-    const safeVelocity = Math.max(0, (remainingDistance / dt) * 0.99);
+  // Safety net: if velocity would overshoot the arrival boundary in this frame,
+  // clamp it so the ship lands exactly on the boundary (remaining → 0).
+  // Using factor 1.0 (not 0.99) so we don't create an asymptotic approach.
+  if (state.shipVelocity.length() * dt > remainingDistance && remainingDistance > 0) {
+    const safeVelocity = remainingDistance / dt;
     state.shipVelocity.setLength(safeVelocity);
   }
 
@@ -894,15 +971,18 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
 
     // Recalculate ETA every 5 seconds if autopilot is engaged, otherwise just keep counting down
     if (!etaInfo || now - etaInfo.timestamp > 5000) {
-      const destinationLocalPosition = vectorFromTuple(
-        toFrameLocalPosition(autopilotDestination.localPosition, activeFrameOrigin),
-      );
-      const liveDistance = destinationLocalPosition.distanceTo(localStateRef.current.shipPosition);
+      // For inter-system travel the meaningful distance is to the interstellar waypoint, not
+      // the destination's localPosition (which lives in a different coordinate frame).
+      const liveDistance = autopilotDestination.interstellarWaypoint
+        ? vectorFromTuple(autopilotDestination.interstellarWaypoint).distanceTo(localStateRef.current.shipPosition)
+        : vectorFromTuple(toFrameLocalPosition(autopilotDestination.localPosition, activeFrameOrigin))
+            .distanceTo(localStateRef.current.shipPosition);
 
       const calculatedEta = estimateAutopilotEtaSeconds(
         liveDistance,
         autopilotDestination.approachRadius,
         localStateRef.current.shipVelocity.length(),
+        autopilotDestination.systemId !== activeSystemId,
       );
 
       etaInfo = {
@@ -1123,6 +1203,20 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           highlightedAsteroidTargetId={highlightedAsteroidTargetId}
           mode={hud.mode}
           onAutopilotArrival={setAutopilotReachedDestinationId}
+          onInterstellarArrival={(dest) => {
+            // Fast-travel the ship to the actual destination system.
+            const kind = (dest.kind === 'asteroid-object' || dest.kind === 'moon') ? 'planet' : dest.kind as StationKind;
+            handleFastTravel({
+              id: dest.id,
+              name: dest.name,
+              kind,
+              systemId: dest.systemId,
+              systemName: dest.systemName,
+              localPosition: dest.localPosition,
+              mapPosition: [0, 0],
+              linkedStationIds: [],
+            });
+          }}
           localStateRef={localStateRef}
           onAutopilotStatusChange={setAutopilotStatus}
           onAutopilotToggle={setAutopilotEngaged}
@@ -1196,7 +1290,30 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
             setAutopilotStatus('Autopilot disengaged.');
           }}
           onEngageAutopilot={(dest) => {
-            setAutopilotDestination(dest);
+            let finalDest = dest;
+            if (dest.systemId !== activeSystemId) {
+              // Compute a waypoint far away in the direction of the destination system.
+              // The ship physically flies to this point, then fast-travels on arrival.
+              const currentSys = galaxy.systems.find((s) => s.id === activeSystemId);
+              const destSys = galaxy.systems.find((s) => s.id === dest.systemId);
+              if (currentSys && destSys) {
+                const dx = destSys.mapPosition[0] - currentSys.mapPosition[0];
+                const dy = destSys.mapPosition[1] - currentSys.mapPosition[1];
+                const dz = destSys.mapPosition[2] - currentSys.mapPosition[2];
+                const len = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+                const ship = localStateRef.current.shipPosition;
+                finalDest = {
+                  ...dest,
+                  interstellarWaypoint: [
+                    ship.x + (dx / len) * INTERSTELLAR_WAYPOINT_DISTANCE,
+                    ship.y + (dy / len) * INTERSTELLAR_WAYPOINT_DISTANCE,
+                    ship.z + (dz / len) * INTERSTELLAR_WAYPOINT_DISTANCE,
+                  ],
+                  interstellarArrivalAt: performance.now() + getInterstellarTripSeconds() * 1000,
+                };
+              }
+            }
+            setAutopilotDestination(finalDest);
             setAutopilotEngaged(true);
             setAutopilotReachedDestinationId('');
             setAutopilotStatus(`Autopilot engaged for ${dest.name}.`);
@@ -1223,6 +1340,7 @@ function GameScene({
   mode,
   localStateRef,
   onAutopilotArrival,
+  onInterstellarArrival,
   onAutopilotStatusChange,
   onAutopilotToggle,
   playersOnline,
@@ -1242,6 +1360,7 @@ function GameScene({
   mode: Mode;
   localStateRef: MutableRefObject<LocalGameState>;
   onAutopilotArrival: Dispatch<SetStateAction<string>>;
+  onInterstellarArrival: (dest: AutopilotDestination) => void;
   onAutopilotStatusChange: Dispatch<SetStateAction<string>>;
   onAutopilotToggle: Dispatch<SetStateAction<boolean>>;
   playersOnline: number;
@@ -1389,11 +1508,25 @@ function GameScene({
       }
     } else if (state.mode === 'interior') {
       if (autopilotAvailable && autopilotDestination) {
-        const autopilotStep = updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles);
-        if (autopilotStep.arrived) {
-          onAutopilotArrival(autopilotDestination.id);
-          onAutopilotToggle(false);
-          onAutopilotStatusChange(`Destination reached: ${autopilotDestination.name}.`);
+        // Time-based interstellar arrival: fire fast-travel when the pre-computed
+        // arrival timestamp is reached, regardless of physics convergence.
+        if (
+          autopilotDestination.interstellarWaypoint &&
+          autopilotDestination.interstellarArrivalAt !== undefined &&
+          performance.now() >= autopilotDestination.interstellarArrivalAt
+        ) {
+          onInterstellarArrival(autopilotDestination);
+        } else {
+          const autopilotStep = updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles);
+          if (autopilotStep.arrived) {
+            if (autopilotDestination.interstellarWaypoint) {
+              onInterstellarArrival(autopilotDestination);
+            } else {
+              onAutopilotArrival(autopilotDestination.id);
+              onAutopilotToggle(false);
+              onAutopilotStatusChange(`Destination reached: ${autopilotDestination.name}.`);
+            }
+          }
         }
       } else {
         settleShipVelocity(state, dt);
@@ -1465,11 +1598,24 @@ function GameScene({
       }
     } else {
       if (autopilotAvailable && autopilotDestination) {
-        const autopilotStep = updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles);
-        if (autopilotStep.arrived) {
-          onAutopilotArrival(autopilotDestination.id);
-          onAutopilotToggle(false);
-          onAutopilotStatusChange(`Destination reached: ${autopilotDestination.name}.`);
+        // Time-based interstellar arrival (pilot mode)
+        if (
+          autopilotDestination.interstellarWaypoint &&
+          autopilotDestination.interstellarArrivalAt !== undefined &&
+          performance.now() >= autopilotDestination.interstellarArrivalAt
+        ) {
+          onInterstellarArrival(autopilotDestination);
+        } else {
+          const autopilotStep = updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles);
+          if (autopilotStep.arrived) {
+            if (autopilotDestination.interstellarWaypoint) {
+              onInterstellarArrival(autopilotDestination);
+            } else {
+              onAutopilotArrival(autopilotDestination.id);
+              onAutopilotToggle(false);
+              onAutopilotStatusChange(`Destination reached: ${autopilotDestination.name}.`);
+            }
+          }
         }
       } else {
         settleShipVelocity(state, dt);
@@ -2748,8 +2894,13 @@ function SpaceTablet({
                     marker.localPosition &&
                     (typeof markerDistance !== 'number' || markerDistance > 50)
                   );
-                  const autopilotEtaSeconds = canAutopilot && markerDistance !== null
-                    ? estimateAutopilotEtaSeconds(markerDistance, marker.approachRadius, shipSpeed)
+                  // For inter-system targets the ship travels INTERSTELLAR_WAYPOINT_DISTANCE,
+                  // not the meaningless local frame distance to the destination's localPosition.
+                  const etaDistance = (marker.systemId !== activeSystemId)
+                    ? INTERSTELLAR_WAYPOINT_DISTANCE
+                    : markerDistance;
+                  const autopilotEtaSeconds = canAutopilot && etaDistance !== null
+                    ? estimateAutopilotEtaSeconds(etaDistance, marker.approachRadius, shipSpeed, marker.systemId !== activeSystemId)
                     : null;
                   const isAutopilotTarget = autopilotEngaged && autopilotDestinationId === marker.id;
 
@@ -2797,7 +2948,7 @@ function SpaceTablet({
                               </button>
                             ) : null}
 
-                            {mapMode === 'sector' && canAutopilot ? (
+                            {(mapMode === 'sector' || (mapMode === 'system' && marker.systemId !== activeSystemId)) && canAutopilot ? (
                               <button
                                 onClick={(e) => {
                                   e.stopPropagation();
