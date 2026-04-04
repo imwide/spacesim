@@ -8,3 +8,4 @@ On each "zoom level" of the map there should be a indicator of the current locat
 On each level it will simply highlight the object that the player is closest to.
 
 Increase the intensity of the glow around stars a bit to make them more visible from a distance. Also make this glow change size and intensity same for the lens flare based on how big the star is on the screen of the player so it feels really intense when you are close to a star but not blinding when you are far away
+

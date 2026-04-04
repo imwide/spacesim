@@ -1182,6 +1182,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
         <SpaceTablet
           frameOrigin={activeFrameOrigin}
           shipPosition={localStateRef.current ? [localStateRef.current.shipPosition.x, localStateRef.current.shipPosition.y, localStateRef.current.shipPosition.z] as [number, number, number] : undefined}
+          shipSpeed={localStateRef.current?.shipVelocity.length() ?? 0}
           activeSystemId={activeSystemId}
           autopilotDestinationId={autopilotDestination?.id || ''}
           autopilotEngaged={autopilotEngaged}
@@ -1820,6 +1821,7 @@ export function findPathToNode(galaxy: GalaxyData, targetId: string): string[] {
 function SpaceTablet({
   frameOrigin,
   shipPosition,
+  shipSpeed,
   activeSystemId,
   autopilotDestinationId,
   autopilotEngaged,
@@ -1845,17 +1847,20 @@ function SpaceTablet({
   onStopAutopilot: () => void;
   onTravel: (station: StationNode) => void;
   shipPosition?: [number, number, number];
+  shipSpeed: number;
 }): ReactElement {
   const MAP_CANVAS_WIDTH = 1600;
   const MAP_CANVAS_HEIGHT = 1200;
-  const [mapMode, setMapMode] = useState<SpaceTabletMapMode>('galaxy');
+  const [mapMode, setMapMode] = useState<SpaceTabletMapMode>('sector');
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [selectedSystemId, setSelectedSystemId] = useState(activeSystemId);
   const [selectedStationId, setSelectedStationId] = useState<string>(
-    autopilotDestinationId || lastTravelledId || `system:${activeSystemId}`,
+    `system:${activeSystemId}`,
   );
+  const [sectorFocusId, setSectorFocusId] = useState<string | null>(null);
   const [dragState, setDragState] = useState<{ x: number; y: number } | null>(null);
+  const initializedViewRef = useRef(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const shipAbsolutePosition = useMemo<Vec3Tuple | undefined>(() => {
     if (!shipPosition) {
@@ -1867,12 +1872,6 @@ function SpaceTablet({
 
   const stationById = useMemo(() => new Map(network.map((station) => [station.id, station])), [network]);
   const systemById = useMemo(() => new Map(galaxy.systems.map((system) => [system.id, system])), [galaxy.systems]);
-
-  useEffect(() => {
-    if (autopilotDestinationId) {
-      setSelectedStationId(autopilotDestinationId);
-    }
-  }, [autopilotDestinationId]);
 
   useEffect(() => {
     setSelectedSystemId((current) => current || activeSystemId);
@@ -2118,14 +2117,13 @@ function SpaceTablet({
     () => selectedSystemMarkers.filter((marker) =>
       marker.kind === 'star' ||
       marker.kind === 'planet' ||
-      marker.kind === 'asteroid-belt' ||
-      marker.kind === 'ship'
+      marker.kind === 'asteroid-belt'
     ),
     [selectedSystemMarkers]
   );
 
   const sectorFocusMarker = useMemo(() => {
-    const current = selectedSystemMarkerLookup.get(selectedStationId);
+    const current = selectedSystemMarkerLookup.get(sectorFocusId ?? selectedStationId);
     if (!current) {
       return null;
     }
@@ -2135,7 +2133,7 @@ function SpaceTablet({
     }
 
     return current;
-  }, [selectedStationId, selectedSystemMarkerLookup]);
+  }, [sectorFocusId, selectedStationId, selectedSystemMarkerLookup]);
 
   const sectorMarkers = useMemo<SpaceTabletMarker[]>(() => {
     if (!selectedSystem || !sectorFocusMarker || !sectorFocusMarker.localPosition) {
@@ -2143,26 +2141,39 @@ function SpaceTablet({
     }
 
     const focusPosition = sectorFocusMarker.localPosition;
+    const hasAncestor = (marker: SpaceTabletMarker, ancestorId: string): boolean => {
+      let parentId = marker.parentId;
+
+      while (parentId) {
+        if (parentId === ancestorId) {
+          return true;
+        }
+
+        parentId = selectedSystemMarkerLookup.get(parentId)?.parentId ?? null;
+      }
+
+      return false;
+    };
+
     const included = selectedSystemMarkers.filter((marker) => {
       if (marker.systemId !== selectedSystem.id) {
         return false;
       }
       if (marker.id === sectorFocusMarker.id) {
+        if (sectorFocusMarker.kind === 'asteroid-belt') {
+          return false;
+        }
         return true;
       }
       if (marker.kind === 'ship') {
-        return activeSystemId === selectedSystem.id;
+        return false;
       }
-      if (sectorFocusMarker.kind === 'planet') {
-        return marker.parentId === sectorFocusMarker.id || selectedSystemMarkerLookup.get(marker.parentId ?? '')?.parentId === sectorFocusMarker.id;
+
+      if (sectorFocusMarker.kind === 'star') {
+        return hasAncestor(marker, sectorFocusMarker.id);
       }
-      if (sectorFocusMarker.kind === 'moon') {
-        return marker.parentId === sectorFocusMarker.id;
-      }
-      if (sectorFocusMarker.kind === 'asteroid-belt') {
-        return marker.parentId === sectorFocusMarker.id;
-      }
-      return marker.parentId === sectorFocusMarker.id || marker.id === `star:${selectedSystem.id}`;
+
+      return hasAncestor(marker, sectorFocusMarker.id);
     });
 
     const relativePositions = included
@@ -2295,15 +2306,17 @@ function SpaceTablet({
     }
 
     const lookup = new Map((visibleMarkers).map((marker) => [marker.id, marker]));
+    const hideSectorCenterConnections = mapMode === 'sector' && sectorFocusMarker?.kind === 'asteroid-belt';
     const connections: Array<{ from: [number, number]; to: [number, number]; variant: 'network' | 'route' }> = (visibleMarkers)
       .filter((marker) => marker.parentId && lookup.has(marker.parentId))
+      .filter((marker) => !hideSectorCenterConnections || marker.parentId !== sectorFocusMarker?.id)
       .map((marker) => ({
         from: lookup.get(marker.parentId!)!.mapPosition,
         to: marker.mapPosition,
         variant: 'network' as const,
       }));
 
-    if (selectedMarker?.localPosition && selectedMarker.systemId === activeSystemId && lookup.has(currentShipMarkerId)) {
+    if (mapMode !== 'sector' && selectedMarker?.localPosition && selectedMarker.systemId === activeSystemId && lookup.has(currentShipMarkerId)) {
       connections.push({
         from: lookup.get(currentShipMarkerId)!.mapPosition,
         to: selectedMarker.mapPosition,
@@ -2312,7 +2325,7 @@ function SpaceTablet({
     }
 
     return connections;
-  }, [activeSystemId, currentShipMarkerId, mapMode, network, selectedMarker, systemById, visibleMarkers]);
+  }, [activeSystemId, currentShipMarkerId, mapMode, network, sectorFocusMarker, selectedMarker, systemById, visibleMarkers]);
 
   const orbitRings = useMemo(() => {
     if (mapMode === 'galaxy') {
@@ -2362,6 +2375,40 @@ function SpaceTablet({
     return combinedMarkerLookup.get(nearestContact)?.name ?? systemById.get(activeSystemId)?.name ?? 'Unknown contact';
   }, [activeSystemId, combinedMarkerLookup, mapMode, nearestContact, systemById]);
 
+  const resolveSectorFocusId = useCallback(
+    (markerId: string | null): string | null => {
+      if (!markerId) {
+        return null;
+      }
+
+      const marker = selectedSystemMarkerLookup.get(markerId);
+      if (!marker) {
+        return null;
+      }
+
+      if (marker.kind === 'station' || marker.kind === 'asteroid-object') {
+        return marker.parentId ? selectedSystemMarkerLookup.get(marker.parentId)?.id ?? marker.parentId : marker.id;
+      }
+
+      return marker.id;
+    },
+    [selectedSystemMarkerLookup],
+  );
+
+  useEffect(() => {
+    if (initializedViewRef.current || selectedSystemMarkers.length === 0) {
+      return;
+    }
+
+    initializedViewRef.current = true;
+    setSelectedSystemId(activeSystemId);
+    setSelectedStationId(nearestContact);
+
+    const nextSectorFocusId = resolveSectorFocusId(nearestContact);
+    setSectorFocusId(nextSectorFocusId);
+    setMapMode(nextSectorFocusId ? 'sector' : 'system');
+  }, [activeSystemId, nearestContact, resolveSectorFocusId, selectedSystemMarkers.length]);
+
   const focusMarker = useCallback(
     (markerId: string, nextMode?: SpaceTabletMapMode) => {
       const marker = combinedMarkerLookup.get(markerId) ?? galaxyMarkerLookup.get(markerId);
@@ -2372,12 +2419,22 @@ function SpaceTablet({
       setSelectedStationId(markerId);
       setSelectedSystemId(marker.systemId);
 
+      if (nextMode === 'sector') {
+        setSectorFocusId(markerId);
+      }
+
       if (nextMode) {
         setMapMode(nextMode);
       }
     },
     [combinedMarkerLookup, galaxyMarkerLookup],
   );
+
+  useEffect(() => {
+    if (mapMode !== 'sector') {
+      setSectorFocusId(null);
+    }
+  }, [mapMode]);
 
   const resetView = useCallback(() => {
     const viewport = viewportRef.current;
@@ -2401,7 +2458,7 @@ function SpaceTablet({
 
   useEffect(() => {
     resetView();
-  }, [mapMode, selectedSystemId, selectedStationId, resetView]);
+  }, [mapMode, resetView]);
 
   const handleWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -2460,8 +2517,8 @@ function SpaceTablet({
     selectedMarker?.stationNode ?? (selectedMarker?.kind === 'station' ? stationById.get(selectedMarker.id) : undefined);
   const selectedCanAutopilot = Boolean(
     selectedMarker &&
-      (selectedMarker.kind === 'station' || selectedMarker.kind === 'asteroid-object') &&
-      selectedMarker.systemId === activeSystemId &&
+      selectedMarker.kind !== 'ship' &&
+      selectedMarker.kind !== 'system' &&
       selectedMarker.localPosition &&
       hudMode !== 'space',
   );
@@ -2501,6 +2558,36 @@ function SpaceTablet({
 
   const selectedVisibleMarker = visibleMarkerLookup.get(selectedStationId) ?? visibleMarkerLookup.get(selectedMarker?.id ?? '');
   const mapSurfaceMarkers = visibleMarkers;
+  const breadcrumbItems = useMemo(
+    () => [
+      {
+        key: 'galaxy',
+        label: 'Galaxy',
+        active: mapMode === 'galaxy',
+        onClick: () => setMapMode('galaxy'),
+      },
+      {
+        key: 'system',
+        label: selectedSystem?.name ?? 'System',
+        active: mapMode === 'system',
+        onClick: () => {
+          setSelectedSystemId(selectedSystem?.id ?? activeSystemId);
+          setMapMode('system');
+        },
+      },
+      ...(mapMode === 'sector' && sectorFocusMarker
+        ? [
+            {
+              key: 'sector',
+              label: sectorFocusMarker.name,
+              active: true,
+              onClick: () => setMapMode('sector'),
+            },
+          ]
+        : []),
+    ],
+    [activeSystemId, mapMode, sectorFocusMarker, selectedSystem],
+  );
 
   const closestMarkerId = useMemo(() => {
     if (!shipAbsolutePosition) return null;
@@ -2547,6 +2634,20 @@ function SpaceTablet({
               <span className="tablet-status-chip">You are near {currentLocationName}</span>
               <span className="tablet-status-chip">{hudMode === 'space' ? 'Fast-travel ready' : 'Autopilot routing online'}</span>
               <span className="tablet-status-chip">{selectedSystem?.name ?? 'No system selected'}</span>
+            </div>
+            <div className="tablet-breadcrumbs" aria-label="Space tablet navigation breadcrumbs">
+              {breadcrumbItems.map((item, index) => (
+                <span className="tablet-breadcrumb-item" key={item.key}>
+                  <button
+                    className={item.active ? 'tablet-breadcrumb tablet-breadcrumb-active' : 'tablet-breadcrumb'}
+                    onClick={item.onClick}
+                    type="button"
+                  >
+                    {item.label}
+                  </button>
+                  {index < breadcrumbItems.length - 1 ? <span className="tablet-breadcrumb-separator">/</span> : null}
+                </span>
+              ))}
             </div>
           </div>
           <button onClick={onClose} type="button">
@@ -2637,24 +2738,42 @@ function SpaceTablet({
                   const isCurrent = marker.id === closestMarkerId;
                   const shouldShowLabel = selected;
 
-                  const markerDistance = marker.localPosition ? distanceBetweenPoints(shipAbsolutePosition, marker.localPosition) : null;
-                  const canAutopilot = Boolean((marker.kind === 'station' || marker.kind === 'asteroid-object') && hudMode !== 'space' && marker.systemId === activeSystemId && typeof markerDistance === 'number' && markerDistance > 50);
+                  const markerDistance = marker.localPosition && marker.systemId === activeSystemId
+                    ? distanceBetweenPoints(shipAbsolutePosition, marker.localPosition)
+                    : null;
+                  const canAutopilot = Boolean(
+                    ((marker.kind === 'station' && (mapMode === 'system' || mapMode === 'sector')) ||
+                      (mapMode === 'sector' && marker.kind !== 'ship' && marker.kind !== 'system' && marker.kind !== 'star')) &&
+                    hudMode !== 'space' &&
+                    marker.localPosition &&
+                    (typeof markerDistance !== 'number' || markerDistance > 50)
+                  );
+                  const autopilotEtaSeconds = canAutopilot && markerDistance !== null
+                    ? estimateAutopilotEtaSeconds(markerDistance, marker.approachRadius, shipSpeed)
+                    : null;
                   const isAutopilotTarget = autopilotEngaged && autopilotDestinationId === marker.id;
 
                   return (
-                    <button
+                    <div
                       className={`tablet-marker tablet-marker-${marker.kind} ${selected ? 'tablet-marker-selected' : ''} ${isCurrent ? 'tablet-marker-current' : ''}`}
                       key={marker.id}
                       onClick={() => {
                         focusMarker(marker.id, undefined);
                       }}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          focusMarker(marker.id, undefined);
+                        }
+                      }}
+                      role="button"
                       style={{
                         left: `${projected.left}px`,
                         top: `${projected.top}px`,
                         ['--tablet-label-scale' as string]: `${1 / zoom}`,
                         zIndex: selected ? 1000 : undefined
                       }}
-                      type="button"
+                      tabIndex={0}
                     >
                       <span className="tablet-marker-ping" />
                       <span className="tablet-marker-core" />
@@ -2663,6 +2782,7 @@ function SpaceTablet({
                           <strong>{marker.name}</strong>
                           <small>{marker.subtitle}</small>
                           {markerDistance !== null ? <small>{formatDistance(markerDistance)}</small> : null}
+                          {canAutopilot ? <small>{autopilotEtaSeconds !== null ? `ETA ${formatEta(autopilotEtaSeconds)}` : 'ETA unavailable'}</small> : null}
 
                           <div className="tablet-label-actions">
                             {mapMode === 'galaxy' ? (
@@ -2698,7 +2818,7 @@ function SpaceTablet({
                           </div>
                         </div>
                       ) : null}
-                    </button>
+                    </div>
                   );
                 })}
               </div>

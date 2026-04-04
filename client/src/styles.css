@@ -419,6 +419,40 @@ button {
   color: #cbd5e1;
 }
 
+.tablet-breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+  margin-top: 0.75rem;
+}
+
+.tablet-breadcrumb-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.tablet-breadcrumb {
+  padding: 0.3rem 0.55rem;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.7);
+  color: #cbd5e1;
+  font-size: 0.82rem;
+}
+
+.tablet-breadcrumb-active {
+  border-color: rgba(96, 165, 250, 0.28);
+  background: rgba(30, 41, 59, 0.9);
+  color: #eff6ff;
+}
+
+.tablet-breadcrumb-separator {
+  color: rgba(148, 163, 184, 0.7);
+  font-size: 0.85rem;
+}
+
 .tablet-map {
   position: relative;
   overflow: hidden;
@@ -539,6 +573,11 @@ button {
   box-shadow: none;
   appearance: none;
   cursor: pointer;
+}
+
+.tablet-marker:focus-visible {
+  outline: 2px solid rgba(125, 211, 252, 0.9);
+  outline-offset: 4px;
 }
 
 .tablet-marker-ping,
