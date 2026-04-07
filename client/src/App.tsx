@@ -236,10 +236,10 @@ const METERS_PER_LIGHT_YEAR = 9_460_730_472_580_800;
 const AUTOPILOT_LOCAL_MAX_ACCELERATION = SHIP_THRUST_ACCELERATION * 5;
 const AUTOPILOT_LOCAL_MAX_BRAKE_DECELERATION = SHIP_THRUST_ACCELERATION * 6.5;
 // ─── Autopilot tuning ────────────────────────────────────────────────────────
-const AUTOPILOT_MAX_SPEED_METERS_PER_SECOND = 0.1 * METERS_PER_LIGHT_YEAR;
+const AUTOPILOT_MAX_SPEED_METERS_PER_SECOND = 200 * METERS_PER_LIGHT_YEAR;
 const AUTOPILOT_INTERSTELLAR_CRUISE_SPEED = AUTOPILOT_MAX_SPEED_METERS_PER_SECOND;
-// Local (intra-system) travel at 15 billion m/s (approx 50x speed of light) gives a nice scenic pace where planets fly by in 15-30 seconds.
-const AUTOPILOT_LOCAL_CRUISE_SPEED = 15_000_000_000;
+// Local (intra-system) travel at 30 billion m/s gives a short 10-15 seconds pace where planets fly by quickly to keep travel under 2 mins.
+const AUTOPILOT_LOCAL_CRUISE_SPEED = 30_000_000_000;
 // Time in seconds to ramp from 0 → cruise (interstellar only)
 const AUTOPILOT_ACCEL_TIME_SECONDS = 20;
 // Time in seconds to ramp from cruise → 0 (interstellar only)
@@ -839,31 +839,14 @@ function getAutopilotCruiseSpeed(isInterSystem: boolean): number {
 }
 
 function getAutopilotAcceleration(isInterSystem: boolean, currentSpeed: number): number {
-  if (!isInterSystem) {
-    return AUTOPILOT_LOCAL_MAX_ACCELERATION;
-  }
-
-  const maxCruise = isInterSystem ? AUTOPILOT_INTERSTELLAR_CRUISE_SPEED : AUTOPILOT_LOCAL_CRUISE_SPEED;
-  
-  // Base acceleration for a cinematic, slow departure (e.g., 50 m/s² allows you to see the station fade away)
-  const baseAccel = isInterSystem ? 100.0 : 50.0;
-  
-  // Exponential growth factor: speed increases smoothly but aggressively later on
-  // k = 1.25 gives a beautiful curve hitting max cruise within roughly 15-20 seconds
-  const k = 1.25;
-  
-  // Prevent absurd acceleration values at ultra-high speeds
-  const maxAccel = maxCruise / 2.0;
-  
-  return Math.min(maxAccel, baseAccel + currentSpeed * k);
+  void currentSpeed;
+  const cruise = isInterSystem ? AUTOPILOT_INTERSTELLAR_CRUISE_SPEED : AUTOPILOT_LOCAL_CRUISE_SPEED;
+  return cruise / AUTOPILOT_ACCEL_TIME_SECONDS;
 }
 
 function getAutopilotBrakeDeceleration(isInterSystem: boolean): number {
-  if (!isInterSystem) {
-    return AUTOPILOT_LOCAL_MAX_BRAKE_DECELERATION;
-  }
-  // Interstellar: kinematic ramp — cruise → 0 in exactly AUTOPILOT_DECEL_TIME_SECONDS
-  return AUTOPILOT_INTERSTELLAR_CRUISE_SPEED / AUTOPILOT_DECEL_TIME_SECONDS;
+  const cruise = isInterSystem ? AUTOPILOT_INTERSTELLAR_CRUISE_SPEED : AUTOPILOT_LOCAL_CRUISE_SPEED;
+  return cruise / AUTOPILOT_DECEL_TIME_SECONDS;
 }
 
 function getAutopilotBrakingDistance(): number {
@@ -877,9 +860,9 @@ function getAutopilotTargetSpeed(distanceToDestination: number, arrivalDistance:
   if (remainingDistance <= 0) return 0;
 
   if (!isInterSystem) {
-    const brakingLimitedSpeed = Math.sqrt(2 * AUTOPILOT_LOCAL_MAX_BRAKE_DECELERATION * remainingDistance);
+    const aBrake = getAutopilotBrakeDeceleration(false);
+    const brakingLimitedSpeed = Math.sqrt(2 * aBrake * remainingDistance);
     const settleLimitedSpeed = remainingDistance / AUTOPILOT_LOCAL_SETTLE_TIME_SECONDS;
-    const closeRangeCruiseCap = remainingDistance <= 12_000 ? AUTOPILOT_LOCAL_CLOSE_RANGE_SPEED_CAP : AUTOPILOT_LOCAL_CRUISE_SPEED;
 
     if (remainingDistance <= AUTOPILOT_REACH_DISTANCE_METERS * 0.35) {
       return 0;
@@ -888,7 +871,7 @@ function getAutopilotTargetSpeed(distanceToDestination: number, arrivalDistance:
     return clamp(
       Math.max(
         AUTOPILOT_LOCAL_MIN_SPEED,
-        Math.min(brakingLimitedSpeed * 0.82, settleLimitedSpeed, closeRangeCruiseCap),
+        Math.min(brakingLimitedSpeed, settleLimitedSpeed)
       ),
       0,
       AUTOPILOT_LOCAL_CRUISE_SPEED,
@@ -1317,17 +1300,20 @@ function updateAutopilotShip(
     state.shipVelocity.copy(lateralVelocity).add(currentForward.clone().multiplyScalar(Math.max(0, nextForwardScalar)));
   } else {
     absoluteTargetSpeed = Math.min(absoluteTargetSpeed, cruiseSpeedCap);
+
+    const currentForward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
+    const headingAlignment = Math.max(0, currentForward.dot(desiredDirection));
+    absoluteTargetSpeed *= Math.max(0.05, headingAlignment * headingAlignment);
+
     const desiredVelocity = desiredDirection.clone().multiplyScalar(absoluteTargetSpeed);
     const velocityError = desiredVelocity.sub(state.shipVelocity);
 
     if (velocityError.lengthSq() > 1e-8) {
-      const responseTime = clamp(
-        AUTOPILOT_LOCAL_VELOCITY_RESPONSE_SECONDS + currentSpeed / 4_000,
-        0.9,
-        1.8,
-      );
+      const accelerating = desiredVelocity.lengthSq() >= state.shipVelocity.lengthSq();
+      const responseTime = accelerating
+        ? clamp(AUTOPILOT_LOCAL_VELOCITY_RESPONSE_SECONDS + currentSpeed / 4_000, 0.9, 1.8)
+        : 0.1;
       const requestedAcceleration = velocityError.multiplyScalar(1 / responseTime);
-      const accelerating = desiredVelocity.length() >= currentSpeed;
       requestedAcceleration.clampLength(0, accelerating ? acceleration : brakeDeceleration);
       state.shipVelocity.addScaledVector(requestedAcceleration, dt);
     }
