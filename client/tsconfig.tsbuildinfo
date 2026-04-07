@@ -1,1 +1,1 @@
-{"root":["./src/App.tsx","./src/galaxy.ts","./src/main.tsx"],"version":"5.9.3"}
+{"root":["./src/App.tsx","./src/PlanetTerrain.tsx","./src/galaxy.ts","./src/main.tsx","./src/noise.ts"],"version":"5.9.3"}

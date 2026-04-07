@@ -19,6 +19,12 @@ import {
   generateGalaxy,
   isLargeAsteroid,
 } from './galaxy';
+import {
+  PLANET_TERRAIN_RENDER_DISTANCE,
+  PlanetTerrain,
+  getTerrainAltitudeAtPosition,
+  getTerrainNormalAtPosition,
+} from './PlanetTerrain';
 
 import {
   type Dispatch,
@@ -38,7 +44,7 @@ import {
 import { io, Socket } from 'socket.io-client';
 import * as THREE from 'three';
 
-type Mode = 'space' | 'interior' | 'pilot';
+type Mode = 'space' | 'interior' | 'pilot' | 'planet-surface';
 type Vec3Tuple = [number, number, number];
 type QuatTuple = [number, number, number, number];
 
@@ -54,6 +60,7 @@ const STAR_PROXY_LINEAR_DISTANCE = 120_000;
 const STAR_PROXY_LOG_FACTOR = 420_000;
 const ASTEROID_RENDER_SCALE_MULTIPLIER = 1;
 const MIN_PROXY_SCALE = 0.00000001;
+const BODY_DETAIL_SPHERE_DISTANCE = PLANET_TERRAIN_RENDER_DISTANCE * 2;
 const PLAYER_MAX_EVA_SPEED_METERS_PER_SECOND = 10 * METERS_PER_WORLD_UNIT;
 const EVA_THRUST_ACCELERATION = 6 * METERS_PER_WORLD_UNIT;
 const EVA_DAMPING = 0.85;
@@ -85,6 +92,14 @@ const SHIP_INTERIOR_CLAMP_Z_METERS = 5 * METERS_PER_WORLD_UNIT;
 const STAR_STATION_SCALE = 6;
 const PLANET_STATION_SCALE = 4.5;
 const ASTEROID_STATION_SCALE = 3.8;
+// ─── Planet surface / landing constants ──────────────────────────────────────
+const PLANET_GRAVITY_RANGE = 100_000; // 100 km from surface
+const PLANET_SURFACE_GRAVITY = 9.81 * METERS_PER_WORLD_UNIT;
+const PLANET_GRAVITY_TERMINAL_VELOCITY = 1000 * METERS_PER_WORLD_UNIT; // 1 km/s max fall speed
+const PLANET_SURFACE_WALK_SPEED = 3.0 * METERS_PER_WORLD_UNIT;
+const PLANET_SURFACE_JUMP_VELOCITY = 5.0 * METERS_PER_WORLD_UNIT;
+const PLANET_SURFACE_EYE_HEIGHT = 1.7 * METERS_PER_WORLD_UNIT;
+const SHIP_LANDING_GEAR_HEIGHT = 6.0 * METERS_PER_WORLD_UNIT;
 const PLANET_TEXTURE_FILES = [
   '4k_ceres_fictional.jpg',
   '4k_eris_fictional.jpg',
@@ -224,6 +239,16 @@ interface LocalGameState {
   pitch: number;
   lastNetworkAt: number;
   lastHudAt: number;
+  /** Planet ID the player is near/on (empty string if none) */
+  nearPlanetId: string;
+  /** Planet center in frame-local coords when near a planet */
+  nearPlanetCenter: THREE.Vector3;
+  /** Planet radius when near a planet */
+  nearPlanetRadius: number;
+  /** Whether the ship is touching the ground */
+  shipOnGround: boolean;
+  /** Whether the player (EVA) is on the planet surface */
+  playerOnGround: boolean;
 }
 
 const AUTH_STORAGE_KEY = 'spacesim.auth';
@@ -260,9 +285,10 @@ const LONG_DISTANCE_DECEL_TRIGGER = 0.5 * LONG_DISTANCE_CRUISE_SPEED * LONG_DIST
 // Steepness of the Gaussian bell-curve deceleration profile.
 // Higher → deceleration more concentrated in the middle; lower → more spread out.
 const LONG_DISTANCE_BELL_CURVE_K = 2.0;
-// Phase 5: final approach distance & duration
-const LONG_DISTANCE_PHASE5_DISTANCE = 10_000; // 10 km
-const LONG_DISTANCE_PHASE5_DURATION = 20; // seconds — constant decel over last 10 km
+
+// Phase 5: final approach distance & duration. User wants last 100km to take 40s and not exceed 5km/s
+const LONG_DISTANCE_PHASE5_DISTANCE = 100_000; // 100 km
+const LONG_DISTANCE_PHASE5_DURATION = 40; // seconds — constant decel over last 100 km
 // Distance of the interstellar waypoint. 3 Light Years provides a realistic warp duration
 const INTERSTELLAR_WAYPOINT_DISTANCE = 3 * METERS_PER_LIGHT_YEAR;
 // Arrival radius for the interstellar waypoint (physics fallback only).
@@ -457,7 +483,7 @@ function createStationSnapshot(state: LocalGameState): PlayerSnapshot {
     frameSystemId: state.frameSystemId,
     frameOrigin: tupleFromVector(state.frameOrigin),
     mode: state.mode,
-    insideShip: state.mode !== 'space',
+    insideShip: state.mode !== 'space' && state.mode !== 'planet-surface',
     position: tupleFromVector(state.position),
     velocity: tupleFromVector(state.velocity),
     rotation: tupleFromQuaternion(state.rotation),
@@ -828,6 +854,124 @@ function moveBodyWithSceneColliders(
   resolveStaticColliderOverlaps(position, velocity, actorRadius, colliders, ignoredColliderIds);
 }
 
+// ─── Planet proximity & terrain collision helpers ─────────────────────────────
+
+interface NearestPlanetInfo {
+  planetId: string;
+  planetCenter: THREE.Vector3;
+  planetRadius: number;
+  distanceToSurface: number;
+}
+
+/**
+ * Find the nearest planet (or moon) to a position, in frame-local coordinates.
+ * Returns null if no planet is within PLANET_GRAVITY_RANGE of the surface.
+ */
+function findNearestPlanet(
+  position: THREE.Vector3,
+  system: StarSystemData,
+  frameOrigin: THREE.Vector3,
+): NearestPlanetInfo | null {
+  let nearest: NearestPlanetInfo | null = null;
+
+  for (const planet of system.planets) {
+    const center = new THREE.Vector3(
+      planet.position[0] - frameOrigin.x,
+      planet.position[1] - frameOrigin.y,
+      planet.position[2] - frameOrigin.z,
+    );
+    const dist = position.distanceTo(center) - planet.radius;
+
+    if (dist < PLANET_GRAVITY_RANGE && (!nearest || dist < nearest.distanceToSurface)) {
+      nearest = {
+        planetId: planet.id,
+        planetCenter: center,
+        planetRadius: planet.radius,
+        distanceToSurface: dist,
+      };
+    }
+
+    // Also check moons
+    for (const moon of planet.moons) {
+      const moonCenter = new THREE.Vector3(
+        planet.position[0] + moon.position[0] - frameOrigin.x,
+        planet.position[1] + moon.position[1] - frameOrigin.y,
+        planet.position[2] + moon.position[2] - frameOrigin.z,
+      );
+      const moonDist = position.distanceTo(moonCenter) - moon.radius;
+
+      if (moonDist < PLANET_GRAVITY_RANGE && (!nearest || moonDist < nearest.distanceToSurface)) {
+        nearest = {
+          planetId: moon.id,
+          planetCenter: moonCenter,
+          planetRadius: moon.radius,
+          distanceToSurface: moonDist,
+        };
+      }
+    }
+  }
+
+  return nearest;
+}
+
+/**
+ * Apply planet gravity to a body. Returns whether the body is on/touching the ground.
+ */
+function applyPlanetGravityAndTerrainCollision(
+  position: THREE.Vector3,
+  velocity: THREE.Vector3,
+  planetCenter: THREE.Vector3,
+  planetRadius: number,
+  planetId: string,
+  bodyRadius: number,
+  dt: number,
+): boolean {
+  // Direction from planet center to body
+  const toBody = new THREE.Vector3().subVectors(position, planetCenter);
+  const distFromCenter = toBody.length();
+  if (distFromCenter < 1e-6) return false;
+
+  const gravityDir = toBody.clone().normalize().negate(); // toward planet center
+
+  // Apply gravity
+  velocity.addScaledVector(gravityDir, PLANET_SURFACE_GRAVITY * dt);
+
+  // Cap gravity-induced speed to terminal velocity (1 km/s)
+  const gravitySpeed = velocity.dot(gravityDir);
+  if (gravitySpeed > PLANET_GRAVITY_TERMINAL_VELOCITY) {
+    velocity.addScaledVector(gravityDir, -(gravitySpeed - PLANET_GRAVITY_TERMINAL_VELOCITY));
+  }
+
+  // Move body
+  position.addScaledVector(velocity, dt);
+
+  // Check terrain collision
+  const terrainAltitude = getTerrainAltitudeAtPosition(position, planetCenter, planetRadius, planetId);
+  const bodyAltitude = position.distanceTo(planetCenter);
+  const minAltitude = terrainAltitude + bodyRadius;
+
+  if (bodyAltitude <= minAltitude) {
+    // On ground: snap to surface
+    const upDir = toBody.normalize();
+    position.copy(planetCenter).addScaledVector(upDir.clone().normalize(), minAltitude);
+
+    // Remove velocity component going into the ground
+    const normalSpeed = velocity.dot(upDir);
+    if (normalSpeed < 0) {
+      velocity.addScaledVector(upDir, -normalSpeed);
+    }
+
+    // Apply friction when on ground
+    const lateralVel = velocity.clone().addScaledVector(upDir, -velocity.dot(upDir));
+    lateralVel.multiplyScalar(Math.max(0, 1 - 4.0 * dt));
+    velocity.copy(upDir.clone().multiplyScalar(velocity.dot(upDir))).add(lateralVel);
+
+    return true;
+  }
+
+  return false;
+}
+
 function integrateShipAngularVelocity(state: LocalGameState, dt: number, angularDamping: number): void {
   if (state.shipAngularVelocity.lengthSq() <= 1e-8) {
     state.shipAngularVelocity.set(0, 0, 0);
@@ -1081,7 +1225,9 @@ function updateLongDistanceAutopilot(
         longDistanceState.decelStartDistance = Math.max(0, remainingDistance - LONG_DISTANCE_PHASE5_DISTANCE);
         longDistanceState.decelStartPosition.copy(state.shipPosition);
         longDistanceState.decelArrivalPoint.copy(destinationLocalPosition).addScaledVector(targetDirection, -(arrivalDistance + LONG_DISTANCE_PHASE5_DISTANCE));
-        break;
+        state.shipVelocity.set(0, 0, 0);
+        state.velocity.copy(state.shipVelocity);
+        return { arrived: false, distance };
       }
 
       if (t >= LONG_DISTANCE_PHASE2_DURATION) {
@@ -1103,6 +1249,11 @@ function updateLongDistanceAutopilot(
         longDistanceState.decelStartDistance = Math.max(0, remainingDistance - LONG_DISTANCE_PHASE5_DISTANCE);
         longDistanceState.decelStartPosition.copy(state.shipPosition);
         longDistanceState.decelArrivalPoint.copy(destinationLocalPosition).addScaledVector(targetDirection, -(arrivalDistance + LONG_DISTANCE_PHASE5_DISTANCE));
+        // Stop the ship at this exact position so phase 4 can take over cleanly
+        // from decelStartPosition without a one-frame 80c overshoot.
+        state.shipVelocity.set(0, 0, 0);
+        state.velocity.copy(state.shipVelocity);
+        return { arrived: false, distance };
       }
       break;
     }
@@ -1154,8 +1305,8 @@ function updateLongDistanceAutopilot(
       if (dt > 0 && errorDist > 0.01) {
         // Speed needed to reach the ideal position in this frame
         const correctionSpeed = errorDist / dt;
-        // Blend: mostly correction, clamp to avoid wild jumps
-        driveSpeed = clamp(correctionSpeed, 0, Math.max(analyticalSpeed * 3, errorDist / dt));
+        // Clamp to analytical speed × 2 to prevent wild velocity spikes
+        driveSpeed = clamp(correctionSpeed, 0, analyticalSpeed * 2 + 1000);
       } else {
         driveSpeed = analyticalSpeed;
       }
@@ -1229,17 +1380,41 @@ function updateLongDistanceAutopilot(
       let driveSpeed5: number;
       if (dt > 0 && errorDist5 > 0.01) {
         const correctionSpeed5 = errorDist5 / dt;
-        driveSpeed5 = clamp(correctionSpeed5, 0, Math.max(analyticalSpeed5 * 3, correctionSpeed5));
+        driveSpeed5 = clamp(correctionSpeed5, 0, analyticalSpeed5 * 2 + 500);
       } else {
         driveSpeed5 = analyticalSpeed5;
       }
+      // Hard cap: never exceed 5 km/s during final approach
+      driveSpeed5 = Math.min(driveSpeed5, 5000);
 
       const driveDir5 = errorDist5 > 0.01
         ? posError5.normalize()
         : longDistanceState.decelDirection;
 
-      // Orient ship toward target
+      // Orient ship: gradually rotate to horizontal (belly toward planet)
+      // during final 100km approach
       const decelRotation5 = createShipFacingQuaternion(driveDir5);
+
+      if (state.nearPlanetId && (destination.kind === 'planet' || destination.kind === 'moon')) {
+        // Direction toward planet center (gravity down)
+        const toCenter = state.nearPlanetCenter.clone().sub(state.shipPosition).normalize();
+        // Project forward direction onto tangent plane
+        const fwd = driveDir5.clone();
+        fwd.addScaledVector(toCenter, -fwd.dot(toCenter)).normalize();
+
+        if (fwd.lengthSq() > 0.01) {
+          // Rotation where -Z is forward along tangent plane, +Y is away from planet
+          const horizontalMatrix = new THREE.Matrix4().lookAt(
+            new THREE.Vector3(0, 0, 0),
+            fwd,
+            toCenter.clone().negate(),
+          );
+          const horizontalQuat = new THREE.Quaternion().setFromRotationMatrix(horizontalMatrix);
+          // Smoothly blend from nose-first to horizontal over the approach
+          decelRotation5.slerp(horizontalQuat, f5);
+        }
+      }
+
       state.shipAngularVelocity.set(0, 0, 0);
       state.shipRotation.rotateTowards(decelRotation5, 1.0 * dt);
       state.rotation.copy(state.shipRotation);
@@ -1854,6 +2029,11 @@ function createLocalState(frameSystemId: string): LocalGameState {
     pitch: 0,
     lastNetworkAt: 0,
     lastHudAt: 0,
+    nearPlanetId: '',
+    nearPlanetCenter: new THREE.Vector3(),
+    nearPlanetRadius: 0,
+    shipOnGround: false,
+    playerOnGround: false,
   };
 }
 
@@ -2139,7 +2319,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
   
 
   useEffect(() => {
-    if (hud.mode === 'space') {
+    if (hud.mode === 'space' || hud.mode === 'planet-surface') {
       resetLongDistanceState();
       setAutopilotEngaged(false);
     }
@@ -2272,7 +2452,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
   );
 
   const handleEngageAutopilot = useCallback(() => {
-    if (!autopilotDestination || hud.mode === 'space') {
+    if (!autopilotDestination || hud.mode === 'space' || hud.mode === 'planet-surface') {
       return;
     }
 
@@ -2303,6 +2483,12 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           'Manual flight: arrow keys rotate the ship with inertia instead of snapping instantly.',
           'W/S thrust forward and backward, A/D thrust left and right. The ship naturally bleeds off sideways drift.',
           'Shift exits the pilot seat. Mouse and Space do nothing here. Press T for the Space-Tablet.',
+        ];
+      case 'planet-surface':
+        return [
+          'Walking on the planet surface. Look around with the mouse.',
+          'WASD to walk along the terrain, Space to jump.',
+          'Approach your ship and press E to board. Use Shift while airborne to activate jetpack.',
         ];
       default:
         return [
@@ -2591,12 +2777,31 @@ function GameScene({
     const keys = pressedKeys.current;
     const movementEnabled = !tabletOpen;
     const lookRotation = new THREE.Quaternion().setFromEuler(new THREE.Euler(state.pitch, state.yaw, 0, 'YXZ'));
-    const autopilotAvailable = autopilotActive && Boolean(autopilotDestination) && state.mode !== 'space';
+    const autopilotAvailable = autopilotActive && Boolean(autopilotDestination) && state.mode !== 'space' && state.mode !== 'planet-surface';
     const playerSceneColliders = [
       ...localEnvironmentColliders,
       ...remoteShipColliders,
       ...buildShipSceneColliders('local-ship', tupleFromVector(state.shipPosition), state.shipRotation),
     ];
+
+    // ── Detect nearest planet for gravity ────────────────────────────────────
+    let nearestPlanet: NearestPlanetInfo | null = null;
+    if (activeSystem) {
+      nearestPlanet = findNearestPlanet(state.position, activeSystem, state.frameOrigin);
+      if (nearestPlanet) {
+        state.nearPlanetId = nearestPlanet.planetId;
+        state.nearPlanetCenter.copy(nearestPlanet.planetCenter);
+        state.nearPlanetRadius = nearestPlanet.planetRadius;
+      } else {
+        state.nearPlanetId = '';
+      }
+    }
+
+    // ── Also check ship proximity to planet for ship gravity ─────────────────
+    let shipNearPlanet: NearestPlanetInfo | null = null;
+    if (activeSystem) {
+      shipNearPlanet = findNearestPlanet(state.shipPosition, activeSystem, state.frameOrigin);
+    }
 
     if (state.mode === 'space') {
       state.rotation.copy(lookRotation);
@@ -2647,7 +2852,25 @@ function GameScene({
         }
       }
 
-      moveBodyWithSceneColliders(state.position, state.velocity, dt, PLAYER_COLLISION_RADIUS, playerSceneColliders);
+      // Apply planet gravity to EVA player within 100km of surface
+      if (nearestPlanet && nearestPlanet.distanceToSurface < PLANET_GRAVITY_RANGE) {
+        const onGround = applyPlanetGravityAndTerrainCollision(
+          state.position, state.velocity,
+          nearestPlanet.planetCenter, nearestPlanet.planetRadius,
+          nearestPlanet.planetId, PLAYER_COLLISION_RADIUS, dt,
+        );
+        state.playerOnGround = onGround;
+
+        // Auto-switch to planet-surface mode when touching ground
+        if (onGround) {
+          state.mode = 'planet-surface';
+          state.insideShip = false;
+        }
+      } else {
+        state.playerOnGround = false;
+        moveBodyWithSceneColliders(state.position, state.velocity, dt, PLAYER_COLLISION_RADIUS, playerSceneColliders);
+      }
+
       camera.position.copy(state.position);
       camera.quaternion.copy(state.rotation);
 
@@ -2749,6 +2972,119 @@ function GameScene({
         onAutopilotToggle(false);
         onAutopilotStatusChange('Autopilot disengaged.');
       }
+    } else if (state.mode === 'planet-surface') {
+      // ── Planet surface walking mode ─────────────────────────────────────
+
+      if (nearestPlanet) {
+        // "Up" is away from planet center
+        const planetUp = new THREE.Vector3().subVectors(state.position, nearestPlanet.planetCenter).normalize();
+
+        // Build a stable surface-aligned reference frame.
+        // Pick a world reference direction that isn't parallel to planetUp.
+        const refDir = Math.abs(planetUp.y) < 0.99
+          ? new THREE.Vector3(0, 1, 0)
+          : new THREE.Vector3(1, 0, 0);
+        // Project refDir onto the tangent plane to get a stable "surface forward"
+        const surfForward = refDir.clone().addScaledVector(planetUp, -refDir.dot(planetUp)).normalize();
+
+        // Surface-aligned quaternion: makes camera up = planetUp, forward = surfForward
+        const surfaceLookMatrix = new THREE.Matrix4().lookAt(
+          new THREE.Vector3(0, 0, 0), surfForward, planetUp,
+        );
+        const surfaceQuat = new THREE.Quaternion().setFromRotationMatrix(surfaceLookMatrix);
+
+        // Apply FPS pitch/yaw within the surface-aligned frame
+        const localLook = new THREE.Quaternion().setFromEuler(
+          new THREE.Euler(state.pitch, state.yaw, 0, 'YXZ'),
+        );
+        state.rotation.copy(surfaceQuat).multiply(localLook);
+
+        // Walking direction uses yaw only (pitch-independent, always in tangent plane).
+        // Derive from the surface quaternion + yaw (no pitch) to stay robust.
+        const localYaw = new THREE.Quaternion().setFromEuler(
+          new THREE.Euler(0, state.yaw, 0, 'YXZ'),
+        );
+        const surfYaw = surfaceQuat.clone().multiply(localYaw);
+        const tangentForward = new THREE.Vector3(0, 0, -1).applyQuaternion(surfYaw);
+        const tangentRight = new THREE.Vector3(1, 0, 0).applyQuaternion(surfYaw);
+
+        const walk = new THREE.Vector3();
+        if (movementEnabled && keys.has('KeyW')) walk.add(tangentForward);
+        if (movementEnabled && keys.has('KeyS')) walk.addScaledVector(tangentForward, -1);
+        if (movementEnabled && keys.has('KeyA')) walk.addScaledVector(tangentRight, -1);
+        if (movementEnabled && keys.has('KeyD')) walk.add(tangentRight);
+
+        if (walk.lengthSq() > 0) {
+          walk.normalize().multiplyScalar(PLANET_SURFACE_WALK_SPEED);
+          // Set horizontal velocity along surface, but preserve vertical (gravity) component
+          const verticalSpeed = state.velocity.dot(planetUp);
+          state.velocity.copy(walk).addScaledVector(planetUp, verticalSpeed);
+        } else {
+          // Damp horizontal velocity
+          const verticalComponent = planetUp.clone().multiplyScalar(state.velocity.dot(planetUp));
+          const horizontalComponent = state.velocity.clone().sub(verticalComponent);
+          horizontalComponent.multiplyScalar(Math.max(0, 1 - 8.0 * dt));
+          state.velocity.copy(verticalComponent).add(horizontalComponent);
+        }
+
+        // Jump with Space
+        if (movementEnabled && consumeAction('Space') && state.playerOnGround) {
+          state.velocity.addScaledVector(planetUp, PLANET_SURFACE_JUMP_VELOCITY);
+          state.playerOnGround = false;
+        }
+
+        // Apply gravity
+        const gravityDir = planetUp.clone().negate();
+        state.velocity.addScaledVector(gravityDir, PLANET_SURFACE_GRAVITY * dt);
+
+        // Cap fall speed to terminal velocity (1 km/s)
+        const fallSpeed = state.velocity.dot(gravityDir);
+        if (fallSpeed > PLANET_GRAVITY_TERMINAL_VELOCITY) {
+          state.velocity.addScaledVector(gravityDir, -(fallSpeed - PLANET_GRAVITY_TERMINAL_VELOCITY));
+        }
+
+        state.position.addScaledVector(state.velocity, dt);
+
+        // Terrain collision
+        const terrainAlt = getTerrainAltitudeAtPosition(
+          state.position, nearestPlanet.planetCenter,
+          nearestPlanet.planetRadius, nearestPlanet.planetId,
+        );
+        const playerAlt = state.position.distanceTo(nearestPlanet.planetCenter);
+        const minAlt = terrainAlt + PLANET_SURFACE_EYE_HEIGHT;
+
+        if (playerAlt <= minAlt) {
+          const upNorm = new THREE.Vector3().subVectors(state.position, nearestPlanet.planetCenter).normalize();
+          state.position.copy(nearestPlanet.planetCenter).addScaledVector(upNorm, minAlt);
+          const normalSpeed = state.velocity.dot(upNorm);
+          if (normalSpeed < 0) {
+            state.velocity.addScaledVector(upNorm, -normalSpeed);
+          }
+          state.playerOnGround = true;
+        } else {
+          state.playerOnGround = false;
+        }
+
+        // Board ship with E
+        if (consumeAction('KeyE') && state.position.distanceTo(state.shipPosition) < BOARDING_DISTANCE_METERS) {
+          state.mode = 'interior';
+          state.insideShip = true;
+          state.interiorPosition.set(0, SHIP_INTERIOR_FLOOR_HEIGHT_METERS, 2.5);
+          state.interiorVelocity.set(0, 0, 0);
+        }
+
+        // Leave surface (jetpack up) with Shift+Space — switch back to EVA space mode
+        if (movementEnabled && (keys.has('ShiftLeft') || keys.has('ShiftRight')) && !state.playerOnGround) {
+          state.mode = 'space';
+        }
+      } else {
+        // Somehow left planet gravity range, switch back to space
+        state.mode = 'space';
+        state.playerOnGround = false;
+      }
+
+      camera.position.copy(state.position);
+      camera.quaternion.copy(state.rotation);
     } else {
       const exitPilotSeat = consumeAction('ShiftLeft') || consumeAction('ShiftRight') || consumeAction('KeyX');
       const pitchInput =
@@ -2856,6 +3192,30 @@ function GameScene({
       camera.quaternion.copy(state.shipRotation);
     }
 
+    // ── Apply ship gravity when touching ground (any mode except flying) ───
+    if (shipNearPlanet && state.mode !== 'pilot') {
+      const shipOnGround = applyPlanetGravityAndTerrainCollision(
+        state.shipPosition, state.shipVelocity,
+        shipNearPlanet.planetCenter, shipNearPlanet.planetRadius,
+        shipNearPlanet.planetId, SHIP_LANDING_GEAR_HEIGHT, dt,
+      );
+      state.shipOnGround = shipOnGround;
+    } else if (shipNearPlanet && state.mode === 'pilot') {
+      // In pilot mode, only apply ship gravity if already on ground or very slow
+      if (state.shipOnGround || state.shipVelocity.length() < 2.0) {
+        const shipOnGround = applyPlanetGravityAndTerrainCollision(
+          state.shipPosition, state.shipVelocity,
+          shipNearPlanet.planetCenter, shipNearPlanet.planetRadius,
+          shipNearPlanet.planetId, SHIP_LANDING_GEAR_HEIGHT, dt,
+        );
+        state.shipOnGround = shipOnGround;
+      } else {
+        state.shipOnGround = false;
+      }
+    } else {
+      state.shipOnGround = false;
+    }
+
     if (shipGroupRef.current) {
       shipGroupRef.current.visible = state.mode !== 'pilot';
       shipGroupRef.current.position.copy(state.shipPosition);
@@ -2875,10 +3235,10 @@ function GameScene({
 
     if (now - state.lastHudAt > 100) {
       const boardingDistance = state.position.distanceTo(state.shipPosition);
-      const canEnter = state.mode === 'space' && boardingDistance < BOARDING_DISTANCE_METERS;
+      const canEnter = (state.mode === 'space' || state.mode === 'planet-surface') && boardingDistance < BOARDING_DISTANCE_METERS;
       const canPilot = state.mode === 'interior' && state.interiorPosition.distanceTo(seatPosition) < SEAT_INTERACTION_DISTANCE_METERS;
       const shipSpeed = state.shipVelocity.length();
-      const speed = state.mode === 'pilot' ? shipSpeed : state.mode === 'space' ? state.velocity.length() : walkSpeed(state);
+      const speed = state.mode === 'pilot' ? shipSpeed : state.mode === 'space' || state.mode === 'planet-surface' ? state.velocity.length() : walkSpeed(state);
 
       let prompt = pointerLocked
         ? 'WASD to move, Space/Shift for vertical thrust. Momentum is preserved.'
@@ -2889,6 +3249,14 @@ function GameScene({
       if (state.mode === 'space' && canEnter) {
         prompt = 'Press E to enter your ship.';
       }
+      if (state.mode === 'planet-surface') {
+        const canBoard = canEnter;
+        if (canBoard) {
+          prompt = 'Walking on planet surface. WASD to walk, Space to jump. Press E to board ship.';
+        } else {
+          prompt = 'Walking on planet surface. WASD to walk, Space to jump. Use jetpack (Shift while airborne) to return to EVA.';
+        }
+      }
       if (state.mode === 'interior') {
         prompt = canPilot ? 'Press F near the seat to sit down, or use the autopilot panel to select a destination.' : 'Explore the ship interior with WASD. Use the autopilot panel or press X to exit.';
       }
@@ -2897,7 +3265,7 @@ function GameScene({
           ? `Autopilot en route to ${autopilotDestination.name}. ETA ${autopilotEtaLabel}. Use arrow keys or WASD to take over. Shift exits the seat.`
           : 'Pilot seat engaged. Arrow keys rotate, WASD thrusts, Shift exits the seat. Mouse and Space do nothing.';
       }
-      if (state.mode !== 'space' && autopilotActive && autopilotDestination) {
+      if (state.mode !== 'space' && state.mode !== 'planet-surface' && autopilotActive && autopilotDestination) {
         prompt = `Autopilot en route to ${autopilotDestination.name}. ETA ${autopilotEtaLabel}. Arrival threshold: ${formatDistance(AUTOPILOT_REACH_DISTANCE_METERS)}.`;
       }
       if (tabletOpen) {
@@ -3033,7 +3401,7 @@ function WarpSpeedEffect({ localStateRef }: { localStateRef: MutableRefObject<Lo
 
     const shipSpeed = localStateRef.current.shipVelocity.length();
     const intensity = getWarpEffectIntensity(shipSpeed);
-    groupRef.current.visible = intensity > 0.001 && localStateRef.current.mode !== 'space';
+    groupRef.current.visible = intensity > 0.001 && localStateRef.current.mode !== 'space' && localStateRef.current.mode !== 'planet-surface';
 
     if (!groupRef.current.visible) {
       materialRef.current.opacity = 0;
@@ -3234,7 +3602,7 @@ function SpaceTablet({
   autopilotDestinationId: string;
   autopilotEngaged: boolean;
   galaxy: GalaxyData;
-  hudMode: 'space' | 'interior' | 'pilot';
+  hudMode: Mode;
   lastTravelledId: string;
   network: StationNode[];
   onClose: () => void;
@@ -3912,11 +4280,11 @@ function SpaceTablet({
     selectedMarker?.stationNode ?? (selectedMarker?.kind === 'station' ? stationById.get(selectedMarker.id) : undefined);
   const selectedCanAutopilot = Boolean(
     selectedMarker &&
-      (selectedMarker.kind === 'station' || selectedMarker.kind === 'asteroid-belt' || selectedMarker.kind === 'asteroid-object') &&
+      (selectedMarker.kind === 'station' || selectedMarker.kind === 'asteroid-belt' || selectedMarker.kind === 'asteroid-object' || selectedMarker.kind === 'planet' || selectedMarker.kind === 'moon') &&
       selectedMarker.localPosition &&
-      hudMode !== 'space',
+      hudMode !== 'space' && hudMode !== 'planet-surface',
   );
-  const selectedCanTravel = Boolean(hudMode === 'space' && selectedStationNode);
+  const selectedCanTravel = Boolean((hudMode === 'space' || hudMode === 'planet-surface') && selectedStationNode);
   const selectedAutopilotActive = Boolean(autopilotEngaged && selectedMarker && autopilotDestinationId === selectedMarker.id);
 
   const buildDestination = useCallback(
@@ -3936,15 +4304,50 @@ function SpaceTablet({
                 ? marker.kind
                 : 'planet';
 
+      // For planets and moons, target the closest surface point instead of the center
+      let targetPosition: Vec3Tuple = marker.localPosition;
+      let targetApproachRadius = marker.approachRadius;
+      if ((marker.kind === 'planet' || marker.kind === 'moon') && shipAbsolutePosition) {
+        const cx = marker.localPosition[0];
+        const cy = marker.localPosition[1];
+        const cz = marker.localPosition[2];
+        const dx = shipAbsolutePosition[0] - cx;
+        const dy = shipAbsolutePosition[1] - cy;
+        const dz = shipAbsolutePosition[2] - cz;
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist > 0) {
+          // Surface radius: strip the extra multiplier the marker has (planet 1.2×, moon 1.8×)
+          // to get the actual body radius, then target a point just above the surface
+          const bodyRadius = marker.kind === 'planet'
+            ? (marker.approachRadius >= 180 ? marker.approachRadius / 1.2 : marker.approachRadius)
+            : (marker.approachRadius >= 120 ? marker.approachRadius / 1.8 : marker.approachRadius);
+          
+          const wPos = new THREE.Vector3(shipAbsolutePosition[0], shipAbsolutePosition[1], shipAbsolutePosition[2]);
+          const pCenter = new THREE.Vector3(cx, cy, cz);
+          const actualTerrainAlt = getTerrainAltitudeAtPosition(wPos, pCenter, bodyRadius, marker.id);
+          const surfaceAltitude = actualTerrainAlt + 500; // Stop exactly 500m above the specific terrain point
+          
+          const nx = dx / dist;
+          const ny = dy / dist;
+          const nz = dz / dist;
+          targetPosition = [
+            cx + nx * surfaceAltitude,
+            cy + ny * surfaceAltitude,
+            cz + nz * surfaceAltitude,
+          ];
+          targetApproachRadius = 0; // the position itself is already near the surface
+        }
+      }
+
       return {
         id: marker.id,
         name: marker.name,
         kind: destinationKind,
         systemId: marker.systemId,
         systemName: marker.systemName,
-        localPosition: marker.localPosition,
-        approachRadius: marker.approachRadius,
-        distanceFromShip: distanceBetweenPoints(shipAbsolutePosition, marker.localPosition) ?? 0,
+        localPosition: targetPosition,
+        approachRadius: targetApproachRadius,
+        distanceFromShip: distanceBetweenPoints(shipAbsolutePosition, targetPosition) ?? 0,
       };
     },
     [shipAbsolutePosition],
@@ -4026,7 +4429,7 @@ function SpaceTablet({
             <p>Modern tactical map for galaxy travel, in-system routing, and live object tracking.</p>
             <div className="tablet-status-row">
               <span className="tablet-status-chip">You are near {currentLocationName}</span>
-              <span className="tablet-status-chip">{hudMode === 'space' ? 'Fast-travel ready' : 'Autopilot routing online'}</span>
+              <span className="tablet-status-chip">{hudMode === 'space' || hudMode === 'planet-surface' ? 'Fast-travel ready' : 'Autopilot routing online'}</span>
               <span className="tablet-status-chip">{selectedSystem?.name ?? 'No system selected'}</span>
             </div>
             <div className="tablet-breadcrumbs" aria-label="Space tablet navigation breadcrumbs">
@@ -4136,9 +4539,9 @@ function SpaceTablet({
                     ? distanceBetweenPoints(shipAbsolutePosition, marker.localPosition)
                     : null;
                   const canAutopilot = Boolean(
-                    (marker.kind === 'station' || marker.kind === 'asteroid-belt' || marker.kind === 'asteroid-object') &&
+                    (marker.kind === 'station' || marker.kind === 'asteroid-belt' || marker.kind === 'asteroid-object' || marker.kind === 'planet' || marker.kind === 'moon') &&
                     (mapMode === 'system' || mapMode === 'sector') &&
-                    hudMode !== 'space' &&
+                    hudMode !== 'space' && hudMode !== 'planet-surface' &&
                     marker.localPosition &&
                     (typeof markerDistance !== 'number' || markerDistance > 50)
                   );
@@ -4196,7 +4599,7 @@ function SpaceTablet({
                               </button>
                             ) : null}
 
-                            {(mapMode === 'sector' || (mapMode === 'system' && marker.systemId !== activeSystemId)) && canAutopilot ? (
+                            {(mapMode === 'sector' || (mapMode === 'system' && (marker.systemId !== activeSystemId || marker.kind === 'planet' || marker.kind === 'moon'))) && canAutopilot ? (
                               <button
                                 onClick={(e) => {
                                   e.stopPropagation();
@@ -4675,6 +5078,60 @@ function PhysicalProxyGroup({
   return <group ref={groupRef}>{children}</group>;
 }
 
+function AdaptiveBodySurface({
+  color,
+  detailDistance = BODY_DETAIL_SPHERE_DISTANCE,
+  lowSegments,
+  metalness,
+  physicalPosition,
+  radius,
+  roughness,
+  surfaceTexture,
+  terrainDistance = PLANET_TERRAIN_RENDER_DISTANCE,
+}: {
+  color: string;
+  detailDistance?: number;
+  lowSegments: number;
+  metalness: number;
+  physicalPosition: Vec3Tuple;
+  radius: number;
+  roughness: number;
+  surfaceTexture?: THREE.Texture;
+  terrainDistance?: number;
+}): ReactElement {
+  const { camera } = useThree();
+  const lowRef = useRef<THREE.Mesh>(null);
+  const highRef = useRef<THREE.Mesh>(null);
+  const physicalPositionVector = useMemo(() => new THREE.Vector3(...physicalPosition), [physicalPosition]);
+  const highSegments = lowSegments * 2;
+
+  useFrame(() => {
+    const distanceToSurface = camera.position.distanceTo(physicalPositionVector) - radius;
+    const showTerrainOnly = distanceToSurface <= terrainDistance;
+    const showHighDetailSphere = !showTerrainOnly && distanceToSurface <= detailDistance;
+
+    if (lowRef.current) {
+      lowRef.current.visible = !showTerrainOnly && !showHighDetailSphere;
+    }
+    if (highRef.current) {
+      highRef.current.visible = showHighDetailSphere;
+    }
+  });
+
+  return (
+    <>
+      <mesh ref={lowRef}>
+        <sphereGeometry args={[radius, lowSegments, lowSegments]} />
+        <meshStandardMaterial color={color} map={surfaceTexture} roughness={roughness} metalness={metalness} />
+      </mesh>
+      <mesh ref={highRef} visible={false}>
+        <sphereGeometry args={[radius, highSegments, highSegments]} />
+        <meshStandardMaterial color={color} map={surfaceTexture} roughness={roughness} metalness={metalness} />
+      </mesh>
+    </>
+  );
+}
+
 function PlanetBody({ physicalPosition, planet }: { physicalPosition: Vec3Tuple; planet: PlanetData }): ReactElement {
   const textureLibrary = usePlanetTextureLibrary();
   const surfaceTexture = useMemo(() => pickBodySurfaceTexture(textureLibrary, planet.id), [planet.id, textureLibrary]);
@@ -4682,11 +5139,23 @@ function PlanetBody({ physicalPosition, planet }: { physicalPosition: Vec3Tuple;
   return (
     <>
       <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={PLANET_VISIBILITY_RANGE}>
-        <mesh>
-          <sphereGeometry args={[planet.radius, 20, 20]} />
-          <meshStandardMaterial color={planet.color} map={surfaceTexture} roughness={0.96} metalness={0.04} />
-        </mesh>
+        <AdaptiveBodySurface
+          color={planet.color}
+          lowSegments={20}
+          metalness={0.04}
+          physicalPosition={physicalPosition}
+          radius={planet.radius}
+          roughness={0.96}
+          surfaceTexture={surfaceTexture}
+        />
       </PhysicalProxyGroup>
+
+      <PlanetTerrain
+        planetPosition={physicalPosition}
+        planetRadius={planet.radius}
+        planetId={planet.id}
+        planetColor={planet.color}
+      />
 
       {planet.stations.map((station) => (
         <SpaceStation key={station.id} station={station} physicalPosition={tupleAdd(physicalPosition, station.position)} scale={PLANET_STATION_SCALE} />
@@ -4706,11 +5175,23 @@ function MoonBody({ moon, physicalPosition }: { moon: MoonData; physicalPosition
   return (
     <>
       <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={PLANET_VISIBILITY_RANGE}>
-        <mesh>
-          <sphereGeometry args={[moon.radius, 16, 16]} />
-          <meshStandardMaterial color={moon.color} map={surfaceTexture} roughness={0.98} metalness={0.03} />
-        </mesh>
+        <AdaptiveBodySurface
+          color={moon.color}
+          lowSegments={16}
+          metalness={0.03}
+          physicalPosition={physicalPosition}
+          radius={moon.radius}
+          roughness={0.98}
+          surfaceTexture={surfaceTexture}
+        />
       </PhysicalProxyGroup>
+
+      <PlanetTerrain
+        planetPosition={physicalPosition}
+        planetRadius={moon.radius}
+        planetId={moon.id}
+        planetColor={moon.color}
+      />
 
       {moon.stations.map((station) => (
         <SpaceStation key={station.id} station={station} physicalPosition={tupleAdd(physicalPosition, station.position)} scale={PLANET_STATION_SCALE} />
@@ -5036,7 +5517,7 @@ function RemotePlayer({ player, viewerFrameOrigin }: { player: PlayerSnapshot; v
           <div className="status-pill">{player.username}</div>
         </Html>
       </group>
-      {!player.insideShip && player.mode === 'space' ? (
+      {!player.insideShip && (player.mode === 'space' || player.mode === 'planet-surface') ? (
         <group position={relativeBodyPosition} quaternion={bodyQuaternion}>
           <Astronaut />
         </group>

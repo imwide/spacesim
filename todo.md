@@ -11,3 +11,7 @@ Create a simple inventory system. The user should see 3 inventory slots in their
 Use the textures in the "planet_textures" folder to wrap all the planets and moons in random textures from this folder. These textures are full wraps like an earth map. Also create alternative textures by copying each of these and applying some random (medium strength) colorization edits
 
 Add collision for the player and ship with objects such as stations, ships, asteroids, planets and co. (Just so they can phase through each other, no complicated physics needed)
+
+
+The players "height" position on a planet has the opposite effect on the ships height position. when the palyer walks downhill, the ship rises and when walking uphill, the ship lowers. Fix this.
+
