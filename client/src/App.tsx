@@ -246,6 +246,23 @@ const AUTOPILOT_ACCEL_TIME_SECONDS = 20;
 const AUTOPILOT_DECEL_TIME_SECONDS = 20;
 // Distances below this use short-range proportional approach
 const AUTOPILOT_LOCAL_RANGE_THRESHOLD_METERS = 100_000; // 100 km
+// ─── Long-distance autopilot (intra-system, > 1000 km) ────────────────────────
+const SPEED_OF_LIGHT_MPS = 299_792_458;
+/** Long distance cruise speed — tune this value to adjust top travel speed */
+const LONG_DISTANCE_CRUISE_SPEED = 80 * SPEED_OF_LIGHT_MPS;
+const LONG_DISTANCE_THRESHOLD_METERS = 1_000_000; // 1 000 km
+const LONG_DISTANCE_PHASE1_DURATION = 20; // seconds — slow accel & orient
+const LONG_DISTANCE_PHASE1_TARGET_SPEED = 5_000; // 5 km/s
+const LONG_DISTANCE_PHASE2_DURATION = 20; // seconds — fast accel to cruise
+const LONG_DISTANCE_DECEL_DURATION = 20; // seconds — deceleration phase
+// Decel trigger distance: 0.5 × cruiseSpeed × decelDuration ≈ 240 million km (1.6 AU)
+const LONG_DISTANCE_DECEL_TRIGGER = 0.5 * LONG_DISTANCE_CRUISE_SPEED * LONG_DISTANCE_DECEL_DURATION;
+// Steepness of the Gaussian bell-curve deceleration profile.
+// Higher → deceleration more concentrated in the middle; lower → more spread out.
+const LONG_DISTANCE_BELL_CURVE_K = 2.0;
+// Phase 5: final approach distance & duration
+const LONG_DISTANCE_PHASE5_DISTANCE = 10_000; // 10 km
+const LONG_DISTANCE_PHASE5_DURATION = 20; // seconds — constant decel over last 10 km
 // Distance of the interstellar waypoint. 3 Light Years provides a realistic warp duration
 const INTERSTELLAR_WAYPOINT_DISTANCE = 3 * METERS_PER_LIGHT_YEAR;
 // Arrival radius for the interstellar waypoint (physics fallback only).
@@ -888,12 +905,410 @@ function getAutopilotTargetSpeed(distanceToDestination: number, arrivalDistance:
 }
 
 function getWarpEffectIntensity(currentSpeed: number): number {
+  // Long-distance autopilot warp visual: ramp from 10% to 100% of cruise
+  if (longDistanceState.active) {
+    return clamp(
+      (currentSpeed - LONG_DISTANCE_CRUISE_SPEED * 0.1) /
+        (LONG_DISTANCE_CRUISE_SPEED - LONG_DISTANCE_CRUISE_SPEED * 0.1),
+      0,
+      1,
+    );
+  }
   return clamp(
     (currentSpeed - AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND) /
       (AUTOPILOT_MAX_SPEED_METERS_PER_SECOND - AUTOPILOT_WARP_EFFECT_SPEED_METERS_PER_SECOND),
     0,
     1,
   );
+}
+
+// ─── Long-distance autopilot phase state ─────────────────────────────────────
+
+/**
+ * Error function approximation (Abramowitz & Stegun 7.1.26, max error ≈ 1.5 × 10⁻⁷).
+ */
+function approxErf(x: number): number {
+  const sign = x < 0 ? -1 : 1;
+  const ax = Math.abs(x);
+  const t = 1 / (1 + 0.3275911 * ax);
+  const y = 1 - (((((1.061405429 * t + -1.453152027) * t) + 1.421413741) * t + -0.284496736) * t + 0.254829592) * t * Math.exp(-ax * ax);
+  return sign * y;
+}
+
+/**
+ * Normalised Gaussian CDF mapping [0, 1] → [0, 1].
+ * G(0) = 0, G(0.5) = 0.5, G(1) = 1.
+ */
+function bellCurveCDF(f: number, k: number): number {
+  const ek = approxErf(k);
+  return (approxErf(k * (2 * f - 1)) + ek) / (2 * ek);
+}
+
+/**
+ * Ideal remaining-distance fraction at time-fraction f ∈ [0, 1] for the
+ * bell-curve velocity profile `v(t) = v₀ · (1 − G(t/T))`.
+ * Returns 1 at f = 0 and 0 at f = 1.
+ */
+function bellCurveIdealRemaining(f: number, k: number): number {
+  const ek = approxErf(k);
+  const xi = k * (2 * f - 1);
+  // Antiderivative of erf(w): F(w) = w · erf(w) + exp(−w²) / √π
+  const Fxi = xi * approxErf(xi) + Math.exp(-xi * xi) / Math.sqrt(Math.PI);
+  const Fnk = k * ek + Math.exp(-k * k) / Math.sqrt(Math.PI); // = F(−k)
+  const J = (Fxi - Fnk) / (2 * k);
+  const I = (f * ek + J) / (2 * ek);
+  return clamp(1 - 2 * f + 2 * I, 0, 1);
+}
+
+interface LongDistancePhaseState {
+  active: boolean;
+  phase: 1 | 2 | 3 | 4 | 5;
+  phaseElapsed: number;
+  /** Speed when entering phase 4 */
+  decelEntrySpeed: number;
+  /** Locked travel direction during phase 4 (straight line) */
+  decelDirection: THREE.Vector3;
+  /** Remaining distance recorded at the start of phase 4 */
+  decelStartDistance: number;
+  /** Ship position when entering phase 4 */
+  decelStartPosition: THREE.Vector3;
+  /** Point the ship must reach at end of phase 4 (10 km from destination) */
+  decelArrivalPoint: THREE.Vector3;
+  /** Ship position when entering phase 5 */
+  phase5StartPosition: THREE.Vector3;
+  /** Exact arrival point for phase 5 (250 m from destination) */
+  phase5ArrivalPoint: THREE.Vector3;
+  /** Speed when entering phase 5 */
+  phase5EntrySpeed: number;
+  destinationId: string;
+}
+
+const longDistanceState: LongDistancePhaseState = {
+  active: false,
+  phase: 1,
+  phaseElapsed: 0,
+  decelEntrySpeed: 0,
+  decelDirection: new THREE.Vector3(),
+  decelStartDistance: 0,
+  decelStartPosition: new THREE.Vector3(),
+  decelArrivalPoint: new THREE.Vector3(),
+  phase5StartPosition: new THREE.Vector3(),
+  phase5ArrivalPoint: new THREE.Vector3(),
+  phase5EntrySpeed: 0,
+  destinationId: '',
+};
+
+function resetLongDistanceState(): void {
+  longDistanceState.active = false;
+  longDistanceState.phase = 1;
+  longDistanceState.phaseElapsed = 0;
+  longDistanceState.decelEntrySpeed = 0;
+  longDistanceState.decelDirection.set(0, 0, 0);
+  longDistanceState.decelStartDistance = 0;
+  longDistanceState.decelStartPosition.set(0, 0, 0);
+  longDistanceState.decelArrivalPoint.set(0, 0, 0);
+  longDistanceState.phase5StartPosition.set(0, 0, 0);
+  longDistanceState.phase5ArrivalPoint.set(0, 0, 0);
+  longDistanceState.phase5EntrySpeed = 0;
+  longDistanceState.destinationId = '';
+}
+
+/**
+ * Long-distance autopilot (intra-system, distance > 1 000 km).
+ *
+ * Phase 1 (20 s): Orient toward target & accelerate to 5 km/s.
+ * Phase 2 (20 s): Accelerate to Long distance cruise speed (80 c).
+ * Phase 3 (cruise): Hold cruise speed until ~240 M km (1.6 AU) from target.
+ * Phase 4 (20 s): Bell-curve decelerate to ~10 km from target.
+ * Phase 5 (20 s): Constant deceleration over last 10 km, arrive at 250 m threshold.
+ */
+function updateLongDistanceAutopilot(
+  state: LocalGameState,
+  dt: number,
+  destination: AutopilotDestination,
+  destinationLocalPosition: THREE.Vector3,
+  distance: number,
+  arrivalDistance: number,
+): { arrived: boolean; distance: number } {
+  const toTarget = destinationLocalPosition.clone().sub(state.shipPosition);
+  const targetDirection = toTarget.clone().normalize();
+
+  // Initialise / re-initialise when the destination changes
+  if (!longDistanceState.active || longDistanceState.destinationId !== destination.id) {
+    resetLongDistanceState();
+    longDistanceState.active = true;
+    longDistanceState.destinationId = destination.id;
+  }
+
+  longDistanceState.phaseElapsed += dt;
+  const remainingDistance = Math.max(0, distance - arrivalDistance);
+
+  // ── Compute target speed & direction for the current phase ──────────────
+  let targetSpeed = 0;
+  let desiredDirection = targetDirection.clone();
+  let accelerationRate = 0;
+
+  switch (longDistanceState.phase) {
+    case 1: { // Slow acceleration & orientation
+      const t = longDistanceState.phaseElapsed;
+      accelerationRate = LONG_DISTANCE_PHASE1_TARGET_SPEED / LONG_DISTANCE_PHASE1_DURATION;
+      targetSpeed = clamp(accelerationRate * t, 0, LONG_DISTANCE_PHASE1_TARGET_SPEED);
+
+      if (t >= LONG_DISTANCE_PHASE1_DURATION) {
+        longDistanceState.phase = 2;
+        longDistanceState.phaseElapsed = 0;
+      }
+      break;
+    }
+    case 2: { // Fast acceleration to cruise
+      const t = longDistanceState.phaseElapsed;
+      accelerationRate =
+        (LONG_DISTANCE_CRUISE_SPEED - LONG_DISTANCE_PHASE1_TARGET_SPEED) / LONG_DISTANCE_PHASE2_DURATION;
+      targetSpeed = clamp(
+        LONG_DISTANCE_PHASE1_TARGET_SPEED + accelerationRate * t,
+        0,
+        LONG_DISTANCE_CRUISE_SPEED,
+      );
+
+      // Safety: if remaining distance already requires deceleration, skip to phase 4
+      const currentSpeed = state.shipVelocity.length();
+      const decelDist = 0.5 * currentSpeed * LONG_DISTANCE_DECEL_DURATION;
+      if (remainingDistance <= decelDist && currentSpeed > LONG_DISTANCE_PHASE1_TARGET_SPEED) {
+        longDistanceState.phase = 4;
+        longDistanceState.phaseElapsed = 0;
+        longDistanceState.decelEntrySpeed = currentSpeed;
+        longDistanceState.decelDirection.copy(targetDirection);
+        longDistanceState.decelStartDistance = Math.max(0, remainingDistance - LONG_DISTANCE_PHASE5_DISTANCE);
+        longDistanceState.decelStartPosition.copy(state.shipPosition);
+        longDistanceState.decelArrivalPoint.copy(destinationLocalPosition).addScaledVector(targetDirection, -(arrivalDistance + LONG_DISTANCE_PHASE5_DISTANCE));
+        break;
+      }
+
+      if (t >= LONG_DISTANCE_PHASE2_DURATION) {
+        longDistanceState.phase = 3;
+        longDistanceState.phaseElapsed = 0;
+      }
+      break;
+    }
+    case 3: { // Cruise
+      targetSpeed = LONG_DISTANCE_CRUISE_SPEED;
+      accelerationRate =
+        (LONG_DISTANCE_CRUISE_SPEED - LONG_DISTANCE_PHASE1_TARGET_SPEED) / LONG_DISTANCE_PHASE2_DURATION;
+
+      if (remainingDistance <= LONG_DISTANCE_DECEL_TRIGGER) {
+        longDistanceState.phase = 4;
+        longDistanceState.phaseElapsed = 0;
+        longDistanceState.decelEntrySpeed = state.shipVelocity.length() || LONG_DISTANCE_CRUISE_SPEED;
+        longDistanceState.decelDirection.copy(targetDirection);
+        longDistanceState.decelStartDistance = Math.max(0, remainingDistance - LONG_DISTANCE_PHASE5_DISTANCE);
+        longDistanceState.decelStartPosition.copy(state.shipPosition);
+        longDistanceState.decelArrivalPoint.copy(destinationLocalPosition).addScaledVector(targetDirection, -(arrivalDistance + LONG_DISTANCE_PHASE5_DISTANCE));
+      }
+      break;
+    }
+    case 4: { // Deceleration — bell-curve profile, straight line
+      const t = longDistanceState.phaseElapsed;
+      const T = LONG_DISTANCE_DECEL_DURATION;
+      const D0 = longDistanceState.decelStartDistance;
+      const f = clamp(t / T, 0, 1);
+      const decelDir = longDistanceState.decelDirection;
+      const startPos = longDistanceState.decelStartPosition;
+      const arrivalPt = longDistanceState.decelArrivalPoint;
+
+      // Progress fraction from bell-curve: 0 at start, 1 at arrival
+      const progressFraction = 1 - bellCurveIdealRemaining(f, LONG_DISTANCE_BELL_CURVE_K);
+
+      // Ideal position = lerp from startPos to arrivalPt
+      const idealPosition = startPos.clone().lerp(arrivalPt, progressFraction);
+
+      // Compute velocity needed to reach ideal position this frame
+      const posError = idealPosition.clone().sub(state.shipPosition);
+      const errorDist = posError.length();
+
+      // Also compute the analytical speed for visual smoothness
+      const v0 = D0 > 0 ? 2 * D0 / T : longDistanceState.decelEntrySpeed;
+      const speedFraction = 1 - bellCurveCDF(f, LONG_DISTANCE_BELL_CURVE_K);
+      const analyticalSpeed = v0 * speedFraction;
+
+      // ── Arrival checks ──────────────────────────────────────────────────
+      if (f >= 1) {
+        // Snap to the phase-4 arrival point (10 km out) and transition to phase 5
+        state.shipPosition.copy(arrivalPt);
+        state.shipVelocity.set(0, 0, 0);
+        state.position.copy(state.shipPosition);
+        state.velocity.copy(state.shipVelocity);
+
+        const toTargetNow = destinationLocalPosition.clone().sub(state.shipPosition).normalize();
+        longDistanceState.phase = 5;
+        longDistanceState.phaseElapsed = 0;
+        longDistanceState.phase5StartPosition.copy(state.shipPosition);
+        longDistanceState.phase5ArrivalPoint.copy(destinationLocalPosition).addScaledVector(toTargetNow, -arrivalDistance);
+        longDistanceState.phase5EntrySpeed = 2 * LONG_DISTANCE_PHASE5_DISTANCE / LONG_DISTANCE_PHASE5_DURATION;
+        return { arrived: false, distance: state.shipPosition.distanceTo(destinationLocalPosition) };
+      }
+
+      // Drive toward ideal position: use the analytical speed as the
+      // magnitude but point directly at the ideal position so any
+      // lateral or longitudinal drift is corrected each frame.
+      let driveSpeed: number;
+      if (dt > 0 && errorDist > 0.01) {
+        // Speed needed to reach the ideal position in this frame
+        const correctionSpeed = errorDist / dt;
+        // Blend: mostly correction, clamp to avoid wild jumps
+        driveSpeed = clamp(correctionSpeed, 0, Math.max(analyticalSpeed * 3, errorDist / dt));
+      } else {
+        driveSpeed = analyticalSpeed;
+      }
+
+      const driveDirection = errorDist > 0.01
+        ? posError.normalize()
+        : decelDir;
+
+      // ── Orient ship along decel direction ────────────────────────────────
+      const decelRotation = createShipFacingQuaternion(decelDir);
+      state.shipAngularVelocity.set(0, 0, 0);
+      state.shipRotation.rotateTowards(decelRotation, 0.22 * dt);
+      state.rotation.copy(state.shipRotation);
+      state.autopilotDirection.copy(decelDir);
+
+      // ── Set velocity and move ───────────────────────────────────────────
+      state.shipVelocity.copy(driveDirection).multiplyScalar(driveSpeed);
+      state.shipPosition.addScaledVector(state.shipVelocity, dt);
+      state.position.copy(state.shipPosition);
+      state.velocity.copy(state.shipVelocity);
+
+      // Post-move arrival check
+      const newDist = state.shipPosition.distanceTo(destinationLocalPosition);
+      if (newDist <= arrivalDistance) {
+        state.shipVelocity.set(0, 0, 0);
+        state.shipAngularVelocity.set(0, 0, 0);
+        state.position.copy(state.shipPosition);
+        state.velocity.copy(state.shipVelocity);
+        state.rotation.copy(state.shipRotation);
+        resetLongDistanceState();
+        return { arrived: true, distance: newDist };
+      }
+
+      return { arrived: false, distance };
+    }
+    case 5: { // Final approach — constant deceleration over last 10 km
+      const t = longDistanceState.phaseElapsed;
+      const T = LONG_DISTANCE_PHASE5_DURATION;
+      const f5 = clamp(t / T, 0, 1);
+      const startPos5 = longDistanceState.phase5StartPosition;
+      const arrivalPt5 = longDistanceState.phase5ArrivalPoint;
+
+      // Constant-deceleration position: s(t) = v0*t - 0.5*a*t²
+      // with v0 = 2D/T, a = 2D/T² => s/D = 2f - f²
+      const progressFraction5 = 2 * f5 - f5 * f5;
+
+      // Ideal position = lerp from start to arrival
+      const idealPos5 = startPos5.clone().lerp(arrivalPt5, progressFraction5);
+
+      // Speed: v(t) = v0 * (1 - f)
+      const v05 = longDistanceState.phase5EntrySpeed;
+      const analyticalSpeed5 = v05 * (1 - f5);
+
+      // Compute drive toward ideal position
+      const posError5 = idealPos5.clone().sub(state.shipPosition);
+      const errorDist5 = posError5.length();
+
+      // ── Arrival ───────────────────────────────────────────────────────
+      if (f5 >= 1 || distance <= arrivalDistance) {
+        state.shipPosition.copy(arrivalPt5);
+        state.shipVelocity.set(0, 0, 0);
+        state.shipAngularVelocity.set(0, 0, 0);
+        state.position.copy(state.shipPosition);
+        state.velocity.copy(state.shipVelocity);
+        state.rotation.copy(state.shipRotation);
+        resetLongDistanceState();
+        return { arrived: true, distance: state.shipPosition.distanceTo(destinationLocalPosition) };
+      }
+
+      // Drive toward ideal position
+      let driveSpeed5: number;
+      if (dt > 0 && errorDist5 > 0.01) {
+        const correctionSpeed5 = errorDist5 / dt;
+        driveSpeed5 = clamp(correctionSpeed5, 0, Math.max(analyticalSpeed5 * 3, correctionSpeed5));
+      } else {
+        driveSpeed5 = analyticalSpeed5;
+      }
+
+      const driveDir5 = errorDist5 > 0.01
+        ? posError5.normalize()
+        : longDistanceState.decelDirection;
+
+      // Orient ship toward target
+      const decelRotation5 = createShipFacingQuaternion(driveDir5);
+      state.shipAngularVelocity.set(0, 0, 0);
+      state.shipRotation.rotateTowards(decelRotation5, 1.0 * dt);
+      state.rotation.copy(state.shipRotation);
+      state.autopilotDirection.copy(driveDir5);
+
+      // Move
+      state.shipVelocity.copy(driveDir5).multiplyScalar(driveSpeed5);
+      state.shipPosition.addScaledVector(state.shipVelocity, dt);
+      state.position.copy(state.shipPosition);
+      state.velocity.copy(state.shipVelocity);
+
+      // Post-move arrival check
+      const newDist5 = state.shipPosition.distanceTo(destinationLocalPosition);
+      if (newDist5 <= arrivalDistance) {
+        state.shipVelocity.set(0, 0, 0);
+        state.shipAngularVelocity.set(0, 0, 0);
+        state.position.copy(state.shipPosition);
+        state.velocity.copy(state.shipVelocity);
+        state.rotation.copy(state.shipRotation);
+        resetLongDistanceState();
+        return { arrived: true, distance: newDist5 };
+      }
+
+      return { arrived: false, distance };
+    }
+  }
+
+  // ── Orient the ship ─────────────────────────────────────────────────────
+  const desiredRotation = createShipFacingQuaternion(desiredDirection);
+  state.shipAngularVelocity.set(0, 0, 0);
+  // Phase 1 uses a higher turn rate for initial orientation
+  const turnRate = longDistanceState.phase === 1 ? 0.5 : 0.22;
+  state.shipRotation.rotateTowards(desiredRotation, turnRate * dt);
+  state.rotation.copy(state.shipRotation);
+  state.autopilotDirection.copy(desiredDirection);
+
+  // ── Apply velocity along ship forward axis ──────────────────────────────
+  const currentForward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
+
+  // Throttle by heading alignment during orient / accel phases so the ship
+  // doesn't shoot sideways while still turning.
+  if (longDistanceState.phase <= 3) {
+    const alignment = Math.max(0, currentForward.dot(desiredDirection));
+    targetSpeed *= clamp(alignment * alignment, 0.005, 1);
+  }
+
+  const forwardScalar = state.shipVelocity.dot(currentForward);
+  const lateralVelocity = state.shipVelocity.clone().sub(currentForward.clone().multiplyScalar(forwardScalar));
+  lateralVelocity.multiplyScalar(Math.max(0, 1 - 2.0 * dt)); // damp lateral drift
+
+  let nextForward: number;
+  if (targetSpeed >= forwardScalar) {
+    const maxStep = (accelerationRate > 0 ? accelerationRate : (LONG_DISTANCE_CRUISE_SPEED / LONG_DISTANCE_PHASE2_DURATION)) * dt;
+    nextForward = Math.min(targetSpeed, forwardScalar + maxStep);
+  } else {
+    const decelRate = longDistanceState.decelEntrySpeed > 0
+      ? longDistanceState.decelEntrySpeed / LONG_DISTANCE_DECEL_DURATION
+      : LONG_DISTANCE_CRUISE_SPEED / LONG_DISTANCE_DECEL_DURATION;
+    nextForward = Math.max(targetSpeed, forwardScalar - decelRate * dt);
+  }
+
+  state.shipVelocity.copy(lateralVelocity).addScaledVector(currentForward, Math.max(0, nextForward));
+
+  // ── Move the ship ──────────────────────────────────────────────────────
+  state.shipPosition.addScaledVector(state.shipVelocity, dt);
+  state.position.copy(state.shipPosition);
+  state.velocity.copy(state.shipVelocity);
+
+  return { arrived: false, distance };
 }
 
 function estimateAutopilotEtaSeconds(
@@ -910,6 +1325,63 @@ function estimateAutopilotEtaSeconds(
 
   if (remainingDistance <= 0) {
     return 0;
+  }
+
+  // ── Long-distance ETA (phase-aware) ─────────────────────────────────────
+  if (!isInterSystem && longDistanceState.active) {
+    const phase = longDistanceState.phase;
+    const pe = longDistanceState.phaseElapsed;
+    let eta = 0;
+    let dist = remainingDistance;
+    let speed = currentSpeed;
+
+    // Time left in current phase
+    if (phase === 1) {
+      const tLeft1 = Math.max(0, LONG_DISTANCE_PHASE1_DURATION - pe);
+      const accel1 = LONG_DISTANCE_PHASE1_TARGET_SPEED / LONG_DISTANCE_PHASE1_DURATION;
+      const dPhase1 = speed * tLeft1 + 0.5 * accel1 * tLeft1 * tLeft1;
+      eta += tLeft1;
+      dist -= dPhase1;
+      speed = LONG_DISTANCE_PHASE1_TARGET_SPEED;
+
+      // Phase 2
+      const accel2 = (LONG_DISTANCE_CRUISE_SPEED - LONG_DISTANCE_PHASE1_TARGET_SPEED) / LONG_DISTANCE_PHASE2_DURATION;
+      const dPhase2 = speed * LONG_DISTANCE_PHASE2_DURATION + 0.5 * accel2 * LONG_DISTANCE_PHASE2_DURATION * LONG_DISTANCE_PHASE2_DURATION;
+      eta += LONG_DISTANCE_PHASE2_DURATION;
+      dist -= dPhase2;
+      speed = LONG_DISTANCE_CRUISE_SPEED;
+    } else if (phase === 2) {
+      const tLeft2 = Math.max(0, LONG_DISTANCE_PHASE2_DURATION - pe);
+      const accel2 = (LONG_DISTANCE_CRUISE_SPEED - LONG_DISTANCE_PHASE1_TARGET_SPEED) / LONG_DISTANCE_PHASE2_DURATION;
+      const dPhase2 = speed * tLeft2 + 0.5 * accel2 * tLeft2 * tLeft2;
+      eta += tLeft2;
+      dist -= dPhase2;
+      speed = LONG_DISTANCE_CRUISE_SPEED;
+    }
+
+    if (phase <= 3) {
+      // Cruise distance = remaining minus decel distance minus phase5 distance
+      const decelDist = 0.5 * speed * LONG_DISTANCE_DECEL_DURATION;
+      const cruiseDist = Math.max(0, dist - decelDist - LONG_DISTANCE_PHASE5_DISTANCE);
+      if (cruiseDist > 0) {
+        eta += cruiseDist / speed;
+        dist -= cruiseDist;
+      }
+      // Decel phase (bell-curve)
+      eta += LONG_DISTANCE_DECEL_DURATION;
+      // Phase 5 (final approach)
+      eta += LONG_DISTANCE_PHASE5_DURATION;
+    } else if (phase === 4) {
+      // Still in bell-curve decel
+      const tLeft4 = Math.max(0, LONG_DISTANCE_DECEL_DURATION - pe);
+      eta += tLeft4;
+      eta += LONG_DISTANCE_PHASE5_DURATION;
+    } else {
+      // Phase 5: final approach
+      const tLeft5 = Math.max(0, LONG_DISTANCE_PHASE5_DURATION - pe);
+      eta += tLeft5;
+    }
+    return Math.max(0, eta);
   }
 
   const cruise = isInterSystem ? AUTOPILOT_INTERSTELLAR_CRUISE_SPEED : AUTOPILOT_LOCAL_CRUISE_SPEED;
@@ -1245,7 +1717,13 @@ function updateAutopilotShip(
     state.position.copy(state.shipPosition);
     state.velocity.copy(state.shipVelocity);
     state.rotation.copy(state.shipRotation);
+    resetLongDistanceState();
     return { arrived: true, distance };
+  }
+
+  // ── Long-distance autopilot: intra-system trips longer than 1 000 km ───
+  if (!isInterSystem && (distance > LONG_DISTANCE_THRESHOLD_METERS || longDistanceState.active)) {
+    return updateLongDistanceAutopilot(state, dt, destination, destinationLocalPosition, distance, arrivalDistance);
   }
 
   const targetDirection = toTarget.clone().normalize();
@@ -1662,6 +2140,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
 
   useEffect(() => {
     if (hud.mode === 'space') {
+      resetLongDistanceState();
       setAutopilotEngaged(false);
     }
   }, [hud.mode]);
@@ -1797,6 +2276,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
       return;
     }
 
+    resetLongDistanceState();
     setAutopilotEngaged(true);
     setAutopilotReachedDestinationId('');
     setAutopilotStatus(`Autopilot engaged for ${autopilotDestination.name}.`);
@@ -1805,6 +2285,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
 
 
   const handleDisengageAutopilot = useCallback(() => {
+    resetLongDistanceState();
     setAutopilotEngaged(false);
     setAutopilotStatus('Autopilot disengaged.');
   }, []);
@@ -1942,6 +2423,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           network={stationNetwork}
           onClose={() => setTabletOpen(false)}
           onStopAutopilot={() => {
+            resetLongDistanceState();
             setAutopilotEngaged(false);
             setAutopilotStatus('Autopilot disengaged.');
           }}
@@ -1955,6 +2437,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
               }, 1000); // Trigger travel when screen maxes out white
               setTabletOpen(false);
             } else {
+              resetLongDistanceState();
               setAutopilotDestination(dest);
               setAutopilotEngaged(true);
               setAutopilotReachedDestinationId('');
@@ -2262,6 +2745,7 @@ function GameScene({
         state.insideShip = false;
         state.position.copy(state.shipPosition).add(exitOffset);
         state.velocity.copy(state.shipVelocity);
+        resetLongDistanceState();
         onAutopilotToggle(false);
         onAutopilotStatusChange('Autopilot disengaged.');
       }
@@ -2290,6 +2774,7 @@ function GameScene({
         state.shipAngularVelocity.set(0, 0, 0);
       } else if (hasManualPilotInput) {
         if (autopilotAvailable) {
+          resetLongDistanceState();
           onAutopilotToggle(false);
           onAutopilotStatusChange('Autopilot disengaged. Manual control active.');
         }
