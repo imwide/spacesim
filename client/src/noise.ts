@@ -174,10 +174,10 @@ export function getTerrainHeight(
 ): number {
   // Scale factor: larger planets get proportionally taller terrain features
   // but capped to avoid absurd mountains
-  const heightScale = Math.min(planetRadius * 0.008, 80_000);
+  const heightScale = Math.min(planetRadius * 0.00016, 1_600);
 
   // Large continental features
-  const continentalScale = 25;
+  const continentalScale = 1250;
   const continental = noise.fbm(
     nx * continentalScale,
     ny * continentalScale,
@@ -186,7 +186,7 @@ export function getTerrainHeight(
   );
 
   // Medium mountain ridges
-  const ridgeScale = 80;
+  const ridgeScale = 4000;
   const ridgeNoise = noise.fbm(
     nx * ridgeScale,
     ny * ridgeScale,
@@ -198,7 +198,7 @@ export function getTerrainHeight(
   const ridgeSquared = ridge * ridge;
 
   // Fine detail
-  const detailScale = 320;
+  const detailScale = 16000;
   const detail = noise.fbm(
     nx * detailScale,
     ny * detailScale,
@@ -206,8 +206,8 @@ export function getTerrainHeight(
     3, 2.0, 0.45,
   );
 
-  // Micro detail (large hills to small slopes, approx 1-10km scale)
-  const microScale = 2560;
+  // Micro detail (large hills to small slopes, approx 20m-200m scale)
+  const microScale = 128000;
   const micro = noise.fbm(
     nx * microScale,
     ny * microScale,
@@ -215,8 +215,8 @@ export function getTerrainHeight(
     4, 2.0, 0.4,
   );
 
-  // Nano detail (bumpy noise for immediate surroundings up to 10-100m)
-  const nanoScale = 655360;
+  // Nano detail (bumpy noise for immediate surroundings up to 0.2-2m)
+  const nanoScale = 32768000;
   const nano = noise.fbm(
     nx * nanoScale,
     ny * nanoScale,
@@ -229,8 +229,8 @@ export function getTerrainHeight(
   
   // Apply the very localized frequency based on a small absolute height scale
   // so the player can actually tell they are moving on uneven "terrain".
-  height += micro * 800.0;
-  height += nano * 35.0;
+  height += micro * 16.0;
+  height += nano * 0.7;
 
   return height;
 }

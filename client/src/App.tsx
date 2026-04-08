@@ -99,6 +99,9 @@ const PLANET_GRAVITY_TERMINAL_VELOCITY = 1000 * METERS_PER_WORLD_UNIT; // 1 km/s
 const PLANET_SURFACE_WALK_SPEED = 3.0 * METERS_PER_WORLD_UNIT;
 const PLANET_SURFACE_JUMP_VELOCITY = 5.0 * METERS_PER_WORLD_UNIT;
 const PLANET_SURFACE_EYE_HEIGHT = 1.7 * METERS_PER_WORLD_UNIT;
+// Max distance above terrain the player can be while still being "glued" to slope.
+// Large enough to handle steep descents at walk speed; small enough that a jump breaks free.
+const PLANET_SURFACE_GROUND_FOLLOW_DIST = 3.0 * METERS_PER_WORLD_UNIT;
 const SHIP_LANDING_GEAR_HEIGHT = 6.0 * METERS_PER_WORLD_UNIT;
 const PLANET_TEXTURE_FILES = [
   '4k_ceres_fictional.jpg',
@@ -286,9 +289,10 @@ const LONG_DISTANCE_DECEL_TRIGGER = 0.5 * LONG_DISTANCE_CRUISE_SPEED * LONG_DIST
 // Higher → deceleration more concentrated in the middle; lower → more spread out.
 const LONG_DISTANCE_BELL_CURVE_K = 2.0;
 
-// Phase 5: final approach distance & duration. User wants last 100km to take 40s and not exceed 5km/s
-const LONG_DISTANCE_PHASE5_DISTANCE = 100_000; // 100 km
-const LONG_DISTANCE_PHASE5_DURATION = 40; // seconds — constant decel over last 100 km
+// Phase 5: final approach distance & duration.
+const LONG_DISTANCE_PHASE5_DISTANCE = 100_000; // 100 km — start of final approach
+const LONG_DISTANCE_PHASE5_MAX_SPEED = 2000; // 2 km/s — hard cap during approach
+const LONG_DISTANCE_PHASE5_LAND_ALT = 30; // 30 m — hover altitude above terrain at arrival
 // Distance of the interstellar waypoint. 3 Light Years provides a realistic warp duration
 const INTERSTELLAR_WAYPOINT_DISTANCE = 3 * METERS_PER_LIGHT_YEAR;
 // Arrival radius for the interstellar waypoint (physics fallback only).
@@ -945,15 +949,21 @@ function applyPlanetGravityAndTerrainCollision(
   // Move body
   position.addScaledVector(velocity, dt);
 
+  // Recompute radial direction from the NEW position so the snap is
+  // always along the correct outward normal (fixes height mismatch on slopes).
+  const newToBody = new THREE.Vector3().subVectors(position, planetCenter);
+  const newDistFromCenter = newToBody.length();
+  if (newDistFromCenter < 1e-6) return false;
+
   // Check terrain collision
   const terrainAltitude = getTerrainAltitudeAtPosition(position, planetCenter, planetRadius, planetId);
-  const bodyAltitude = position.distanceTo(planetCenter);
+  const bodyAltitude = newDistFromCenter;
   const minAltitude = terrainAltitude + bodyRadius;
 
   if (bodyAltitude <= minAltitude) {
-    // On ground: snap to surface
-    const upDir = toBody.normalize();
-    position.copy(planetCenter).addScaledVector(upDir.clone().normalize(), minAltitude);
+    // On ground: snap to surface using the correct (post-move) up direction
+    const upDir = newToBody.divideScalar(newDistFromCenter);
+    position.copy(planetCenter).addScaledVector(upDir, minAltitude);
 
     // Remove velocity component going into the ground
     const normalSpeed = velocity.dot(upDir);
@@ -1294,7 +1304,7 @@ function updateLongDistanceAutopilot(
         longDistanceState.phaseElapsed = 0;
         longDistanceState.phase5StartPosition.copy(state.shipPosition);
         longDistanceState.phase5ArrivalPoint.copy(destinationLocalPosition).addScaledVector(toTargetNow, -arrivalDistance);
-        longDistanceState.phase5EntrySpeed = 2 * LONG_DISTANCE_PHASE5_DISTANCE / LONG_DISTANCE_PHASE5_DURATION;
+        // phase5EntrySpeed no longer used by realtime terrain-tracking approach
         return { arrived: false, distance: state.shipPosition.distanceTo(destinationLocalPosition) };
       }
 
@@ -1342,103 +1352,132 @@ function updateLongDistanceAutopilot(
 
       return { arrived: false, distance };
     }
-    case 5: { // Final approach — constant deceleration over last 10 km
-      const t = longDistanceState.phaseElapsed;
-      const T = LONG_DISTANCE_PHASE5_DURATION;
-      const f5 = clamp(t / T, 0, 1);
-      const startPos5 = longDistanceState.phase5StartPosition;
-      const arrivalPt5 = longDistanceState.phase5ArrivalPoint;
+    case 5: { // Final approach — realtime terrain-tracking descent
+      // Determine the planet center for terrain queries.
+      // We use state.nearPlanetCenter/nearPlanetId if the destination is the same planet;
+      // otherwise look it up from the destination's stale localPosition (best we can do).
+      const isPlanetDest = destination.kind === 'planet' || destination.kind === 'moon';
 
-      // Constant-deceleration position: s(t) = v0*t - 0.5*a*t²
-      // with v0 = 2D/T, a = 2D/T² => s/D = 2f - f²
-      const progressFraction5 = 2 * f5 - f5 * f5;
+      // Find planet center from nearPlanet state (most accurate) or fall back to dest center
+      let planetCenter5: THREE.Vector3;
+      let planetRadius5: number;
+      let planetId5: string;
+      if (isPlanetDest && state.nearPlanetId === destination.id) {
+        planetCenter5 = state.nearPlanetCenter;
+        planetRadius5 = state.nearPlanetRadius;
+        planetId5 = state.nearPlanetId;
+      } else if (isPlanetDest) {
+        // Use destination local position as planet center approximation
+        // (only valid while ship is far; near-planet state takes over quickly)
+        planetCenter5 = destinationLocalPosition;
+        planetRadius5 = destination.approachRadius;
+        planetId5 = destination.id;
+      } else {
+        // Non-planet target: just drive straight to destination
+        const toDest = destinationLocalPosition.clone().sub(state.shipPosition);
+        const distToDest = toDest.length();
+        if (distToDest <= arrivalDistance + 1) {
+          state.shipVelocity.set(0, 0, 0);
+          state.shipAngularVelocity.set(0, 0, 0);
+          state.position.copy(state.shipPosition);
+          state.velocity.copy(state.shipVelocity);
+          state.rotation.copy(state.shipRotation);
+          resetLongDistanceState();
+          return { arrived: true, distance: distToDest };
+        }
+        const speed5 = Math.min(distToDest / 10, LONG_DISTANCE_PHASE5_MAX_SPEED);
+        const dir5 = toDest.normalize();
+        state.shipVelocity.copy(dir5).multiplyScalar(speed5);
+        state.shipPosition.addScaledVector(state.shipVelocity, dt);
+        state.position.copy(state.shipPosition);
+        state.velocity.copy(state.shipVelocity);
+        const decelRot5 = createShipFacingQuaternion(dir5);
+        state.shipAngularVelocity.set(0, 0, 0);
+        state.shipRotation.rotateTowards(decelRot5, 1.0 * dt);
+        state.rotation.copy(state.shipRotation);
+        return { arrived: false, distance: distToDest };
+      }
 
-      // Ideal position = lerp from start to arrival
-      const idealPos5 = startPos5.clone().lerp(arrivalPt5, progressFraction5);
+      // ── Realtime terrain-below query ──────────────────────────────────────
+      // Radial direction from planet center to ship
+      const radial5 = state.shipPosition.clone().sub(planetCenter5);
+      const radialDist5 = radial5.length();
+      if (radialDist5 < 1e-6) return { arrived: false, distance };
+      const radialDir5 = radial5.clone().divideScalar(radialDist5);
 
-      // Speed: v(t) = v0 * (1 - f)
-      const v05 = longDistanceState.phase5EntrySpeed;
-      const analyticalSpeed5 = v05 * (1 - f5);
+      // Terrain altitude at the ship's current angular position
+      const terrainAlt5 = getTerrainAltitudeAtPosition(state.shipPosition, planetCenter5, planetRadius5, planetId5);
+      // Current ship altitude above terrain
+      const shipAlt5 = radialDist5 - terrainAlt5;
 
-      // Compute drive toward ideal position
-      const posError5 = idealPos5.clone().sub(state.shipPosition);
-      const errorDist5 = posError5.length();
+      // Target is LONG_DISTANCE_PHASE5_LAND_ALT above the terrain directly below
+      const targetAlt5 = LONG_DISTANCE_PHASE5_LAND_ALT + SHIP_LANDING_GEAR_HEIGHT;
+      const altError5 = shipAlt5 - targetAlt5;
 
-      // ── Arrival ───────────────────────────────────────────────────────
-      if (f5 >= 1 || distance <= arrivalDistance) {
-        state.shipPosition.copy(arrivalPt5);
+      // ── Arrival ───────────────────────────────────────────────────────────
+      if (altError5 <= 2) {
+        // Snap ship to exact hover altitude and stop
+        state.shipPosition.copy(planetCenter5).addScaledVector(radialDir5, terrainAlt5 + targetAlt5);
         state.shipVelocity.set(0, 0, 0);
         state.shipAngularVelocity.set(0, 0, 0);
         state.position.copy(state.shipPosition);
         state.velocity.copy(state.shipVelocity);
         state.rotation.copy(state.shipRotation);
         resetLongDistanceState();
-        return { arrived: true, distance: state.shipPosition.distanceTo(destinationLocalPosition) };
+        return { arrived: true, distance: 0 };
       }
 
-      // Drive toward ideal position
-      let driveSpeed5: number;
-      if (dt > 0 && errorDist5 > 0.01) {
-        const correctionSpeed5 = errorDist5 / dt;
-        driveSpeed5 = clamp(correctionSpeed5, 0, analyticalSpeed5 * 2 + 500);
-      } else {
-        driveSpeed5 = analyticalSpeed5;
-      }
-      // Hard cap: never exceed 5 km/s during final approach
-      driveSpeed5 = Math.min(driveSpeed5, 5000);
+      // ── Speed controller: proportional to remaining altitude ─────────────
+      // Decelerate smoothly using sqrt profile: v = sqrt(altError * 2 * maxDecel)
+      // maxDecel chosen so we stop from 2km/s within ~1km
+      const maxDecel5 = 2.0; // m/s²  — gentle deceleration
+      const profileSpeed5 = Math.sqrt(Math.max(0, altError5 * 2 * maxDecel5 * 100));
+      const descentSpeed5 = clamp(profileSpeed5, 0, LONG_DISTANCE_PHASE5_MAX_SPEED);
 
-      const driveDir5 = errorDist5 > 0.01
-        ? posError5.normalize()
-        : longDistanceState.decelDirection;
+      // Drive direction: straight down along radial (toward terrain)
+      const driveDir5 = radialDir5.clone().negate();
 
-      // Orient ship: gradually rotate to horizontal (belly toward planet)
-      // during final 100km approach
-      const decelRotation5 = createShipFacingQuaternion(driveDir5);
-
-      if (state.nearPlanetId && (destination.kind === 'planet' || destination.kind === 'moon')) {
-        // Direction toward planet center (gravity down)
-        const toCenter = state.nearPlanetCenter.clone().sub(state.shipPosition).normalize();
-        // Project forward direction onto tangent plane
-        const fwd = driveDir5.clone();
-        fwd.addScaledVector(toCenter, -fwd.dot(toCenter)).normalize();
-
-        if (fwd.lengthSq() > 0.01) {
-          // Rotation where -Z is forward along tangent plane, +Y is away from planet
-          const horizontalMatrix = new THREE.Matrix4().lookAt(
-            new THREE.Vector3(0, 0, 0),
-            fwd,
-            toCenter.clone().negate(),
-          );
-          const horizontalQuat = new THREE.Quaternion().setFromRotationMatrix(horizontalMatrix);
-          // Smoothly blend from nose-first to horizontal over the approach
-          decelRotation5.slerp(horizontalQuat, f5);
-        }
+      // ── Horizontal correction toward destination approach point ──────────
+      // Keep the ship aligned with the approach corridor (don't drift laterally)
+      const toDestHoriz = destinationLocalPosition.clone().sub(state.shipPosition);
+      // Strip radial component to get pure lateral offset
+      toDestHoriz.addScaledVector(radialDir5, -toDestHoriz.dot(radialDir5));
+      const horizDist5 = toDestHoriz.length();
+      let blendedDir5 = driveDir5.clone();
+      if (horizDist5 > 5) {
+        // Blend descent direction with lateral correction (max 30° correction angle)
+        const correctionStrength = clamp(horizDist5 / 500, 0, 0.3);
+        blendedDir5.addScaledVector(toDestHoriz.normalize(), correctionStrength).normalize();
       }
 
+      // ── Orient ship: gradually rotate to horizontal (belly toward planet) ─
+      const decelRotation5 = createShipFacingQuaternion(blendedDir5);
+      const toCenter5 = planetCenter5.clone().sub(state.shipPosition).normalize();
+      const fwd5 = blendedDir5.clone();
+      fwd5.addScaledVector(toCenter5, -fwd5.dot(toCenter5)).normalize();
+      if (fwd5.lengthSq() > 0.01) {
+        const horizontalMatrix5 = new THREE.Matrix4().lookAt(
+          new THREE.Vector3(0, 0, 0),
+          fwd5,
+          toCenter5.clone().negate(),
+        );
+        const horizontalQuat5 = new THREE.Quaternion().setFromRotationMatrix(horizontalMatrix5);
+        // f5: 0 at 100km, 1 at surface — use altitude fraction for blend
+        const f5blend = clamp(1 - altError5 / LONG_DISTANCE_PHASE5_DISTANCE, 0, 1);
+        decelRotation5.slerp(horizontalQuat5, f5blend);
+      }
       state.shipAngularVelocity.set(0, 0, 0);
-      state.shipRotation.rotateTowards(decelRotation5, 1.0 * dt);
+      state.shipRotation.rotateTowards(decelRotation5, 1.5 * dt);
       state.rotation.copy(state.shipRotation);
-      state.autopilotDirection.copy(driveDir5);
+      state.autopilotDirection.copy(blendedDir5);
 
-      // Move
-      state.shipVelocity.copy(driveDir5).multiplyScalar(driveSpeed5);
+      // ── Move ─────────────────────────────────────────────────────────────
+      state.shipVelocity.copy(blendedDir5).multiplyScalar(descentSpeed5);
       state.shipPosition.addScaledVector(state.shipVelocity, dt);
       state.position.copy(state.shipPosition);
       state.velocity.copy(state.shipVelocity);
 
-      // Post-move arrival check
-      const newDist5 = state.shipPosition.distanceTo(destinationLocalPosition);
-      if (newDist5 <= arrivalDistance) {
-        state.shipVelocity.set(0, 0, 0);
-        state.shipAngularVelocity.set(0, 0, 0);
-        state.position.copy(state.shipPosition);
-        state.velocity.copy(state.shipVelocity);
-        state.rotation.copy(state.shipRotation);
-        resetLongDistanceState();
-        return { arrived: true, distance: newDist5 };
-      }
-
-      return { arrived: false, distance };
+      return { arrived: false, distance: altError5 };
     }
   }
 
@@ -1544,17 +1583,16 @@ function estimateAutopilotEtaSeconds(
       }
       // Decel phase (bell-curve)
       eta += LONG_DISTANCE_DECEL_DURATION;
-      // Phase 5 (final approach)
-      eta += LONG_DISTANCE_PHASE5_DURATION;
+      // Phase 5 (final approach, realtime terrain descent — estimate ~LAND_ALT/0.5s + decel from MAX_SPEED)
+      eta += LONG_DISTANCE_PHASE5_DISTANCE / (LONG_DISTANCE_PHASE5_MAX_SPEED * 0.5);
     } else if (phase === 4) {
       // Still in bell-curve decel
       const tLeft4 = Math.max(0, LONG_DISTANCE_DECEL_DURATION - pe);
       eta += tLeft4;
-      eta += LONG_DISTANCE_PHASE5_DURATION;
+      eta += LONG_DISTANCE_PHASE5_DISTANCE / (LONG_DISTANCE_PHASE5_MAX_SPEED * 0.5);
     } else {
-      // Phase 5: final approach
-      const tLeft5 = Math.max(0, LONG_DISTANCE_PHASE5_DURATION - pe);
-      eta += tLeft5;
+      // Phase 5: estimate remaining descent time from current altitude (approximation)
+      eta += dist / (LONG_DISTANCE_PHASE5_MAX_SPEED * 0.5);
     }
     return Math.max(0, eta);
   }
@@ -3045,21 +3083,33 @@ function GameScene({
 
         state.position.addScaledVector(state.velocity, dt);
 
-        // Terrain collision
+        // Terrain collision + slope following
         const terrainAlt = getTerrainAltitudeAtPosition(
           state.position, nearestPlanet.planetCenter,
           nearestPlanet.planetRadius, nearestPlanet.planetId,
         );
         const playerAlt = state.position.distanceTo(nearestPlanet.planetCenter);
         const minAlt = terrainAlt + PLANET_SURFACE_EYE_HEIGHT;
+        const altError = playerAlt - minAlt;
+        const upNorm = new THREE.Vector3().subVectors(state.position, nearestPlanet.planetCenter).normalize();
 
-        if (playerAlt <= minAlt) {
-          const upNorm = new THREE.Vector3().subVectors(state.position, nearestPlanet.planetCenter).normalize();
+        if (altError <= 0) {
+          // Below terrain surface: snap up and kill downward velocity.
           state.position.copy(nearestPlanet.planetCenter).addScaledVector(upNorm, minAlt);
           const normalSpeed = state.velocity.dot(upNorm);
           if (normalSpeed < 0) {
             state.velocity.addScaledVector(upNorm, -normalSpeed);
           }
+          state.playerOnGround = true;
+        } else if (state.playerOnGround && altError < PLANET_SURFACE_GROUND_FOLLOW_DIST) {
+          // Player was on the ground and is now hovering slightly above it — terrain
+          // dropped away beneath them (walking down a slope). Snap down to follow the
+          // slope smoothly instead of falling through the gap each frame.
+          state.position.copy(nearestPlanet.planetCenter).addScaledVector(upNorm, minAlt);
+          // Strip the entire radial velocity component so gravity doesn't accumulate
+          // while following the slope downward.
+          const normalSpeed = state.velocity.dot(upNorm);
+          state.velocity.addScaledVector(upNorm, -normalSpeed);
           state.playerOnGround = true;
         } else {
           state.playerOnGround = false;

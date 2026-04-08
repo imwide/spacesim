@@ -194,7 +194,7 @@ class TerrainChunkManager {
     const dir = new THREE.Vector3();
     const spherePoint = new THREE.Vector3();
 
-    const heightScale = Math.min(this.planetRadius * 0.008, 80_000);
+    const heightScale = Math.min(this.planetRadius * 0.00016, 1_600);
     const planetBaseColor = new THREE.Color(this.planetColor);
     const color = new THREE.Color();
 
