@@ -24,6 +24,18 @@ const aetherConfig: ShipConfigRaw = {
   // Pilot seat location inside the interior model.
   pilotSeatPosition: [0, 1.2, -3.2],
 
+  // Engine exhaust anchors.
+  thrusterPositions: [
+    [0.95, 0.1, 4.95],
+    [-0.95, 0.1, 4.95],
+  ],
+
+  // Weapon muzzle anchors.
+  gunPositions: [
+    [1.95, 0.08, -3.95],
+    [-1.95, 0.08, -3.95],
+  ],
+
   // ── Flight multipliers (1.0 = baseline) ───────────────────────────────
   accelerationMultiplier: 1.0,
   speedMultiplier: 1.0,

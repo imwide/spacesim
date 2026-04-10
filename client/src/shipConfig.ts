@@ -31,6 +31,12 @@ export interface ShipConfigRaw {
   /** Position of the pilot seat inside the interior model. */
   pilotSeatPosition: [number, number, number];
 
+  /** Relative ship-local positions of engine / thruster exhaust points. */
+  thrusterPositions: [number, number, number][];
+
+  /** Relative ship-local positions of projectile / gun muzzle points. */
+  gunPositions: [number, number, number][];
+
   // ── Flight characteristics ────────────────────────────────────────────
 
   /** Multiplier applied to base thrust acceleration (default 1.0). */
@@ -77,6 +83,8 @@ export interface ShipConfig extends ShipConfigRaw {
   insideSpawnVec: THREE.Vector3;
   outsideSpawnVec: THREE.Vector3;
   pilotSeatVec: THREE.Vector3;
+  thrusterVecs: THREE.Vector3[];
+  gunVecs: THREE.Vector3[];
 }
 
 // ─── Ship registry ──────────────────────────────────────────────────────────
@@ -92,6 +100,8 @@ export function registerShip(id: string, raw: ShipConfigRaw): ShipConfig {
     insideSpawnVec: new THREE.Vector3(...raw.insideSpawnPoint),
     outsideSpawnVec: new THREE.Vector3(...raw.outsideSpawnPoint),
     pilotSeatVec: new THREE.Vector3(...raw.pilotSeatPosition),
+    thrusterVecs: raw.thrusterPositions.map((position) => new THREE.Vector3(...position)),
+    gunVecs: raw.gunPositions.map((position) => new THREE.Vector3(...position)),
   };
   shipRegistry.set(id, config);
   return config;

@@ -10,8 +10,4 @@ Improve the "hyperspeed effect" to not be a UI visual effect ontop of the camera
 
 The turning can happen really fast right now. The intensity that the turn and rotation of the ship is started at is really high. it should "fade in" and slowly start turning as it is has a lot of weight
 
-To the config file of each ship add two fields that can each be lists of relative corrdinates for the ship. One of them should determine the position(s) of the thrusters (to later determine where to spawn particles) and the other should determine the position(s) of the "guns" (to later determine where to spawn projectiles). These coordinates should be relative to the ship's center and should be rotated with the ship. This way we can have different ships with different thruster and gun positions without having to hardcode them in the code.
 
-
-
-Add temporary labelled 3d crosshairs to indicate the positions of the thrusters, guns, insideSpawnPoint, outsideSpawnPoint, pilotSeatPosition so that I can easily adjust them to fit each ships model

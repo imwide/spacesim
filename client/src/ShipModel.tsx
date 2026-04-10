@@ -1,7 +1,88 @@
-import { useGLTF } from '@react-three/drei';
+import { Html, useGLTF } from '@react-three/drei';
 import { type ReactElement, useEffect, useMemo, useRef } from 'react';
 import * as THREE from 'three';
 import type { ShipConfig } from './shipConfig';
+
+interface ShipAnchorMarkerProps {
+  color: string;
+  label: string;
+  position: THREE.Vector3;
+}
+
+function ShipAnchorMarker({ color, label, position }: ShipAnchorMarkerProps): ReactElement {
+  return (
+    <group position={[position.x, position.y, position.z]}>
+      <lineSegments>
+        <bufferGeometry>
+          <bufferAttribute
+            attach="attributes-position"
+            args={[
+              new Float32Array([
+                -0.35, 0, 0,
+                0.35, 0, 0,
+                0, -0.35, 0,
+                0, 0.35, 0,
+                0, 0, -0.35,
+                0, 0, 0.35,
+              ]),
+              3,
+            ]}
+          />
+        </bufferGeometry>
+        <lineBasicMaterial color={color} depthTest={false} toneMapped={false} />
+      </lineSegments>
+      <mesh>
+        <sphereGeometry args={[0.08, 8, 8]} />
+        <meshBasicMaterial color={color} toneMapped={false} depthTest={false} />
+      </mesh>
+      <Html center distanceFactor={12} zIndexRange={[2, 0]}>
+        <div
+          style={{
+            pointerEvents: 'none',
+            color,
+            fontFamily: 'monospace',
+            fontSize: '10px',
+            letterSpacing: '0.12em',
+            textTransform: 'uppercase',
+            whiteSpace: 'nowrap',
+            background: 'rgba(2, 6, 23, 0.72)',
+            border: `1px solid ${color}`,
+            padding: '2px 6px',
+            transform: 'translate(10px, -18px)',
+          }}
+        >
+          {label}
+        </div>
+      </Html>
+    </group>
+  );
+}
+
+function ShipAnchorDebugMarkers({ config, interior = false }: { config: ShipConfig; interior?: boolean }): ReactElement {
+  const markers = interior
+    ? [
+        { label: 'inside spawn', color: '#a3e635', position: config.insideSpawnVec },
+        { label: 'pilot seat', color: '#f472b6', position: config.pilotSeatVec },
+      ]
+    : [
+        { label: 'outside spawn', color: '#fb7185', position: config.outsideSpawnVec },
+        ...config.thrusterVecs.map((position, index) => ({ label: `thruster ${index + 1}`, color: '#22d3ee', position })),
+        ...config.gunVecs.map((position, index) => ({ label: `gun ${index + 1}`, color: '#f59e0b', position })),
+      ];
+
+  return (
+    <group>
+      {markers.map((marker) => (
+        <ShipAnchorMarker
+          key={`${marker.label}-${marker.position.x}-${marker.position.y}-${marker.position.z}`}
+          color={marker.color}
+          label={marker.label}
+          position={marker.position}
+        />
+      ))}
+    </group>
+  );
+}
 
 // ─── Preloading ─────────────────────────────────────────────────────────────
 
@@ -53,7 +134,14 @@ export function ShipExteriorModel({ config, highlight = false }: ShipExteriorMod
     });
   }, [clonedScene, highlight]);
 
-  return <primitive object={clonedScene} rotation={[0, Math.PI, 0]} />;
+  return (
+    <group>
+      <group rotation={[0, Math.PI, 0]}>
+        <primitive object={clonedScene} />
+      </group>
+      <ShipAnchorDebugMarkers config={config} />
+    </group>
+  );
 }
 
 // ─── Interior layer ─────────────────────────────────────────────────────────
@@ -65,5 +153,12 @@ interface ShipInteriorModelProps {
 export function ShipInteriorModel({ config }: ShipInteriorModelProps): ReactElement {
   const { scene } = useGLTF(config.interiorModel);
   const clonedScene = useMemo(() => scene.clone(true), [scene]);
-  return <primitive object={clonedScene} rotation={[0, Math.PI, 0]} />;
+  return (
+    <group>
+      <group rotation={[0, Math.PI, 0]}>
+        <primitive object={clonedScene} />
+      </group>
+      <ShipAnchorDebugMarkers config={config} interior />
+    </group>
+  );
 }

@@ -3286,7 +3286,7 @@ function GameScene({
             onAutopilotStatusChange('Autopilot disengaged. Manual control active.');
           }
 
-            const alignToCamera = movementEnabled && keys.has('KeyW');
+            const alignToCamera = movementEnabled && (keys.has('KeyW') || keys.has('KeyA') || keys.has('KeyS') || keys.has('KeyD'));
             let angleToTarget = 0;
 
             if (alignToCamera) {
