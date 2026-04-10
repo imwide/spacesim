@@ -76,6 +76,9 @@ const INTERIOR_WALK_SPEED_METERS_PER_SECOND = 1.8 * METERS_PER_WORLD_UNIT;
 const INTERIOR_GRAVITY_METERS_PER_SECOND = 9.81 * METERS_PER_WORLD_UNIT;
 const SHIP_THRUST_ACCELERATION = 14 * METERS_PER_WORLD_UNIT;
 const SHIP_MAX_SPEED_METERS_PER_SECOND = 240 * METERS_PER_WORLD_UNIT;
+const SHIP_STATION_SLOW_ZONE_START_METERS = 2_000;
+const SHIP_STATION_SLOW_ZONE_MIN_METERS = 100;
+const SHIP_STATION_SLOW_ZONE_MIN_SPEED_METERS_PER_SECOND = 10;
 const SHIP_LINEAR_DAMPING = 0.18;
 const SHIP_MANUAL_ANGULAR_ACCELERATION = 2.8;
 const SHIP_MANUAL_MAX_ANGULAR_SPEED = 1.85;
@@ -168,6 +171,7 @@ interface HudState {
   shipSpeed: number;
   prompt: string;
   playersOnline: number;
+  speedLimitNotice: string;
 }
 
 interface StationNode {
@@ -235,6 +239,11 @@ interface MotionCollisionResult {
   colliderLocalPosition: THREE.Vector3;
   normal: THREE.Vector3;
   travelFraction: number;
+}
+
+interface StationBorderSpeedLimitInfo {
+  maxSpeed: number;
+  active: boolean;
 }
 
 interface LocalGameState {
@@ -732,6 +741,70 @@ function mapSceneCollidersToFrame(colliders: SceneCollider[], frameOrigin: Vec3T
     ...collider,
     position: toFrameLocalPosition(collider.position, frameOrigin),
   }));
+}
+
+function getStationBorderLimitedManualSpeed(
+  shipPosition: THREE.Vector3,
+  shipVelocity: THREE.Vector3,
+  shipRadius: number,
+  colliders: SceneCollider[],
+  defaultMaxSpeed: number,
+): StationBorderSpeedLimitInfo {
+  let nearestBorderDistance = Number.POSITIVE_INFINITY;
+  let nearestAwayDirection: THREE.Vector3 | null = null;
+
+  colliders.forEach((collider) => {
+    if (collider.kind !== 'station') {
+      return;
+    }
+
+    const dx = shipPosition.x - collider.position[0];
+    const dy = shipPosition.y - collider.position[1];
+    const dz = shipPosition.z - collider.position[2];
+    const centerDistance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const borderDistance = centerDistance - collider.radius - shipRadius;
+    if (borderDistance < nearestBorderDistance) {
+      nearestBorderDistance = borderDistance;
+      nearestAwayDirection = centerDistance > 1e-6
+        ? new THREE.Vector3(dx / centerDistance, dy / centerDistance, dz / centerDistance)
+        : null;
+    }
+  });
+
+  if (!Number.isFinite(nearestBorderDistance) || nearestBorderDistance >= SHIP_STATION_SLOW_ZONE_START_METERS) {
+    return { maxSpeed: defaultMaxSpeed, active: false };
+  }
+
+  if (nearestBorderDistance <= SHIP_STATION_SLOW_ZONE_MIN_METERS) {
+    return {
+      maxSpeed: Math.min(defaultMaxSpeed, SHIP_STATION_SLOW_ZONE_MIN_SPEED_METERS_PER_SECOND),
+      active: true,
+    };
+  }
+
+  const normalizedDistance =
+    (nearestBorderDistance - SHIP_STATION_SLOW_ZONE_MIN_METERS) /
+    (SHIP_STATION_SLOW_ZONE_START_METERS - SHIP_STATION_SLOW_ZONE_MIN_METERS);
+
+  const limitedSpeed = THREE.MathUtils.lerp(
+    Math.min(defaultMaxSpeed, SHIP_STATION_SLOW_ZONE_MIN_SPEED_METERS_PER_SECOND),
+    defaultMaxSpeed,
+    THREE.MathUtils.clamp(normalizedDistance, 0, 1),
+  );
+
+  if (!nearestAwayDirection || shipVelocity.lengthSq() <= 1e-6) {
+    return { maxSpeed: limitedSpeed, active: true };
+  }
+
+  const movingAway = shipVelocity.clone().normalize().dot(nearestAwayDirection) > 0;
+  if (!movingAway) {
+    return { maxSpeed: limitedSpeed, active: true };
+  }
+
+  return {
+    maxSpeed: THREE.MathUtils.lerp(limitedSpeed, defaultMaxSpeed, 0.6),
+    active: true,
+  };
 }
 
 function findSceneCollisionOnSegment(
@@ -1671,6 +1744,9 @@ function formatNumberSpacing(numStr: string): string {
 }
 
 function formatDistance(distance: number): string {
+  if (distance >= 149_597_870_700 * 0.1) {
+    return `${formatNumberSpacing((distance / 149_597_870_700).toFixed(1))} AU`;
+  }
   if (distance >= 1000) {
     return `${formatNumberSpacing((distance / 1000).toFixed(1))} km`;
   }
@@ -2285,6 +2361,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     shipSpeed: 0,
     prompt: 'Connecting to the sector…',
     playersOnline: 1,
+    speedLimitNotice: '',
   });
   const activeSystem = useMemo(
     () => galaxy.systems.find((system) => system.id === activeSystemId) ?? null,
@@ -2341,8 +2418,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeFrameOrigin, autopilotDestination?.id, currentTimestampForEta]);
   const autopilotObstacles = useMemo(() => (activeSystem ? buildAutopilotObstacles(activeSystem) : []), [activeSystem]);
-  const highlightedAsteroidTargetId =
-    autopilotDestination?.kind === 'asteroid-object' && autopilotDestination.id !== autopilotReachedDestinationId ? autopilotDestination.id : '';
+  
   const socketRef = useRef<Socket | null>(null);
   const sendState = useCallback((payload: PlayerSnapshot) => {
     socketRef.current?.emit('state:update', payload);
@@ -2556,11 +2632,12 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           activeFrameOrigin={activeFrameOrigin}
           autopilotActive={autopilotEngaged}
           autopilotDestination={autopilotDestination}
+            activeAutopilotTarget={autopilotDestination?.id !== autopilotReachedDestinationId ? autopilotDestination : null}
           autopilotEtaLabel={autopilotEtaLabel}
           autopilotObstacles={autopilotObstacles}
           activeSystemId={activeSystemId}
           galaxy={galaxy}
-          highlightedAsteroidTargetId={highlightedAsteroidTargetId}
+          
           mode={hud.mode}
           onAutopilotArrival={setAutopilotReachedDestinationId}
           onInterstellarArrival={(dest) => {
@@ -2619,6 +2696,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           </button>
         </div>
 
+        {hud.speedLimitNotice ? <div className="hud-speed-limit-banner">{hud.speedLimitNotice}</div> : null}
         <div className="hud-banner">{hud.prompt}</div>
 
         {!tabletOpen ? <div className="crosshair" /> : null}
@@ -2691,12 +2769,12 @@ function GameScene({
   activeFrameOrigin,
   autopilotActive,
   autopilotDestination,
+  activeAutopilotTarget,
   autopilotEtaLabel,
   autopilotObstacles,
   activeSystemId,
   galaxy,
-  highlightedAsteroidTargetId,
-  mode,
+    mode,
   localStateRef,
   onAutopilotArrival,
   onInterstellarArrival,
@@ -2712,12 +2790,12 @@ function GameScene({
   activeFrameOrigin: Vec3Tuple;
   autopilotActive: boolean;
   autopilotDestination: AutopilotDestination | null;
+  activeAutopilotTarget: AutopilotDestination | null;
   autopilotEtaLabel: string;
   autopilotObstacles: AutopilotObstacle[];
   activeSystemId: string;
   galaxy: GalaxyData;
-  highlightedAsteroidTargetId: string;
-  mode: Mode;
+    mode: Mode;
   localStateRef: MutableRefObject<LocalGameState>;
   onAutopilotArrival: Dispatch<SetStateAction<string>>;
   onInterstellarArrival: (dest: AutopilotDestination) => void;
@@ -3243,7 +3321,14 @@ const turnSpeed = 1.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
             
             state.shipVelocity.copy(forwardVelocity).add(lateralVelocity);
 
-        const maxSpeed = SHIP_MAX_SPEED_METERS_PER_SECOND * shipConfig.speedMultiplier;
+        const stationSpeedLimitInfo = getStationBorderLimitedManualSpeed(
+          state.shipPosition,
+          state.shipVelocity,
+          shipConfig.collisionRadius,
+          localEnvironmentColliders,
+          SHIP_MAX_SPEED_METERS_PER_SECOND * shipConfig.speedMultiplier,
+        );
+        const maxSpeed = stationSpeedLimitInfo.maxSpeed;
         const shipSpeed = state.shipVelocity.length();
         if (shipSpeed > maxSpeed) {
           state.shipVelocity.setLength(maxSpeed);
@@ -3350,6 +3435,16 @@ const turnSpeed = 1.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
       const canPilot = state.mode === 'interior' && state.interiorPosition.distanceTo(shipConfig.pilotSeatVec) < SEAT_INTERACTION_DISTANCE_METERS;
       const shipSpeed = state.shipVelocity.length();
       const speed = state.mode === 'pilot' ? shipSpeed : state.mode === 'space' || state.mode === 'planet-surface' ? state.velocity.length() : walkSpeed(state);
+      const stationSpeedLimitInfo = state.mode === 'pilot'
+        ? getStationBorderLimitedManualSpeed(
+            state.shipPosition,
+            state.shipVelocity,
+            shipConfig.collisionRadius,
+            localEnvironmentColliders,
+            SHIP_MAX_SPEED_METERS_PER_SECOND * shipConfig.speedMultiplier,
+          )
+        : { maxSpeed: SHIP_MAX_SPEED_METERS_PER_SECOND * shipConfig.speedMultiplier, active: false };
+      const speedLimitNotice = stationSpeedLimitInfo.active ? 'STATION TRAFFIC FIELD · VELOCITY LIMITED' : '';
 
       let prompt = pointerLocked
         ? 'WASD to move, Space/Shift for vertical thrust. Momentum is preserved.'
@@ -3390,6 +3485,7 @@ const turnSpeed = 1.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
         shipSpeed,
         prompt,
         playersOnline,
+        speedLimitNotice,
       }));
       state.lastHudAt = now;
     }
@@ -3397,7 +3493,7 @@ const turnSpeed = 1.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
 
   return (
     <>
-      <GalaxyBackdrop activeFrameOrigin={activeFrameOrigin} activeSystemId={activeSystemId} galaxy={galaxy} highlightedAsteroidTargetId={highlightedAsteroidTargetId} />
+      <GalaxyBackdrop activeFrameOrigin={activeFrameOrigin} activeSystemId={activeSystemId} galaxy={galaxy} autopilotTarget={activeAutopilotTarget} localStateRef={localStateRef} />
       <WarpSpeedEffect localStateRef={localStateRef} />
       <group ref={shipGroupRef}>
         <ShipExteriorModel config={shipConfig} highlight />
@@ -4780,13 +4876,15 @@ function createLensFlareTexture(): THREE.CanvasTexture {
 function GalaxyBackdrop({
   activeFrameOrigin,
   activeSystemId,
+  autopilotTarget,
   galaxy,
-  highlightedAsteroidTargetId,
+  localStateRef,
 }: {
   activeFrameOrigin: Vec3Tuple;
   activeSystemId: string;
+  autopilotTarget: AutopilotDestination | null;
   galaxy: GalaxyData;
-  highlightedAsteroidTargetId: string;
+  localStateRef: MutableRefObject<LocalGameState>;
 }): ReactElement {
   const activeSystem = galaxy.systems.find((system) => system.id === activeSystemId) ?? galaxy.systems[0] ?? null;
   const activeSystemPosition = activeSystem?.mapPosition ?? [0, 0, 0];
@@ -4794,7 +4892,7 @@ function GalaxyBackdrop({
   return (
     <group>
       <GalaxyStarMarkers activeSystemId={activeSystemId} activeSystemPosition={activeSystemPosition} galaxy={galaxy} />
-      {activeSystem ? <StarSystem highlightedAsteroidTargetId={highlightedAsteroidTargetId} renderPosition={toFrameLocalPosition([0, 0, 0], activeFrameOrigin)} system={activeSystem} /> : null}
+      {activeSystem ? <StarSystem autopilotTarget={autopilotTarget} renderPosition={toFrameLocalPosition([0, 0, 0], activeFrameOrigin)} system={activeSystem} localStateRef={localStateRef} /> : null}
     </group>
   );
 }
@@ -4888,7 +4986,35 @@ function getStarScreenRadiusNdc(camera: THREE.Camera, distance: number, starRadi
   return THREE.MathUtils.clamp(starRadius / (distance * halfFovTangent), 0.001, 1.5);
 }
 
-function StarSystem({ highlightedAsteroidTargetId, renderPosition, system }: { highlightedAsteroidTargetId: string; renderPosition: Vec3Tuple; system: StarSystemData }): ReactElement {
+
+function AutopilotTargetTag({ target, renderPosition, localStateRef }: { target: AutopilotDestination; renderPosition: Vec3Tuple; localStateRef: MutableRefObject<LocalGameState> }) {
+  // We use bodyCenter except if it happens to be not provided, fallback to localPosition
+  const pos = target.bodyCenter || target.localPosition;
+  const targetPosition = useMemo(() => new THREE.Vector3(...tupleAdd(renderPosition, pos)), [pos, renderPosition]);
+  const [distanceLabel, setDistanceLabel] = useState(() => formatDistance(targetPosition.distanceTo(localStateRef.current.shipPosition)));
+
+  useFrame(() => {
+    const nextLabel = formatDistance(targetPosition.distanceTo(localStateRef.current.shipPosition));
+    setDistanceLabel((current) => (current === nextLabel ? current : nextLabel));
+  });
+  
+  return (
+    <PhysicalProxyGroup physicalPosition={tupleAdd(renderPosition, pos)} visibleRange={1_200_000_000}>
+      <Html center zIndexRange={[1, 0]}>
+        <div className="cyber-target-tag">
+          <div className="cyber-line-top"></div>
+          <div className="cyber-content">
+            <div className="cyber-id">{distanceLabel}</div>
+            <div className="cyber-name">{target.name.toUpperCase()}</div>
+          </div>
+          <div className="cyber-line-bottom"></div>
+        </div>
+      </Html>
+    </PhysicalProxyGroup>
+  );
+}
+
+function StarSystem({ autopilotTarget, renderPosition, system, localStateRef }: { autopilotTarget: AutopilotDestination | null; renderPosition: Vec3Tuple; system: StarSystemData; localStateRef: MutableRefObject<LocalGameState> }): ReactElement {
   const { camera, scene } = useThree();
   const haloRef = useRef<THREE.Mesh>(null);
   const haloMaterialRef = useRef<THREE.MeshBasicMaterial>(null);
@@ -4961,8 +5087,12 @@ function StarSystem({ highlightedAsteroidTargetId, renderPosition, system }: { h
         <PlanetBody key={planet.id} physicalPosition={tupleAdd(renderPosition, planet.position)} planet={planet} />
       ))}
 
+      {autopilotTarget && autopilotTarget.systemId === system.id ? (
+        <AutopilotTargetTag target={autopilotTarget} renderPosition={renderPosition} localStateRef={localStateRef} />
+      ) : null}
+
       {system.asteroidGroups.map((asteroidGroup) => (
-        <AsteroidCluster key={asteroidGroup.id} group={asteroidGroup} highlightedAsteroidTargetId={highlightedAsteroidTargetId} physicalPosition={tupleAdd(renderPosition, asteroidGroup.position)} />
+        <AsteroidCluster key={asteroidGroup.id} group={asteroidGroup}  physicalPosition={tupleAdd(renderPosition, asteroidGroup.position)} />
       ))}
     </>
   );
@@ -5348,12 +5478,10 @@ function DistanceVisibleGroup({
 
 function AsteroidCluster({
   group,
-  highlightedAsteroidTargetId,
-  physicalPosition: physicalPositionTuple,
+    physicalPosition: physicalPositionTuple,
 }: {
   group: AsteroidGroupData;
-  highlightedAsteroidTargetId: string;
-  physicalPosition: Vec3Tuple;
+    physicalPosition: Vec3Tuple;
 }): ReactElement {
   const { camera } = useThree();
   const groupRef = useRef<THREE.Group>(null);
@@ -5407,7 +5535,7 @@ function AsteroidCluster({
           <AsteroidDust dust={group.dust} physicalPosition={physicalPositionTuple} show={showCluster} />
           <SpaceStation station={group.station} physicalPosition={tupleAdd(physicalPositionTuple, group.station.position)} scale={ASTEROID_STATION_SCALE} />
           {asteroidsToRender.map((asteroid) => (
-            <AsteroidMesh key={asteroid.id} asteroid={asteroid} highlightTarget={asteroid.id === highlightedAsteroidTargetId} physicalPosition={tupleAdd(physicalPositionTuple, asteroid.position)} show={showCluster} />
+            <AsteroidMesh key={asteroid.id} asteroid={asteroid} physicalPosition={tupleAdd(physicalPositionTuple, asteroid.position)} show={showCluster} />
           ))}
         </group>
       )}
@@ -5479,12 +5607,10 @@ function AsteroidDust({ dust, physicalPosition, show }: { dust: DustAsteroidData
 
 function AsteroidMesh({
   asteroid,
-  highlightTarget = false,
   physicalPosition,
   show,
 }: {
   asteroid: AsteroidData;
-  highlightTarget?: boolean;
   physicalPosition: Vec3Tuple;
   show: boolean;
 }): ReactElement {
@@ -5496,19 +5622,7 @@ function AsteroidMesh({
   const outlineMaterialRef = useRef<THREE.MeshBasicMaterial>(null);
 
   useFrame((state) => {
-    if (!outlineMaterialRef.current) {
-      return;
-    }
-    
-    if (!highlightTarget) {
-      if (outlineMaterialRef.current.opacity !== 0) {
-        outlineMaterialRef.current.opacity = 0;
-      }
-      return;
-    }
-
-    const shimmer = 0.35 + (Math.sin(state.clock.elapsedTime * TARGET_OUTLINE_PULSE_SPEED) * 0.5 + 0.5) * 0.65;
-    outlineMaterialRef.current.opacity = shimmer;
+    // Shimmer effect no longer needed for HTML tooltip target
   });
 
   return (
@@ -5526,19 +5640,7 @@ function AsteroidMesh({
           </mesh>
         )}
 
-        {highlightTarget ? (
-          asteroid.shape === 'abstract' ? (
-            <mesh scale={[1.12, 1.12, 1.12]}>
-              <icosahedronGeometry args={[1, 1]} />
-              <meshBasicMaterial ref={outlineMaterialRef} color="#67e8f9" side={THREE.BackSide} transparent depthWrite={false} blending={THREE.AdditiveBlending} />
-            </mesh>
-          ) : (
-            <mesh scale={[1.12, 1.12, 1.12]}>
-              <dodecahedronGeometry args={[1, 0]} />
-              <meshBasicMaterial ref={outlineMaterialRef} color="#67e8f9" side={THREE.BackSide} transparent depthWrite={false} blending={THREE.AdditiveBlending} />
-            </mesh>
-          )
-        ) : null}
+        
       </group>
     </PhysicalProxyGroup>
   );

@@ -196,6 +196,65 @@ button {
   color: #dbeafe;
 }
 
+.hud-speed-limit-banner {
+  position: absolute;
+  top: 1.15rem;
+  left: 50%;
+  transform: translateX(-50%);
+  pointer-events: none;
+  color: #38bdf8;
+  font-family: monospace;
+  font-size: 0.78rem;
+  letter-spacing: 0.22rem;
+  text-transform: uppercase;
+  white-space: nowrap;
+  opacity: 0.9;
+  animation: calm-tech-blink 2.8s ease-in-out infinite;
+}
+
+.hud-speed-limit-banner::before,
+.hud-speed-limit-banner::after {
+  content: '';
+  position: absolute;
+  border-color: rgba(14, 165, 233, 0.85);
+  border-style: solid;
+}
+
+.hud-speed-limit-banner::before {
+  top: -0.55rem;
+  left: -1.4rem;
+  width: 1.8rem;
+  height: 1rem;
+  border-width: 1px 0 0 1px;
+  transform: skewX(-42deg);
+}
+
+.hud-speed-limit-banner::after {
+  right: -1rem;
+  bottom: -0.38rem;
+  width: 1.65rem;
+  height: 0.75rem;
+  border-width: 0 1px 1px 0;
+}
+
+.hud-speed-limit-banner {
+  padding: 0.42rem 0.9rem;
+  background: rgba(4, 20, 36, 0.64);
+  border: 1px solid rgba(14, 165, 233, 0.35);
+  box-shadow: 0 0 24px rgba(14, 165, 233, 0.08);
+  backdrop-filter: blur(4px);
+}
+
+@keyframes calm-tech-blink {
+  0%,
+  100% {
+    opacity: 0.42;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+
 .hud-bottom {
   right: 1.25rem;
   bottom: 7.75rem;
@@ -1097,3 +1156,56 @@ button {
   100% { opacity: 0; transform: scale(1.1); }
 }
 
+
+.cyber-target-tag {
+  pointer-events: none;
+  user-select: none;
+  color: #38bdf8;
+  font-family: monospace;
+  font-size: 11px;
+  position: relative;
+  text-transform: uppercase;
+  white-space: nowrap;
+  transform: translate(20px, -20px);
+}
+
+.cyber-line-top {
+  position: absolute;
+  top: -8px;
+  left: -20px;
+  width: 40px;
+  height: 20px;
+  border-top: 1px solid #0ea5e9;
+  border-left: 1px solid #0ea5e9;
+  transform: skewX(-45deg);
+}
+
+.cyber-line-bottom {
+  position: absolute;
+  bottom: -4px;
+  right: -10px;
+  width: 40px;
+  height: 10px;
+  border-bottom: 1px solid #0ea5e9;
+  border-right: 1px solid #0ea5e9;
+}
+
+.cyber-content {
+  background: rgba(4, 20, 36, 0.7);
+  border: 1px solid rgba(14, 165, 233, 0.4);
+  padding: 4px 8px;
+  backdrop-filter: blur(4px);
+}
+
+.cyber-id {
+  color: #bae6fd;
+  font-size: 9px;
+  margin-bottom: 2px;
+  opacity: 0.8;
+}
+
+.cyber-name {
+  font-weight: bold;
+  letter-spacing: 1px;
+  color: #f0f9ff;
+}
