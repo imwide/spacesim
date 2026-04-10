@@ -10,8 +10,9 @@ Improve the "hyperspeed effect" to not be a UI visual effect ontop of the camera
 
 The turning can happen really fast right now. The intensity that the turn and rotation of the ship is started at is really high. it should "fade in" and slowly start turning as it is has a lot of weight
 
-Remove the crosshair
-
 To the config file of each ship add two fields that can each be lists of relative corrdinates for the ship. One of them should determine the position(s) of the thrusters (to later determine where to spawn particles) and the other should determine the position(s) of the "guns" (to later determine where to spawn projectiles). These coordinates should be relative to the ship's center and should be rotated with the ship. This way we can have different ships with different thruster and gun positions without having to hardcode them in the code.
 
-Make the star shine way brighter. Make the flares and glow more intense even at long distances and make them increase "exponentially" the closer you get. Also dont completley remove the glow if the star itself is opbstructed or slightly off screen for a more realistic behavior
+
+Instead of spawning the ship inside of the center of the station, make it spawn in a radius of 500m around the station, but at the same or higher height, randomly. Also spawn the player inside of the ship instead of in space
+
+In tghe space tablet, next to the option for engaging the autopilot, add an option to "Highlight" objects which will just cause the Tag to appear like the autopilot tag but without activating the autopilot and also while the player is outside of the ship. If the player is outside of the ship. also add the option to highlight the players ship in order to find it better.

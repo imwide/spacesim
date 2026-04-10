@@ -2592,35 +2592,6 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     setAutopilotStatus('Autopilot disengaged.');
   }, []);
 
-  const controls = useMemo(() => {
-    switch (hud.mode) {
-      case 'interior':
-        return [
-          'Move with WASD while gravity keeps you grounded inside the ship.',
-          'Press F near the pilot seat to sit down and monitor the autopilot view.',
-          'Use the autopilot panel to pick a destination, or press X to exit back into space.',
-        ];
-      case 'pilot':
-        return [
-          'Manual flight: arrow keys rotate the ship with inertia instead of snapping instantly.',
-          'W/S thrust forward and backward, A/D thrust left and right. The ship naturally bleeds off sideways drift.',
-          'Shift exits the pilot seat. Mouse and Space do nothing here. Press T for the Space-Tablet.',
-        ];
-      case 'planet-surface':
-        return [
-          'Walking on the planet surface. Look around with the mouse.',
-          'WASD to walk along the terrain, Space to jump.',
-          'Approach your ship and press E to board. Use Shift while airborne to activate jetpack.',
-        ];
-      default:
-        return [
-          'Click the scene to lock the cursor, then look around with the mouse.',
-          'W/S thrust where you are looking, A/D strafes, and Space/Shift move up or down.',
-          'Approach your ship and press E to board it. Press T to fast travel via the Space-Tablet.',
-        ];
-    }
-  }, [hud.mode]);
-
   return (
     <main className="sim-shell">
       <Canvas camera={{ fov: 75, near: 0.05, far: GALAXY_CAMERA_FAR }} gl={{ logarithmicDepthBuffer: true }}>
@@ -2697,18 +2668,6 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
         </div>
 
         {hud.speedLimitNotice ? <div className="hud-speed-limit-banner">{hud.speedLimitNotice}</div> : null}
-        <div className="hud-banner">{hud.prompt}</div>
-
-        {!tabletOpen ? <div className="crosshair" /> : null}
-
-        <div className="hud-bottom">
-          <strong>Controls</strong>
-          <ul>
-            {controls.map((control) => (
-              <li key={control}>{control}</li>
-            ))}
-          </ul>
-        </div>
 
         <InventoryHud slots={inventorySlots} />
 
@@ -5023,7 +4982,7 @@ function StarSystem({ autopilotTarget, renderPosition, system, localStateRef }: 
   const worldPosition = useMemo(() => new THREE.Vector3(...renderPosition), [renderPosition]);
   const projectedPosition = useMemo(() => new THREE.Vector3(), []);
   const lastOcclusionCheckRef = useRef(0);
-  const haloVisibleRef = useRef(true);
+  const haloOccludedRef = useRef(false);
 
   useFrame((state) => {
     if (!haloRef.current || !haloMaterialRef.current) {
@@ -5033,31 +4992,33 @@ function StarSystem({ autopilotTarget, renderPosition, system, localStateRef }: 
     projectedPosition.copy(worldPosition).project(camera);
     const distance = worldPosition.distanceTo(camera.position);
     const inBodyRange = distance <= LOCAL_STAR_BODY_VISIBILITY_RANGE;
-    const inFront = projectedPosition.z > -1 && projectedPosition.z < 1;
+    const frontFactor = THREE.MathUtils.clamp(1 - Math.max(0, Math.abs(projectedPosition.z) - 0.92) / 0.55, 0, 1);
+    const edgeDistance = Math.max(Math.abs(projectedPosition.x), Math.abs(projectedPosition.y));
+    const edgeFactor = THREE.MathUtils.clamp(1 - Math.max(0, edgeDistance - 0.82) / 0.78, 0, 1);
 
-    if (!inBodyRange || !inFront) {
-      haloVisibleRef.current = false;
+    if (!inBodyRange || frontFactor <= 0 || edgeFactor <= 0) {
       haloRef.current.visible = false;
       return;
     }
 
     if (state.clock.elapsedTime - lastOcclusionCheckRef.current > 0.12) {
-      haloVisibleRef.current = !isStarOccluded(scene, camera, raycaster, intersections, worldPosition, system.radius);
+      haloOccludedRef.current = isStarOccluded(scene, camera, raycaster, intersections, worldPosition, system.radius);
       lastOcclusionCheckRef.current = state.clock.elapsedTime;
     }
 
-    haloRef.current.visible = haloVisibleRef.current;
+    haloRef.current.visible = true;
 
-    if (haloVisibleRef.current) {
-      const distanceFactor = THREE.MathUtils.clamp(1 - distance / LOCAL_STAR_BODY_VISIBILITY_RANGE, 0, 1);
-      const screenRadiusNdc = getStarScreenRadiusNdc(camera, distance, system.radius);
-      const screenFactor = THREE.MathUtils.clamp(Math.pow(screenRadiusNdc / 0.035, 0.55), 0.55, 3.2);
-      const haloScale = 1.95 + distanceFactor * 0.45 + screenFactor * 0.7;
-      const haloOpacity = THREE.MathUtils.clamp(0.11 + distanceFactor * 0.08 + screenFactor * 0.045, 0.1, 0.34);
+    const distanceFactor = THREE.MathUtils.clamp(1 - distance / LOCAL_STAR_BODY_VISIBILITY_RANGE, 0, 1);
+    const closeBoost = distanceFactor;
+    const screenRadiusNdc = getStarScreenRadiusNdc(camera, distance, system.radius);
+    const screenFactor = THREE.MathUtils.clamp(Math.pow(screenRadiusNdc / 0.028, 0.65), 0.38, 4.2);
+    const visibilityFactor = frontFactor * (0.28 + edgeFactor * 0.72);
+    const occlusionFactor = haloOccludedRef.current ? 0.34 : 1;
+    const haloScale = 2.05 + closeBoost * 0.8 + screenFactor * 0.75;
+    const haloOpacity = THREE.MathUtils.clamp((0.08 + closeBoost * 0.12 + screenFactor * 0.03) * visibilityFactor * occlusionFactor, 0.03, 0.42);
 
-      haloRef.current.scale.setScalar(haloScale);
-      haloMaterialRef.current.opacity = haloOpacity;
-    }
+    haloRef.current.scale.setScalar(haloScale);
+    haloMaterialRef.current.opacity = haloOpacity;
   });
 
   return (
@@ -5147,9 +5108,10 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
     projectedPosition.copy(worldPosition).project(camera);
     const distance = worldPosition.distanceTo(camera.position);
     const inRange = distance <= STAR_LENS_FLARE_RANGE;
-    const inFront = projectedPosition.z > -1 && projectedPosition.z < 1;
-    const nearViewport = Math.abs(projectedPosition.x) < 1.35 && Math.abs(projectedPosition.y) < 1.35;
-    const couldBeVisible = inRange && inFront && nearViewport;
+    const frontFactor = THREE.MathUtils.clamp(1 - Math.max(0, Math.abs(projectedPosition.z) - 0.92) / 0.65, 0, 1);
+    const edgeDistance = Math.max(Math.abs(projectedPosition.x), Math.abs(projectedPosition.y));
+    const edgeFactor = THREE.MathUtils.clamp(1 - Math.max(0, edgeDistance - 0.8) / 0.95, 0, 1);
+    const couldBeVisible = inRange && frontFactor > 0 && edgeFactor > 0;
 
     if (!couldBeVisible) {
       groupRef.current.visible = false;
@@ -5161,12 +5123,7 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
       lastOcclusionCheckRef.current = state.clock.elapsedTime;
     }
 
-    const visible = !occludedRef.current;
-    groupRef.current.visible = visible;
-
-    if (!visible) {
-      return;
-    }
+    groupRef.current.visible = true;
 
     groupRef.current.position.copy(camera.position);
     groupRef.current.quaternion.copy(camera.quaternion);
@@ -5187,25 +5144,27 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
     ghostTwoRef.current.position.set(-ghostOffset.x * 0.72, -ghostOffset.y * 0.72, -planeDistance);
     ghostThreeRef.current.position.set(ghostOffset.x * 0.42, ghostOffset.y * 0.42, -planeDistance);
 
-    const distanceFactor = 1 - distance / STAR_LENS_FLARE_RANGE;
-    const viewFactor = 1 - Math.min(1, Math.sqrt(projectedPosition.x ** 2 + projectedPosition.y ** 2));
+    const distanceFactor = THREE.MathUtils.clamp(1 - distance / STAR_LENS_FLARE_RANGE, 0, 1);
+    const closeBoost = distanceFactor;
+    const viewFactor = THREE.MathUtils.clamp(0.12 + edgeFactor * 0.88, 0, 1) * frontFactor;
     const screenRadiusNdc = getStarScreenRadiusNdc(camera, distance, starRadius);
-    const screenFactor = THREE.MathUtils.clamp(Math.pow(screenRadiusNdc / 0.028, 0.6), 0.7, 4.5);
-    const opacity = THREE.MathUtils.clamp((0.05 + distanceFactor * 0.18) * viewFactor * (0.6 + screenFactor * 0.32), 0.018, 0.34);
+    const screenFactor = THREE.MathUtils.clamp(Math.pow(screenRadiusNdc / 0.026, 0.7), 0.45, 4.8);
+    const occlusionFactor = occludedRef.current ? 0.28 : 1;
+    const opacity = THREE.MathUtils.clamp((0.035 + distanceFactor * 0.1 + closeBoost * 0.18) * viewFactor * (0.7 + screenFactor * 0.22) * occlusionFactor, 0.012, 0.38);
 
     coreMaterialRef.current.opacity = opacity;
-    haloMaterialRef.current.opacity = opacity * 0.55;
-    ghostOneMaterialRef.current.opacity = opacity * 0.48;
-    ghostTwoMaterialRef.current.opacity = opacity * 0.32;
+    haloMaterialRef.current.opacity = opacity * 0.68;
+    ghostOneMaterialRef.current.opacity = opacity * 0.54;
+    ghostTwoMaterialRef.current.opacity = opacity * 0.36;
     ghostThreeMaterialRef.current.opacity = opacity * 0.24;
 
     const starScale = THREE.MathUtils.clamp(starRadius * 0.00012, 0.045, 0.12);
-    const flareScale = starScale * (1.25 + distanceFactor * 1.35 + screenFactor * 0.55);
+    const flareScale = starScale * (1.2 + distanceFactor * 0.7 + closeBoost * 0.95 + screenFactor * 0.45);
     coreSpriteRef.current.scale.setScalar(flareScale);
-    haloSpriteRef.current.scale.setScalar(flareScale * 3.4);
-    ghostOneRef.current.scale.setScalar(flareScale * 0.95);
-    ghostTwoRef.current.scale.setScalar(flareScale * 1.4);
-    ghostThreeRef.current.scale.setScalar(flareScale * 0.65);
+    haloSpriteRef.current.scale.setScalar(flareScale * 3.8);
+    ghostOneRef.current.scale.setScalar(flareScale * 1.0);
+    ghostTwoRef.current.scale.setScalar(flareScale * 1.45);
+    ghostThreeRef.current.scale.setScalar(flareScale * 0.72);
   });
 
   return (
