@@ -1,5 +1,12 @@
 import { Html } from '@react-three/drei';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { type ShipConfig, getShipConfig, DEFAULT_SHIP_ID } from './shipConfig';
+import { ShipExteriorModel, ShipInteriorModel, preloadShipModels } from './ShipModel';
+import './ships'; // register all ship configs
+
+// Preload the default ship models so GLBs download early
+preloadShipModels(getShipConfig(DEFAULT_SHIP_ID));
+
 import {
   ASTEROID_GROUP_VISIBILITY_RANGE,
   MOON_VISIBILITY_RANGE,
@@ -80,15 +87,19 @@ const SHIP_MANUAL_COAST_DAMPING = 0.16;
 const SHIP_MANUAL_LATERAL_DAMPING = 0.5;
 const SHIP_MANUAL_TURN_LATERAL_DAMPING = 1.35;
 const PLAYER_COLLISION_RADIUS = 0.46;
-const SHIP_COLLISION_RADIUS = 5.15;
 const STATION_COLLISION_RADIUS_FACTOR = 4.25;
-const SHIP_SPAWN_OFFSET_METERS = 18 * METERS_PER_WORLD_UNIT;
-const BOARDING_DISTANCE_METERS = 8 * METERS_PER_WORLD_UNIT;
+const BOARDING_RADIUS_METERS = 10 * METERS_PER_WORLD_UNIT;
 const SEAT_INTERACTION_DISTANCE_METERS = 1.15 * METERS_PER_WORLD_UNIT;
-const SHIP_EXIT_OFFSET_METERS = 9.5 * METERS_PER_WORLD_UNIT;
-const SHIP_INTERIOR_FLOOR_HEIGHT_METERS = 1.6 * METERS_PER_WORLD_UNIT;
-const SHIP_INTERIOR_CLAMP_X_METERS = 2.8 * METERS_PER_WORLD_UNIT;
-const SHIP_INTERIOR_CLAMP_Z_METERS = 5 * METERS_PER_WORLD_UNIT;
+
+// ── Legacy constants derived from the default ship config ──────────────────
+// Used by autopilot and other code that doesn't have direct access to the
+// active ShipConfig instance. These will be replaced once every subsystem
+// receives the config as a parameter.
+const _defaultShip = getShipConfig(DEFAULT_SHIP_ID);
+const SHIP_COLLISION_RADIUS = _defaultShip.collisionRadius;
+const SHIP_SPAWN_OFFSET_METERS = 18 * METERS_PER_WORLD_UNIT;
+const SHIP_INTERIOR_FLOOR_HEIGHT_METERS = _defaultShip.interiorFloorHeight;
+const SHIP_LANDING_GEAR_HEIGHT = _defaultShip.landingGearHeight;
 const STAR_STATION_SCALE = 6;
 const PLANET_STATION_SCALE = 4.5;
 const ASTEROID_STATION_SCALE = 3.8;
@@ -102,7 +113,6 @@ const PLANET_SURFACE_EYE_HEIGHT = 1.7 * METERS_PER_WORLD_UNIT;
 // Max distance above terrain the player can be while still being "glued" to slope.
 // Large enough to handle steep descents at walk speed; small enough that a jump breaks free.
 const PLANET_SURFACE_GROUND_FOLLOW_DIST = 3.0 * METERS_PER_WORLD_UNIT;
-const SHIP_LANDING_GEAR_HEIGHT = 6.0 * METERS_PER_WORLD_UNIT;
 const PLANET_TEXTURE_FILES = [
   '4k_ceres_fictional.jpg',
   '4k_eris_fictional.jpg',
@@ -259,8 +269,6 @@ interface LocalGameState {
 }
 
 const AUTH_STORAGE_KEY = 'spacesim.auth';
-const seatPosition = new THREE.Vector3(0, 1.2, -3.2);
-const pilotCameraOffset = new THREE.Vector3(0, 1.45, -3.05);
 const AUTOPILOT_REACH_DISTANCE_METERS = 250;
 const AUTOPILOT_INTERSTELLAR_TURN_RATE = 0.22;
 const AUTOPILOT_LOCAL_TURN_RATE = 1.4;
@@ -643,16 +651,18 @@ function buildStationSceneColliders(id: string, position: Vec3Tuple, scale: numb
   }));
 }
 
-function buildShipSceneColliders(id: string, position: Vec3Tuple, rotation: QuatTuple | THREE.Quaternion): SceneCollider[] {
+function buildShipSceneColliders(id: string, position: Vec3Tuple, rotation: QuatTuple | THREE.Quaternion, config?: ShipConfig): SceneCollider[] {
   const basePosition = vectorFromTuple(position);
   const quaternion = rotation instanceof THREE.Quaternion ? rotation.clone() : new THREE.Quaternion(...rotation);
-  const colliderSpecs = [
-    { offset: new THREE.Vector3(0, 0, -1.2), radius: 1.35 },
-    { offset: new THREE.Vector3(0, 0, 1.65), radius: 1.15 },
-    { offset: new THREE.Vector3(0, 0, 3.9), radius: 0.82 },
-    { offset: new THREE.Vector3(2.35, 0, 0.45), radius: 0.92 },
-    { offset: new THREE.Vector3(-2.35, 0, 0.45), radius: 0.92 },
-  ];
+  const colliderSpecs = config
+    ? config.colliderSpheres.map((s) => ({ offset: new THREE.Vector3(...s.offset), radius: s.radius }))
+    : [
+        { offset: new THREE.Vector3(0, 0, -1.2), radius: 1.35 },
+        { offset: new THREE.Vector3(0, 0, 1.65), radius: 1.15 },
+        { offset: new THREE.Vector3(0, 0, 3.9), radius: 0.82 },
+        { offset: new THREE.Vector3(2.35, 0, 0.45), radius: 0.92 },
+        { offset: new THREE.Vector3(-2.35, 0, 0.45), radius: 0.92 },
+      ];
 
   return colliderSpecs.map((spec, index) => ({
     id: `${id}:part-${index}`,
@@ -2574,6 +2584,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           remotePlayers={remotePlayers}
           sendState={sendState}
           setHud={setHud}
+          shipConfig={getShipConfig(DEFAULT_SHIP_ID)}
           tabletOpen={tabletOpen}
         />
       </Canvas>
@@ -2695,6 +2706,7 @@ function GameScene({
   remotePlayers,
   sendState,
   setHud,
+  shipConfig,
   tabletOpen,
 }: {
   activeFrameOrigin: Vec3Tuple;
@@ -2715,6 +2727,7 @@ function GameScene({
   remotePlayers: PlayerSnapshot[];
   sendState: (payload: PlayerSnapshot) => void;
   setHud: Dispatch<SetStateAction<HudState>>;
+  shipConfig: ShipConfig;
   tabletOpen: boolean;
 }): ReactElement {
   const { camera, gl } = useThree();
@@ -2769,8 +2782,9 @@ function GameScene({
       const state = localStateRef.current;
       if (state.mode === 'pilot') {
         const rotationSpeed = 0.0025;
-        state.yaw -= event.movementX * rotationSpeed;
-        state.pitch = clamp(state.pitch - event.movementY * rotationSpeed, -Math.PI / 2.1, Math.PI / 2.1);
+        const isUpsideDown = Math.cos(state.pitch) < 0;
+        state.yaw -= event.movementX * rotationSpeed * (isUpsideDown ? -1 : 1);
+        state.pitch -= event.movementY * rotationSpeed;
         return;
       }
 
@@ -2820,7 +2834,7 @@ function GameScene({
     const playerSceneColliders = [
       ...localEnvironmentColliders,
       ...remoteShipColliders,
-      ...buildShipSceneColliders('local-ship', tupleFromVector(state.shipPosition), state.shipRotation),
+      ...buildShipSceneColliders('local-ship', tupleFromVector(state.shipPosition), state.shipRotation, shipConfig),
     ];
 
     // ── Detect nearest planet for gravity ────────────────────────────────────
@@ -2913,10 +2927,12 @@ function GameScene({
       camera.position.copy(state.position);
       camera.quaternion.copy(state.rotation);
 
-      if (consumeAction('KeyE') && state.position.distanceTo(state.shipPosition) < BOARDING_DISTANCE_METERS) {
+      // Check boarding: player must be within BOARDING_RADIUS_METERS of the ship's entry point (world-space)
+      const entryWorld = shipConfig.entryPointVec.clone().applyQuaternion(state.shipRotation).add(state.shipPosition);
+      if (consumeAction('KeyE') && state.position.distanceTo(entryWorld) < BOARDING_RADIUS_METERS) {
         state.mode = 'interior';
         state.insideShip = true;
-        state.interiorPosition.set(0, SHIP_INTERIOR_FLOOR_HEIGHT_METERS, 2.5);
+        state.interiorPosition.copy(shipConfig.insideSpawnVec);
         state.interiorVelocity.set(0, 0, 0);
       }
     } else if (state.mode === 'interior') {
@@ -2976,13 +2992,13 @@ function GameScene({
       state.interiorVelocity.y -= INTERIOR_GRAVITY_METERS_PER_SECOND * dt;
       state.interiorPosition.y += state.interiorVelocity.y * dt;
 
-      if (state.interiorPosition.y < SHIP_INTERIOR_FLOOR_HEIGHT_METERS) {
-        state.interiorPosition.y = SHIP_INTERIOR_FLOOR_HEIGHT_METERS;
+      if (state.interiorPosition.y < shipConfig.interiorFloorHeight) {
+        state.interiorPosition.y = shipConfig.interiorFloorHeight;
         state.interiorVelocity.y = 0;
       }
 
-      state.interiorPosition.x = clamp(state.interiorPosition.x, -SHIP_INTERIOR_CLAMP_X_METERS, SHIP_INTERIOR_CLAMP_X_METERS);
-      state.interiorPosition.z = clamp(state.interiorPosition.z, -SHIP_INTERIOR_CLAMP_Z_METERS, SHIP_INTERIOR_CLAMP_Z_METERS);
+      state.interiorPosition.x = clamp(state.interiorPosition.x, -shipConfig.interiorClampX, shipConfig.interiorClampX);
+      state.interiorPosition.z = clamp(state.interiorPosition.z, -shipConfig.interiorClampZ, shipConfig.interiorClampZ);
       state.position.copy(state.shipPosition);
       state.velocity.copy(state.shipVelocity);
       state.rotation.copy(state.shipRotation);
@@ -2992,7 +3008,7 @@ function GameScene({
       camera.position.copy(state.shipPosition).add(cameraOffset);
       camera.quaternion.copy(worldLook);
 
-      if (consumeAction('KeyF') && state.interiorPosition.distanceTo(seatPosition) < SEAT_INTERACTION_DISTANCE_METERS) {
+      if (consumeAction('KeyF') && state.interiorPosition.distanceTo(shipConfig.pilotSeatVec) < SEAT_INTERACTION_DISTANCE_METERS) {
         state.mode = 'pilot';
         state.insideShip = true;
         state.shipAngularVelocity.set(0, 0, 0);
@@ -3002,7 +3018,8 @@ function GameScene({
       }
 
       if (consumeAction('KeyX')) {
-        const exitOffset = new THREE.Vector3(0, 0, SHIP_EXIT_OFFSET_METERS).applyQuaternion(state.shipRotation);
+        // Exit the ship at the configured outside spawn point
+        const exitOffset = shipConfig.outsideSpawnVec.clone().applyQuaternion(state.shipRotation);
         state.mode = 'space';
         state.insideShip = false;
         state.position.copy(state.shipPosition).add(exitOffset);
@@ -3116,11 +3133,12 @@ function GameScene({
           state.playerOnGround = false;
         }
 
-        // Board ship with E
-        if (consumeAction('KeyE') && state.position.distanceTo(state.shipPosition) < BOARDING_DISTANCE_METERS) {
+        // Board ship with E — must be near the ship's configured entry point
+        const entryWorldPS = shipConfig.entryPointVec.clone().applyQuaternion(state.shipRotation).add(state.shipPosition);
+        if (consumeAction('KeyE') && state.position.distanceTo(entryWorldPS) < BOARDING_RADIUS_METERS) {
           state.mode = 'interior';
           state.insideShip = true;
-          state.interiorPosition.set(0, SHIP_INTERIOR_FLOOR_HEIGHT_METERS, 2.5);
+          state.interiorPosition.copy(shipConfig.insideSpawnVec);
           state.interiorVelocity.set(0, 0, 0);
         }
 
@@ -3153,7 +3171,7 @@ function GameScene({
 
         if (exitPilotSeat) {
           state.mode = 'interior';
-          state.interiorPosition.copy(seatPosition).add(new THREE.Vector3(0, 0, 0.8));
+          state.interiorPosition.copy(shipConfig.pilotSeatVec).add(new THREE.Vector3(0, 0, 0.8));
           state.interiorVelocity.set(0, 0, 0);
           state.shipAngularVelocity.set(0, 0, 0);
         } else if (hasManualPilotInput) {
@@ -3163,37 +3181,98 @@ function GameScene({
             onAutopilotStatusChange('Autopilot disengaged. Manual control active.');
           }
 
-const turnSpeed = 0.5 * dt;
-            state.shipRotation.slerp(lookRotation, Math.min(1, turnSpeed));
-            state.shipAngularVelocity.set(0, 0, 0);
-            state.rotation.copy(state.shipRotation);
+const turnSpeed = 1.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
+            const angleToTarget = state.shipRotation.angleTo(lookRotation);
+            
+            // Calculate a roll (lean) based on how far we need to turn horizontally
+            const targetForward = new THREE.Vector3(0, 0, -1).applyQuaternion(lookRotation);
+            const shipRightTemp = new THREE.Vector3(1, 0, 0).applyQuaternion(state.shipRotation);
+            const dotX = targetForward.dot(shipRightTemp);
+            const maxRoll = Math.PI / 4; // 45 degrees max lean
+            const targetRoll = -dotX * maxRoll;
+            
+            // Combine camera look direction with local Z-roll
+            const rollQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), targetRoll);
+            const shipTargetRotation = lookRotation.clone().multiply(rollQuat);
 
-            const shipForward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
-            const shipRight = new THREE.Vector3(1, 0, 0).applyQuaternion(state.shipRotation);
-            const shipUp = new THREE.Vector3(0, 1, 0).applyQuaternion(state.shipRotation);
-
-            if (forwardInput > 0) {
-              state.shipVelocity.addScaledVector(shipForward, SHIP_MANUAL_FORWARD_THRUST * dt);
+            // Compute the target angular velocity to reach shipTargetRotation
+            // We find the difference quaternion and convert it back to an axis-angle
+            const qDiff = state.shipRotation.clone().invert().multiply(shipTargetRotation);
+            // qDiff.w might be negative, which corresponds to the long way around.
+            // We want the shortest path (positive w).
+            if (qDiff.w < 0) {
+              qDiff.w = -qDiff.w;
+              qDiff.x = -qDiff.x;
+              qDiff.y = -qDiff.y;
+              qDiff.z = -qDiff.z;
             }
-            if (forwardInput < 0) {
-              state.shipVelocity.addScaledVector(shipForward, -SHIP_MANUAL_REVERSE_THRUST * dt);
+            const angle = 2 * Math.acos(Math.max(-1, Math.min(1, qDiff.w)));
+            const axisSq = qDiff.x * qDiff.x + qDiff.y * qDiff.y + qDiff.z * qDiff.z;
+            let targetAngularVelLocal = new THREE.Vector3(0, 0, 0);
+            if (axisSq > 0.0001) {
+              const sinHalfAngle = Math.sqrt(axisSq);
+              const axis = new THREE.Vector3(qDiff.x, qDiff.y, qDiff.z).divideScalar(sinHalfAngle);
+              // Calculate desired rotational speed based on angle.
+              // Cap the maximum target rotation speed
+              const targetSpeed = Math.min(angle * 2.0, 1.5 * (shipConfig.turningSpeedMultiplier || 1.0));
+              targetAngularVelLocal = axis.multiplyScalar(targetSpeed);
+            }
+            
+            // Convert local target angular velocity to world space
+            const targetAngularVelWorld = targetAngularVelLocal.applyQuaternion(state.shipRotation);
+
+            // "Fade in" the rotation by smoothly lerping the current angular velocity
+            // towards the target angular velocity. This creates the "weight/momentum" feel.
+            const angularAcceleration = 3.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
+            state.shipAngularVelocity.lerp(targetAngularVelWorld, Math.min(1, angularAcceleration));
+
+            // Apply the angular velocity directly here so the rotation updates smoothly
+            // instead of instant slerping
+            const deltaRotation = new THREE.Quaternion().setFromEuler(
+              new THREE.Euler(
+                state.shipAngularVelocity.x * dt,
+                state.shipAngularVelocity.y * dt,
+                state.shipAngularVelocity.z * dt,
+                'XYZ',
+              ),
+            );
+            state.shipRotation.multiply(deltaRotation).normalize();
+            }
+            const effectiveForwardInput = forwardInput > 0 ? forwardInput * forwardAlignmentMultiplier : forwardInput;
+
+            if (effectiveForwardInput > 0) {
+              state.shipVelocity.addScaledVector(shipForward, effectiveForwardInput * SHIP_MANUAL_FORWARD_THRUST * accelMul * dt);
+            }
+            if (effectiveForwardInput < 0) {
+              state.shipVelocity.addScaledVector(shipForward, effectiveForwardInput * SHIP_MANUAL_REVERSE_THRUST * accelMul * dt);
             }
             if (lateralInput !== 0) {
-              state.shipVelocity.addScaledVector(shipRight, lateralInput * SHIP_MANUAL_STRAFE_THRUST * dt);
+              state.shipVelocity.addScaledVector(shipRight, lateralInput * SHIP_MANUAL_STRAFE_THRUST * accelMul * dt);
             }
             if (verticalInput !== 0) {
-              state.shipVelocity.addScaledVector(shipUp, verticalInput * SHIP_MANUAL_STRAFE_THRUST * dt);
+              state.shipVelocity.addScaledVector(shipUp, verticalInput * SHIP_MANUAL_STRAFE_THRUST * accelMul * dt);
             }
 
+            // Strong lateral damping ensures the ship doesn't slide sideways
             const forwardVelocity = shipForward.clone().multiplyScalar(state.shipVelocity.dot(shipForward));
             const lateralVelocity = state.shipVelocity.clone().sub(forwardVelocity);
             const lateralDamping = 10.0;
-            lateralVelocity.multiplyScalar(Math.max(0, 1 - lateralDamping * dt));
+            lateralVelocity.multiplyScalar(Math.max(0, 1 - (lateralDamping * shipConfig.brakingMultiplier) * dt));
+            
+            // Also apply some braking to forward velocity for sharp turns (> 120 deg) so the ship doesn't fly off too far
+            let turnBraking = 0;
+            if (angleToTarget > startBrakeAngle) {
+              const maxAngleRemaining = Math.PI - startBrakeAngle;
+              turnBraking = Math.min(1, (angleToTarget - startBrakeAngle) / maxAngleRemaining) * 4.0;
+            }
+            forwardVelocity.multiplyScalar(Math.max(0, 1 - (turnBraking * shipConfig.brakingMultiplier) * dt));
+            
             state.shipVelocity.copy(forwardVelocity).add(lateralVelocity);
 
+        const maxSpeed = SHIP_MAX_SPEED_METERS_PER_SECOND * shipConfig.speedMultiplier;
         const shipSpeed = state.shipVelocity.length();
-        if (shipSpeed > SHIP_MAX_SPEED_METERS_PER_SECOND) {
-          state.shipVelocity.setLength(SHIP_MAX_SPEED_METERS_PER_SECOND);
+        if (shipSpeed > maxSpeed) {
+          state.shipVelocity.setLength(maxSpeed);
         }
 
         if (!hasThrustInput) {
@@ -3204,7 +3283,7 @@ const turnSpeed = 0.5 * dt;
           }
         }
 
-        moveBodyWithSceneColliders(state.shipPosition, state.shipVelocity, dt, SHIP_COLLISION_RADIUS, shipSceneColliders);
+        moveBodyWithSceneColliders(state.shipPosition, state.shipVelocity, dt, shipConfig.collisionRadius, shipSceneColliders);
         state.position.copy(state.shipPosition);
         state.velocity.copy(state.shipVelocity);
       } else if (autopilotAvailable && autopilotDestination) {
@@ -3231,7 +3310,7 @@ const turnSpeed = 0.5 * dt;
         settleShipVelocity(state, dt, shipSceneColliders);
       }
 
-      const orbitRadius = 15; // Set desired orbit distance
+      const orbitRadius = shipConfig.cameraOrbitRadius;
       const cameraOffset = new THREE.Vector3(0, 2, orbitRadius).applyQuaternion(lookRotation);
       camera.position.copy(state.shipPosition).add(cameraOffset);
       camera.quaternion.copy(lookRotation);
@@ -3242,7 +3321,7 @@ const turnSpeed = 0.5 * dt;
       const shipOnGround = applyPlanetGravityAndTerrainCollision(
         state.shipPosition, state.shipVelocity,
         shipNearPlanet.planetCenter, shipNearPlanet.planetRadius,
-        shipNearPlanet.planetId, SHIP_LANDING_GEAR_HEIGHT, dt,
+        shipNearPlanet.planetId, shipConfig.landingGearHeight, dt,
       );
       state.shipOnGround = shipOnGround;
     } else if (shipNearPlanet && state.mode === 'pilot') {
@@ -3254,7 +3333,7 @@ const turnSpeed = 0.5 * dt;
         const shipOnGround = applyPlanetGravityAndTerrainCollision(
           state.shipPosition, state.shipVelocity,
           shipNearPlanet.planetCenter, shipNearPlanet.planetRadius,
-          shipNearPlanet.planetId, SHIP_LANDING_GEAR_HEIGHT, dt,
+          shipNearPlanet.planetId, shipConfig.landingGearHeight, dt,
         );
         state.shipOnGround = shipOnGround;
       } else {
@@ -3262,21 +3341,24 @@ const turnSpeed = 0.5 * dt;
         state.shipOnGround = clampBodyToTerrain(
           state.shipPosition, state.shipVelocity,
           shipNearPlanet.planetCenter, shipNearPlanet.planetRadius,
-          shipNearPlanet.planetId, SHIP_LANDING_GEAR_HEIGHT,
+          shipNearPlanet.planetId, shipConfig.landingGearHeight,
         );
       }
     } else {
       state.shipOnGround = false;
     }
 
+    // ── Dual-layer visibility ─────────────────────────────────────────────
+    // Exterior: visible when outside the ship (space, planet-surface) or piloting (3rd-person orbit camera)
+    // Interior: visible only when walking inside the ship (interior mode)
     if (shipGroupRef.current) {
-      shipGroupRef.current.visible = state.mode !== 'pilot';
+      shipGroupRef.current.visible = state.mode !== 'interior';
       shipGroupRef.current.position.copy(state.shipPosition);
       shipGroupRef.current.quaternion.copy(state.shipRotation);
     }
 
     if (interiorGroupRef.current) {
-      interiorGroupRef.current.visible = state.mode === 'interior' || state.mode === 'pilot';
+      interiorGroupRef.current.visible = state.mode === 'interior';
       interiorGroupRef.current.position.copy(state.shipPosition);
       interiorGroupRef.current.quaternion.copy(state.shipRotation);
     }
@@ -3288,8 +3370,10 @@ const turnSpeed = 0.5 * dt;
 
     if (now - state.lastHudAt > 100) {
       const boardingDistance = state.position.distanceTo(state.shipPosition);
-      const canEnter = (state.mode === 'space' || state.mode === 'planet-surface') && boardingDistance < BOARDING_DISTANCE_METERS;
-      const canPilot = state.mode === 'interior' && state.interiorPosition.distanceTo(seatPosition) < SEAT_INTERACTION_DISTANCE_METERS;
+      const entryWorldHud = shipConfig.entryPointVec.clone().applyQuaternion(state.shipRotation).add(state.shipPosition);
+      const entryDist = state.position.distanceTo(entryWorldHud);
+      const canEnter = (state.mode === 'space' || state.mode === 'planet-surface') && entryDist < BOARDING_RADIUS_METERS;
+      const canPilot = state.mode === 'interior' && state.interiorPosition.distanceTo(shipConfig.pilotSeatVec) < SEAT_INTERACTION_DISTANCE_METERS;
       const shipSpeed = state.shipVelocity.length();
       const speed = state.mode === 'pilot' ? shipSpeed : state.mode === 'space' || state.mode === 'planet-surface' ? state.velocity.length() : walkSpeed(state);
 
@@ -3342,10 +3426,10 @@ const turnSpeed = 0.5 * dt;
       <GalaxyBackdrop activeFrameOrigin={activeFrameOrigin} activeSystemId={activeSystemId} galaxy={galaxy} highlightedAsteroidTargetId={highlightedAsteroidTargetId} />
       <WarpSpeedEffect localStateRef={localStateRef} />
       <group ref={shipGroupRef}>
-        <ShipExterior highlight />
+        <ShipExteriorModel config={shipConfig} highlight />
       </group>
       <group ref={interiorGroupRef} visible={false}>
-        <ShipInterior isPilot={mode === 'pilot'} />
+        <ShipInteriorModel config={shipConfig} />
       </group>
       {remotePlayers.map((player) => (
         <RemotePlayer key={player.socketId} player={player} viewerFrameOrigin={activeFrameOrigin} />
@@ -5553,6 +5637,7 @@ function ShipInterior({ isPilot = false }: { isPilot?: boolean }): ReactElement 
 }
 
 function RemotePlayer({ player, viewerFrameOrigin }: { player: PlayerSnapshot; viewerFrameOrigin: Vec3Tuple }): ReactElement {
+  const remoteShipConfig = useMemo(() => getShipConfig(DEFAULT_SHIP_ID), []);
   const shipQuaternion = useMemo(
     () => new THREE.Quaternion(...player.ship.rotation),
     [player.ship.rotation],
@@ -5570,7 +5655,7 @@ function RemotePlayer({ player, viewerFrameOrigin }: { player: PlayerSnapshot; v
   return (
     <group>
       <group position={relativeShipPosition} quaternion={shipQuaternion}>
-        <ShipExterior />
+        <ShipExteriorModel config={remoteShipConfig} />
         <Html distanceFactor={18} position={[0, 1.9, 0]} transform>
           <div className="status-pill">{player.username}</div>
         </Html>
