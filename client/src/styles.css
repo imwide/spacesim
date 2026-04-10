@@ -148,6 +148,61 @@ button {
   pointer-events: none;
 }
 
+.pilot-crosshair-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.pilot-crosshair-circle,
+.pilot-crosshair-ship {
+  position: absolute;
+  transform: translate(-50%, -50%);
+}
+
+.pilot-crosshair-circle {
+  left: 50%;
+  top: 50%;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 1.5px solid rgba(255, 255, 255, 0.5);
+  box-shadow: 0 0 14px rgba(255, 255, 255, 0.08);
+}
+
+.pilot-crosshair-circle.is-aligned {
+  border-color: rgba(74, 222, 128, 0.95);
+  background: rgba(74, 222, 128, 0.06);
+  box-shadow: 0 0 18px rgba(74, 222, 128, 0.12);
+}
+
+.pilot-crosshair-ship {
+  width: 11px;
+  height: 11px;
+}
+
+.pilot-crosshair-ship::before,
+.pilot-crosshair-ship::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  background: rgba(255, 255, 255, 0.5);
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.12);
+  transform: translate(-50%, -50%);
+}
+
+.pilot-crosshair-ship::before {
+  width: 9px;
+  height: 2px;
+}
+
+.pilot-crosshair-ship::after {
+  width: 2px;
+  height: 9px;
+}
+
 .hud-panel,
 .hud-banner,
 .hud-bottom,

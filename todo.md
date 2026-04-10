@@ -11,4 +11,5 @@ Improve the "hyperspeed effect" to not be a UI visual effect ontop of the camera
 The turning can happen really fast right now. The intensity that the turn and rotation of the ship is started at is really high. it should "fade in" and slowly start turning as it is has a lot of weight
 
 
-
+While piloting the ship manually from the pilot seat, create the ability to shoot by pressing left mouse button.
+Use the positions of the guns on the ship to spawn muzzle flashes and projectile effects

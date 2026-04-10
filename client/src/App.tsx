@@ -186,6 +186,14 @@ interface HudState {
   interactionPills: Array<{ key: string; label: string }>;
 }
 
+interface PilotCrosshairState {
+  visible: boolean;
+  shipVisible: boolean;
+  shipScreenX: number;
+  shipScreenY: number;
+  aligned: boolean;
+}
+
 interface StationNode {
   id: string;
   name: string;
@@ -399,6 +407,30 @@ function toFrameLocalPosition(position: Vec3Tuple, frameOrigin: Vec3Tuple | THRE
   }
 
   return [position[0] - frameOrigin[0], position[1] - frameOrigin[1], position[2] - frameOrigin[2]];
+}
+
+function projectWorldPointToScreen(point: THREE.Vector3, camera: THREE.Camera, viewportWidth: number, viewportHeight: number): { x: number; y: number; visible: boolean } {
+  const cameraSpace = point.clone().applyMatrix4(camera.matrixWorldInverse);
+  if (cameraSpace.z >= 0) {
+    return {
+      x: viewportWidth / 2,
+      y: viewportHeight / 2,
+      visible: false,
+    };
+  }
+
+  const projected = point.clone().project(camera);
+  const margin = 28;
+  const halfWidth = viewportWidth / 2;
+  const halfHeight = viewportHeight / 2;
+  const clampedX = clamp(projected.x, -1 + margin / halfWidth, 1 - margin / halfWidth);
+  const clampedY = clamp(projected.y, -1 + margin / halfHeight, 1 - margin / halfHeight);
+
+  return {
+    x: (clampedX * 0.5 + 0.5) * viewportWidth,
+    y: (-clampedY * 0.5 + 0.5) * viewportHeight,
+    visible: true,
+  };
 }
 
 function compressProxyDistance(distance: number, linearDistance: number, logarithmicFactor: number): number {
@@ -2600,7 +2632,14 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
   const [activeSystemId, setActiveSystemId] = useState(homeSystemId);
   const [activeFrameOrigin, setActiveFrameOrigin] = useState<Vec3Tuple>(homeStation?.localPosition ?? [0, 0, 0]);
   const [tabletOpen, setTabletOpen] = useState(false);
-  const [showDebugAnchors, setShowDebugAnchors] = useState(true);
+  const [showDebugAnchors, setShowDebugAnchors] = useState(false);
+  const [pilotCrosshair, setPilotCrosshair] = useState<PilotCrosshairState>({
+    visible: false,
+    shipVisible: false,
+    shipScreenX: typeof window !== 'undefined' ? window.innerWidth / 2 : 0,
+    shipScreenY: typeof window !== 'undefined' ? window.innerHeight / 2 : 0,
+    aligned: false,
+  });
   const [teleporting, setTeleporting] = useState(false);
   const [autopilotDestination, setAutopilotDestination] = useState<AutopilotDestination | null>(null);
   const [autopilotEngaged, setAutopilotEngaged] = useState(false);
@@ -2903,6 +2942,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           remotePlayers={remotePlayers}
           sendState={sendState}
           setHud={setHud}
+          setPilotCrosshair={setPilotCrosshair}
           showDebugAnchors={showDebugAnchors}
           shipConfig={getShipConfig(DEFAULT_SHIP_ID)}
           tabletOpen={tabletOpen}
@@ -2910,6 +2950,18 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
       </Canvas>
 
       <div className="hud">
+        {pilotCrosshair.visible ? (
+          <div className="pilot-crosshair-layer" aria-hidden="true">
+            <div className={`pilot-crosshair-circle${pilotCrosshair.aligned ? ' is-aligned' : ''}`} />
+            {pilotCrosshair.shipVisible ? (
+              <div
+                className="pilot-crosshair-ship"
+                style={{ left: `${pilotCrosshair.shipScreenX}px`, top: `${pilotCrosshair.shipScreenY}px` }}
+              />
+            ) : null}
+          </div>
+        ) : null}
+
         <div className="hud-panel">
           <h2>{session.user.username}</h2>
           <div className="hud-grid">
@@ -3028,6 +3080,7 @@ function GameScene({
   remotePlayers,
   sendState,
   setHud,
+  setPilotCrosshair,
   showDebugAnchors,
   shipConfig,
   tabletOpen,
@@ -3051,12 +3104,20 @@ function GameScene({
   remotePlayers: PlayerSnapshot[];
   sendState: (payload: PlayerSnapshot) => void;
   setHud: Dispatch<SetStateAction<HudState>>;
+  setPilotCrosshair: Dispatch<SetStateAction<PilotCrosshairState>>;
   showDebugAnchors: boolean;
   shipConfig: ShipConfig;
   tabletOpen: boolean;
 }): ReactElement {
   const { camera, gl } = useThree();
   const interiorCollision = useShipInteriorCollisionData(shipConfig);
+  const lastPilotCrosshairRef = useRef<PilotCrosshairState>({
+    visible: false,
+    shipVisible: false,
+    shipScreenX: 0,
+    shipScreenY: 0,
+    aligned: false,
+  });
   const pressedKeys = useRef(new Set<string>());
   const actionQueue = useRef(new Set<string>());
   const shipGroupRef = useRef<THREE.Group>(null);
@@ -3507,9 +3568,8 @@ function GameScene({
       camera.quaternion.copy(state.rotation);
     } else {
         const exitPilotSeat = consumeAction('KeyX');
-        const forwardInput =
-          (movementEnabled && keys.has('KeyW') ? 1 : 0) -
-          (movementEnabled && keys.has('KeyS') ? 1 : 0);
+        const forwardInput = movementEnabled && keys.has('KeyW') ? 1 : 0;
+        const brakingInput = movementEnabled && keys.has('KeyS');
         const lateralInput =
           (movementEnabled && keys.has('KeyD') ? 1 : 0) -
           (movementEnabled && keys.has('KeyA') ? 1 : 0);
@@ -3517,7 +3577,7 @@ function GameScene({
           (movementEnabled && keys.has('Space') ? 1 : 0) -
           (movementEnabled && (keys.has('ShiftLeft') || keys.has('ShiftRight')) ? 1 : 0);
         
-        const hasThrustInput = forwardInput !== 0 || lateralInput !== 0 || verticalInput !== 0;
+        const hasThrustInput = forwardInput !== 0 || brakingInput || lateralInput !== 0 || verticalInput !== 0;
         const hasManualPilotInput = hasThrustInput;
 
         if (exitPilotSeat) {
@@ -3574,8 +3634,13 @@ function GameScene({
             if (effectiveForwardInput > 0) {
               state.shipVelocity.addScaledVector(shipForward, effectiveForwardInput * SHIP_MANUAL_FORWARD_THRUST * accelMul * dt);
             }
-            if (effectiveForwardInput < 0) {
-              state.shipVelocity.addScaledVector(shipForward, effectiveForwardInput * SHIP_MANUAL_REVERSE_THRUST * accelMul * dt);
+            if (brakingInput) {
+              const forwardSpeed = state.shipVelocity.dot(shipForward);
+              const brakingDelta = SHIP_MANUAL_REVERSE_THRUST * accelMul * dt;
+              const nextForwardSpeed = forwardSpeed > 0
+                ? Math.max(0, forwardSpeed - brakingDelta)
+                : Math.min(0, forwardSpeed + brakingDelta);
+              state.shipVelocity.addScaledVector(shipForward, nextForwardSpeed - forwardSpeed);
             }
             if (lateralInput !== 0) {
               state.shipVelocity.addScaledVector(shipRight, lateralInput * SHIP_MANUAL_STRAFE_THRUST * accelMul * dt);
@@ -3699,6 +3764,49 @@ function GameScene({
       interiorGroupRef.current.visible = state.mode === 'interior';
       interiorGroupRef.current.position.copy(state.shipPosition);
       interiorGroupRef.current.quaternion.copy(state.shipRotation);
+    }
+
+    if (state.mode === 'pilot') {
+      const shipForwardPoint = state.shipPosition.clone().add(
+        new THREE.Vector3(0, 0, -2000).applyQuaternion(state.shipRotation),
+      );
+      const shipMarker = projectWorldPointToScreen(
+        shipForwardPoint,
+        camera,
+        gl.domElement.clientWidth,
+        gl.domElement.clientHeight,
+      );
+      const viewportCenterX = gl.domElement.clientWidth / 2;
+      const viewportCenterY = gl.domElement.clientHeight / 2;
+      const nextPilotCrosshair: PilotCrosshairState = {
+        visible: !tabletOpen,
+        shipVisible: shipMarker.visible,
+        shipScreenX: shipMarker.x,
+        shipScreenY: shipMarker.y,
+        aligned: shipMarker.visible && Math.hypot(shipMarker.x - viewportCenterX, shipMarker.y - viewportCenterY) <= 10,
+      };
+      const lastPilotCrosshair = lastPilotCrosshairRef.current;
+
+      if (
+        lastPilotCrosshair.visible !== nextPilotCrosshair.visible
+        || lastPilotCrosshair.shipVisible !== nextPilotCrosshair.shipVisible
+        || lastPilotCrosshair.aligned !== nextPilotCrosshair.aligned
+        || Math.abs(lastPilotCrosshair.shipScreenX - nextPilotCrosshair.shipScreenX) > 0.5
+        || Math.abs(lastPilotCrosshair.shipScreenY - nextPilotCrosshair.shipScreenY) > 0.5
+      ) {
+        lastPilotCrosshairRef.current = nextPilotCrosshair;
+        setPilotCrosshair(nextPilotCrosshair);
+      }
+    } else if (lastPilotCrosshairRef.current.visible) {
+      const hiddenPilotCrosshair: PilotCrosshairState = {
+        visible: false,
+        shipVisible: false,
+        shipScreenX: lastPilotCrosshairRef.current.shipScreenX,
+        shipScreenY: lastPilotCrosshairRef.current.shipScreenY,
+        aligned: false,
+      };
+      lastPilotCrosshairRef.current = hiddenPilotCrosshair;
+      setPilotCrosshair(hiddenPilotCrosshair);
     }
 
     if (now - state.lastNetworkAt > 66) {
@@ -5327,10 +5435,10 @@ function AutopilotTargetTag({ target, renderPosition, localStateRef }: { target:
   // We use bodyCenter except if it happens to be not provided, fallback to localPosition
   const pos = target.bodyCenter || target.localPosition;
   const targetPosition = useMemo(() => new THREE.Vector3(...tupleAdd(renderPosition, pos)), [pos, renderPosition]);
-  const [distanceLabel, setDistanceLabel] = useState(() => formatDistance(targetPosition.distanceTo(localStateRef.current.shipPosition)));
+  const [distanceLabel, setDistanceLabel] = useState(() => formatDistance(targetPosition.distanceTo(localStateRef.current.position)));
 
   useFrame(() => {
-    const nextLabel = formatDistance(targetPosition.distanceTo(localStateRef.current.shipPosition));
+    const nextLabel = formatDistance(targetPosition.distanceTo(localStateRef.current.position));
     setDistanceLabel((current) => (current === nextLabel ? current : nextLabel));
   });
   
@@ -5352,22 +5460,26 @@ function AutopilotTargetTag({ target, renderPosition, localStateRef }: { target:
 
 function ShipHighlightTag({ target, localStateRef }: { target: HighlightTarget; localStateRef: MutableRefObject<LocalGameState> }) {
   const groupRef = useRef<THREE.Group>(null);
-  const [distanceLabel, setDistanceLabel] = useState(() => formatDistance(localStateRef.current.position.distanceTo(localStateRef.current.shipPosition)));
+  const targetPosition = useMemo(
+    () => new THREE.Vector3(...(target.bodyCenter || target.localPosition)),
+    [target.bodyCenter, target.localPosition],
+  );
+  const [distanceLabel, setDistanceLabel] = useState(() => formatDistance(localStateRef.current.position.distanceTo(targetPosition)));
 
   useFrame(() => {
     if (groupRef.current) {
       groupRef.current.position.set(
-        localStateRef.current.shipPosition.x,
-        localStateRef.current.shipPosition.y + 4,
-        localStateRef.current.shipPosition.z,
+        targetPosition.x,
+        targetPosition.y + 4,
+        targetPosition.z,
       );
     }
-    const nextLabel = formatDistance(localStateRef.current.position.distanceTo(localStateRef.current.shipPosition));
+    const nextLabel = formatDistance(localStateRef.current.position.distanceTo(targetPosition));
     setDistanceLabel((current) => (current === nextLabel ? current : nextLabel));
   });
 
   return (
-    <group ref={groupRef} position={[localStateRef.current.shipPosition.x, localStateRef.current.shipPosition.y + 4, localStateRef.current.shipPosition.z]}>
+    <group ref={groupRef} position={[targetPosition.x, targetPosition.y + 4, targetPosition.z]}>
       <Html center zIndexRange={[1, 0]}>
         <div className="cyber-target-tag">
           <div className="cyber-line-top"></div>
@@ -5390,6 +5502,8 @@ function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system
   const intersections = useMemo<THREE.Intersection[]>(() => [], []);
   const worldPosition = useMemo(() => new THREE.Vector3(...renderPosition), [renderPosition]);
   const projectedPosition = useMemo(() => new THREE.Vector3(), []);
+  const cameraForward = useMemo(() => new THREE.Vector3(), []);
+  const toStarDirection = useMemo(() => new THREE.Vector3(), []);
   const lastOcclusionCheckRef = useRef(0);
   const haloOccludedRef = useRef(false);
 
@@ -5399,9 +5513,12 @@ function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system
     }
 
     projectedPosition.copy(worldPosition).project(camera);
+    camera.getWorldDirection(cameraForward);
+    toStarDirection.copy(worldPosition).sub(camera.position).normalize();
     const distance = worldPosition.distanceTo(camera.position);
     const inBodyRange = distance <= LOCAL_STAR_BODY_VISIBILITY_RANGE;
-    const frontFactor = THREE.MathUtils.clamp(1 - Math.max(0, Math.abs(projectedPosition.z) - 0.92) / 0.55, 0, 1);
+    const inFront = cameraForward.dot(toStarDirection) > 0;
+    const frontFactor = inFront ? 1 : 0;
     const edgeDistance = Math.max(Math.abs(projectedPosition.x), Math.abs(projectedPosition.y));
     const edgeFactor = THREE.MathUtils.clamp(1 - Math.max(0, edgeDistance - 0.82) / 0.78, 0, 1);
 
@@ -5477,19 +5594,14 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
   const groupRef = useRef<THREE.Group>(null);
   const coreSpriteRef = useRef<THREE.Sprite>(null);
   const haloSpriteRef = useRef<THREE.Sprite>(null);
-  const ghostOneRef = useRef<THREE.Sprite>(null);
-  const ghostTwoRef = useRef<THREE.Sprite>(null);
-  const ghostThreeRef = useRef<THREE.Sprite>(null);
   const coreMaterialRef = useRef<THREE.SpriteMaterial>(null);
   const haloMaterialRef = useRef<THREE.SpriteMaterial>(null);
-  const ghostOneMaterialRef = useRef<THREE.SpriteMaterial>(null);
-  const ghostTwoMaterialRef = useRef<THREE.SpriteMaterial>(null);
-  const ghostThreeMaterialRef = useRef<THREE.SpriteMaterial>(null);
   const flareTexture = useMemo(() => createLensFlareTexture(), []);
   const worldPosition = useMemo(() => new THREE.Vector3(...starPosition), [starPosition]);
   const projectedPosition = useMemo(() => new THREE.Vector3(), []);
   const screenPosition = useMemo(() => new THREE.Vector3(), []);
-  const ghostOffset = useMemo(() => new THREE.Vector2(), []);
+  const cameraForward = useMemo(() => new THREE.Vector3(), []);
+  const toStarDirection = useMemo(() => new THREE.Vector3(), []);
   const raycaster = useMemo(() => new THREE.Raycaster(), []);
   const intersections = useMemo<THREE.Intersection[]>(() => [], []);
   const lastOcclusionCheckRef = useRef(0);
@@ -5506,22 +5618,19 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
       !groupRef.current ||
       !coreSpriteRef.current ||
       !haloSpriteRef.current ||
-      !ghostOneRef.current ||
-      !ghostTwoRef.current ||
-      !ghostThreeRef.current ||
       !coreMaterialRef.current ||
-      !haloMaterialRef.current ||
-      !ghostOneMaterialRef.current ||
-      !ghostTwoMaterialRef.current ||
-      !ghostThreeMaterialRef.current
+      !haloMaterialRef.current
     ) {
       return;
     }
 
     projectedPosition.copy(worldPosition).project(camera);
+    camera.getWorldDirection(cameraForward);
+    toStarDirection.copy(worldPosition).sub(camera.position).normalize();
     const distance = worldPosition.distanceTo(camera.position);
     const inRange = distance <= STAR_LENS_FLARE_RANGE;
-    const frontFactor = THREE.MathUtils.clamp(1 - Math.max(0, Math.abs(projectedPosition.z) - 0.92) / 0.65, 0, 1);
+    const inFront = cameraForward.dot(toStarDirection) > 0;
+    const frontFactor = inFront ? 1 : 0;
     const edgeDistance = Math.max(Math.abs(projectedPosition.x), Math.abs(projectedPosition.y));
     const edgeFactor = THREE.MathUtils.clamp(1 - Math.max(0, edgeDistance - 0.8) / 0.95, 0, 1);
     const couldBeVisible = inRange && frontFactor > 0 && edgeFactor > 0;
@@ -5552,11 +5661,6 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
     coreSpriteRef.current.position.copy(screenPosition);
     haloSpriteRef.current.position.copy(screenPosition);
 
-    ghostOffset.set(baseX, baseY);
-    ghostOneRef.current.position.set(-ghostOffset.x * 0.35, -ghostOffset.y * 0.35, -planeDistance);
-    ghostTwoRef.current.position.set(-ghostOffset.x * 0.72, -ghostOffset.y * 0.72, -planeDistance);
-    ghostThreeRef.current.position.set(ghostOffset.x * 0.42, ghostOffset.y * 0.42, -planeDistance);
-
     const distanceFactor = THREE.MathUtils.clamp(1 - distance / STAR_LENS_FLARE_RANGE, 0, 1);
     const closeBoost = distanceFactor;
     const viewFactor = THREE.MathUtils.clamp(0.12 + edgeFactor * 0.88, 0, 1) * frontFactor;
@@ -5567,17 +5671,11 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
 
     coreMaterialRef.current.opacity = opacity;
     haloMaterialRef.current.opacity = opacity * 0.68;
-    ghostOneMaterialRef.current.opacity = opacity * 0.54;
-    ghostTwoMaterialRef.current.opacity = opacity * 0.36;
-    ghostThreeMaterialRef.current.opacity = opacity * 0.24;
 
     const starScale = THREE.MathUtils.clamp(starRadius * 0.00012, 0.045, 0.12);
     const flareScale = starScale * (1.2 + distanceFactor * 0.7 + closeBoost * 0.95 + screenFactor * 0.45);
     coreSpriteRef.current.scale.setScalar(flareScale);
     haloSpriteRef.current.scale.setScalar(flareScale * 3.8);
-    ghostOneRef.current.scale.setScalar(flareScale * 1.0);
-    ghostTwoRef.current.scale.setScalar(flareScale * 1.45);
-    ghostThreeRef.current.scale.setScalar(flareScale * 0.72);
   });
 
   return (
@@ -5600,42 +5698,6 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
           attach="material"
           map={flareTexture}
           color="#8eb8ff"
-          transparent
-          depthWrite={false}
-          depthTest={false}
-          blending={THREE.AdditiveBlending}
-        />
-      </sprite>
-      <sprite ref={ghostOneRef} userData={{ ignoreStarOcclusion: true, ignoreMarkerOcclusion: true }}>
-        <spriteMaterial
-          ref={ghostOneMaterialRef}
-          attach="material"
-          map={flareTexture}
-          color="#dbeafe"
-          transparent
-          depthWrite={false}
-          depthTest={false}
-          blending={THREE.AdditiveBlending}
-        />
-      </sprite>
-      <sprite ref={ghostTwoRef} userData={{ ignoreStarOcclusion: true, ignoreMarkerOcclusion: true }}>
-        <spriteMaterial
-          ref={ghostTwoMaterialRef}
-          attach="material"
-          map={flareTexture}
-          color="#bfdbfe"
-          transparent
-          depthWrite={false}
-          depthTest={false}
-          blending={THREE.AdditiveBlending}
-        />
-      </sprite>
-      <sprite ref={ghostThreeRef} userData={{ ignoreStarOcclusion: true, ignoreMarkerOcclusion: true }}>
-        <spriteMaterial
-          ref={ghostThreeMaterialRef}
-          attach="material"
-          map={flareTexture}
-          color="#f8fafc"
           transparent
           depthWrite={false}
           depthTest={false}
