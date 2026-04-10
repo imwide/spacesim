@@ -245,6 +245,56 @@ button {
   backdrop-filter: blur(4px);
 }
 
+.hud-interaction-pills {
+  position: absolute;
+  left: 1.25rem;
+  bottom: 1.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  max-width: min(50vw, 560px);
+}
+
+.hud-interaction-pill {
+  position: relative;
+  padding: 0.46rem 0.78rem;
+  border: 1px solid rgba(14, 165, 233, 0.32);
+  background: rgba(4, 20, 36, 0.58);
+  box-shadow: 0 0 18px rgba(14, 165, 233, 0.06);
+  backdrop-filter: blur(6px);
+  color: #dff7ff;
+  font-family: monospace;
+  font-size: 0.76rem;
+  letter-spacing: 0.12rem;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+.hud-interaction-pill::before,
+.hud-interaction-pill::after {
+  content: '';
+  position: absolute;
+  border-color: rgba(14, 165, 233, 0.75);
+  border-style: solid;
+}
+
+.hud-interaction-pill::before {
+  top: -0.38rem;
+  left: -0.65rem;
+  width: 0.85rem;
+  height: 0.65rem;
+  border-width: 1px 0 0 1px;
+  transform: skewX(-38deg);
+}
+
+.hud-interaction-pill::after {
+  right: -0.45rem;
+  bottom: -0.26rem;
+  width: 0.7rem;
+  height: 0.5rem;
+  border-width: 0 1px 1px 0;
+}
+
 @keyframes calm-tech-blink {
   0%,
   100% {

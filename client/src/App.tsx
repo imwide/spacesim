@@ -172,6 +172,7 @@ interface HudState {
   prompt: string;
   playersOnline: number;
   speedLimitNotice: string;
+  interactionPills: Array<{ key: string; label: string }>;
 }
 
 interface StationNode {
@@ -205,6 +206,15 @@ interface AutopilotDestination {
   interstellarWaypoint?: Vec3Tuple;
   // performance.now() timestamp (ms) at which fast-travel should trigger.
   interstellarArrivalAt?: number;
+}
+
+interface HighlightTarget {
+  id: string;
+  name: string;
+  kind: string;
+  systemId: string;
+  localPosition: Vec3Tuple;
+  bodyCenter: Vec3Tuple;
 }
 
 interface AutopilotObstacle {
@@ -2159,6 +2169,52 @@ function createLocalState(frameSystemId: string): LocalGameState {
   };
 }
 
+function createRandomStationSpawnOffset(maxRadius = 500): THREE.Vector3 {
+  const minPolarAngleFromUp = THREE.MathUtils.degToRad(40);
+
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    const radius = Math.cbrt(Math.random()) * maxRadius;
+    const azimuth = Math.random() * Math.PI * 2;
+    const polarFromUp = minPolarAngleFromUp + Math.random() * (Math.PI / 2 - minPolarAngleFromUp);
+    const sinPolar = Math.sin(polarFromUp);
+    const cosPolar = Math.cos(polarFromUp);
+
+    const offset = new THREE.Vector3(
+      Math.cos(azimuth) * radius * sinPolar,
+      radius * cosPolar,
+      Math.sin(azimuth) * radius * sinPolar,
+    );
+
+    if (offset.y >= 0) {
+      return offset;
+    }
+  }
+
+  return new THREE.Vector3(maxRadius * 0.5, maxRadius * 0.2, 0);
+}
+
+function initializeHomeSpawnState(state: LocalGameState, homeSystemId: string, homeStationPosition: Vec3Tuple, shipConfig: ShipConfig): void {
+  const spawnOffset = createRandomStationSpawnOffset(500);
+
+  state.frameSystemId = homeSystemId;
+  state.frameOrigin.set(...homeStationPosition);
+  state.mode = 'interior';
+  state.insideShip = true;
+  state.position.copy(spawnOffset);
+  state.velocity.set(0, 0, 0);
+  state.rotation.identity();
+  state.shipPosition.copy(spawnOffset);
+  state.shipVelocity.set(0, 0, 0);
+  state.shipAngularVelocity.set(0, 0, 0);
+  state.shipRotation.identity();
+  state.interiorPosition.copy(shipConfig.insideSpawnVec);
+  state.interiorVelocity.set(0, 0, 0);
+  state.yaw = 0;
+  state.pitch = 0;
+  state.lastHudAt = 0;
+  state.lastNetworkAt = 0;
+}
+
 function hydrateLocalState(target: LocalGameState, snapshot: PlayerSnapshot): void {
   target.frameSystemId = snapshot.frameSystemId;
   target.frameOrigin.set(...snapshot.frameOrigin);
@@ -2353,6 +2409,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
   const [autopilotDestination, setAutopilotDestination] = useState<AutopilotDestination | null>(null);
   const [autopilotEngaged, setAutopilotEngaged] = useState(false);
   const [autopilotReachedDestinationId, setAutopilotReachedDestinationId] = useState('');
+  const [highlightedTarget, setHighlightedTarget] = useState<HighlightTarget | null>(null);
   const [autopilotStatus, setAutopilotStatus] = useState('Select a destination from inside the ship to engage autopilot.');
   const [hud, setHud] = useState<HudState>({
     connected: false,
@@ -2362,6 +2419,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     prompt: 'Connecting to the sector…',
     playersOnline: 1,
     speedLimitNotice: '',
+    interactionPills: [],
   });
   const activeSystem = useMemo(
     () => galaxy.systems.find((system) => system.id === activeSystemId) ?? null,
@@ -2430,10 +2488,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     }
 
     const state = localStateRef.current;
-    state.frameSystemId = homeStation.systemId;
-    state.frameOrigin.set(...homeStation.localPosition);
-    state.position.set(0, 0, 10);
-    state.shipPosition.set(0, 0, 0);
+    initializeHomeSpawnState(state, homeStation.systemId, homeStation.localPosition, _defaultShip);
     setActiveSystemId(homeStation.systemId);
     setActiveFrameOrigin(homeStation.localPosition);
   }, [homeStation]);
@@ -2482,9 +2537,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
 
         if (homeStation && self.frameSystemId === homeStation.systemId && self.frameOrigin.every((value) => Math.abs(value) < 1e-3)) {
           const state = localStateRef.current;
-          state.frameOrigin.set(...homeStation.localPosition);
-          state.position.set(0, 0, 10);
-          state.shipPosition.set(0, 0, 0);
+          initializeHomeSpawnState(state, homeStation.systemId, homeStation.localPosition, _defaultShip);
           setActiveFrameOrigin(homeStation.localPosition);
           sendState(createStationSnapshot(state));
         }
@@ -2604,6 +2657,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           autopilotActive={autopilotEngaged}
           autopilotDestination={autopilotDestination}
             activeAutopilotTarget={autopilotDestination?.id !== autopilotReachedDestinationId ? autopilotDestination : null}
+          highlightedTarget={highlightedTarget}
           autopilotEtaLabel={autopilotEtaLabel}
           autopilotObstacles={autopilotObstacles}
           activeSystemId={activeSystemId}
@@ -2669,6 +2723,16 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
 
         {hud.speedLimitNotice ? <div className="hud-speed-limit-banner">{hud.speedLimitNotice}</div> : null}
 
+        {hud.interactionPills.length ? (
+          <div className="hud-interaction-pills">
+            {hud.interactionPills.map((pill) => (
+              <div className="hud-interaction-pill" key={pill.key}>
+                {pill.label}
+              </div>
+            ))}
+          </div>
+        ) : null}
+
         <InventoryHud slots={inventorySlots} />
 
         {teleporting && (
@@ -2688,10 +2752,12 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           autopilotDestinationId={autopilotDestination?.id || ''}
           autopilotEngaged={autopilotEngaged}
           galaxy={galaxy}
+          highlightedTargetId={highlightedTarget?.id ?? ''}
           hudMode={hud.mode}
           lastTravelledId={autopilotReachedDestinationId}
           network={stationNetwork}
           onClose={() => setTabletOpen(false)}
+          onHighlightTarget={setHighlightedTarget}
           onStopAutopilot={() => {
             resetLongDistanceState();
             setAutopilotEngaged(false);
@@ -2729,6 +2795,7 @@ function GameScene({
   autopilotActive,
   autopilotDestination,
   activeAutopilotTarget,
+  highlightedTarget,
   autopilotEtaLabel,
   autopilotObstacles,
   activeSystemId,
@@ -2750,6 +2817,7 @@ function GameScene({
   autopilotActive: boolean;
   autopilotDestination: AutopilotDestination | null;
   activeAutopilotTarget: AutopilotDestination | null;
+  highlightedTarget: HighlightTarget | null;
   autopilotEtaLabel: string;
   autopilotObstacles: AutopilotObstacle[];
   activeSystemId: string;
@@ -3218,22 +3286,28 @@ function GameScene({
             onAutopilotStatusChange('Autopilot disengaged. Manual control active.');
           }
 
-const turnSpeed = 1.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
-            const angleToTarget = state.shipRotation.angleTo(lookRotation);
-            
-            // Calculate a roll (lean) based on how far we need to turn horizontally
-            const targetForward = new THREE.Vector3(0, 0, -1).applyQuaternion(lookRotation);
-            const shipRightTemp = new THREE.Vector3(1, 0, 0).applyQuaternion(state.shipRotation);
-            const dotX = targetForward.dot(shipRightTemp);
-            const maxRoll = Math.PI / 4; // 45 degrees max lean
-            const targetRoll = -dotX * maxRoll;
-            
-            // Combine camera look direction with local Z-roll
-            const rollQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), targetRoll);
-            const shipTargetRotation = lookRotation.clone().multiply(rollQuat);
+            const alignToCamera = movementEnabled && keys.has('KeyW');
+            let angleToTarget = 0;
 
-            state.shipRotation.slerp(shipTargetRotation, Math.min(1, turnSpeed));
-            state.shipAngularVelocity.set(0, 0, 0);
+            if (alignToCamera) {
+              const turnSpeed = 1.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
+              angleToTarget = state.shipRotation.angleTo(lookRotation);
+
+              // Calculate a roll (lean) based on how far we need to turn horizontally
+              const targetForward = new THREE.Vector3(0, 0, -1).applyQuaternion(lookRotation);
+              const shipRightTemp = new THREE.Vector3(1, 0, 0).applyQuaternion(state.shipRotation);
+              const dotX = targetForward.dot(shipRightTemp);
+              const maxRoll = Math.PI / 4; // 45 degrees max lean
+              const targetRoll = -dotX * maxRoll;
+
+              // Combine camera look direction with local Z-roll
+              const rollQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), targetRoll);
+              const shipTargetRotation = lookRotation.clone().multiply(rollQuat);
+
+              state.shipRotation.slerp(shipTargetRotation, Math.min(1, turnSpeed));
+              state.shipAngularVelocity.set(0, 0, 0);
+            }
+
             state.rotation.copy(state.shipRotation);
 
             const accelMul = shipConfig.accelerationMultiplier;
@@ -3245,7 +3319,7 @@ const turnSpeed = 1.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
             // Starts fading out thrust at 120 degrees (2*PI/3) and zeroes it towards 180 degrees.
             const startBrakeAngle = (2 * Math.PI) / 3;
             let forwardAlignmentMultiplier = 1.0;
-            if (angleToTarget > startBrakeAngle) {
+            if (alignToCamera && angleToTarget > startBrakeAngle) {
               const maxAngleRemaining = Math.PI - startBrakeAngle;
               forwardAlignmentMultiplier = Math.max(0, 1 - ((angleToTarget - startBrakeAngle) / maxAngleRemaining));
             }
@@ -3272,7 +3346,7 @@ const turnSpeed = 1.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
             
             // Also apply some braking to forward velocity for sharp turns (> 120 deg) so the ship doesn't fly off too far
             let turnBraking = 0;
-            if (angleToTarget > startBrakeAngle) {
+            if (alignToCamera && angleToTarget > startBrakeAngle) {
               const maxAngleRemaining = Math.PI - startBrakeAngle;
               turnBraking = Math.min(1, (angleToTarget - startBrakeAngle) / maxAngleRemaining) * 4.0;
             }
@@ -3404,6 +3478,19 @@ const turnSpeed = 1.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
           )
         : { maxSpeed: SHIP_MAX_SPEED_METERS_PER_SECOND * shipConfig.speedMultiplier, active: false };
       const speedLimitNotice = stationSpeedLimitInfo.active ? 'STATION TRAFFIC FIELD · VELOCITY LIMITED' : '';
+      const interactionPills: Array<{ key: string; label: string }> = [];
+      if (canEnter) {
+        interactionPills.push({
+          key: 'enter-ship',
+          label: state.mode === 'planet-surface' ? 'E · BOARD SHIP' : 'E · ENTER SHIP',
+        });
+      }
+      if (canPilot) {
+        interactionPills.push({
+          key: 'pilot-seat',
+          label: 'F · ENTER PILOT SEAT',
+        });
+      }
 
       let prompt = pointerLocked
         ? 'WASD to move, Space/Shift for vertical thrust. Momentum is preserved.'
@@ -3445,6 +3532,7 @@ const turnSpeed = 1.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
         prompt,
         playersOnline,
         speedLimitNotice,
+        interactionPills,
       }));
       state.lastHudAt = now;
     }
@@ -3452,11 +3540,14 @@ const turnSpeed = 1.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
 
   return (
     <>
-      <GalaxyBackdrop activeFrameOrigin={activeFrameOrigin} activeSystemId={activeSystemId} galaxy={galaxy} autopilotTarget={activeAutopilotTarget} localStateRef={localStateRef} />
+      <GalaxyBackdrop activeFrameOrigin={activeFrameOrigin} activeSystemId={activeSystemId} galaxy={galaxy} autopilotTarget={activeAutopilotTarget} highlightedTarget={highlightedTarget} localStateRef={localStateRef} />
       <WarpSpeedEffect localStateRef={localStateRef} />
       <group ref={shipGroupRef}>
         <ShipExteriorModel config={shipConfig} highlight />
       </group>
+      {highlightedTarget?.kind === 'ship' && (mode === 'space' || mode === 'planet-surface') ? (
+        <ShipHighlightTag target={highlightedTarget} localStateRef={localStateRef} />
+      ) : null}
       <group ref={interiorGroupRef} visible={false}>
         <ShipInteriorModel config={shipConfig} />
       </group>
@@ -3755,11 +3846,13 @@ function SpaceTablet({
   autopilotDestinationId,
   autopilotEngaged,
   galaxy,
+  highlightedTargetId,
   hudMode,
   lastTravelledId,
   network,
   onClose,
   onEngageAutopilot,
+  onHighlightTarget,
   onStopAutopilot,
   onTravel,
 }: {
@@ -3768,11 +3861,13 @@ function SpaceTablet({
   autopilotDestinationId: string;
   autopilotEngaged: boolean;
   galaxy: GalaxyData;
+  highlightedTargetId: string;
   hudMode: Mode;
   lastTravelledId: string;
   network: StationNode[];
   onClose: () => void;
   onEngageAutopilot: (dest: AutopilotDestination) => void;
+  onHighlightTarget: Dispatch<SetStateAction<HighlightTarget | null>>;
   onStopAutopilot: () => void;
   onTravel: (station: StationNode) => void;
   shipPosition?: [number, number, number];
@@ -4452,6 +4547,14 @@ function SpaceTablet({
   );
   const selectedCanTravel = Boolean((hudMode === 'space' || hudMode === 'planet-surface') && selectedStationNode);
   const selectedAutopilotActive = Boolean(autopilotEngaged && selectedMarker && autopilotDestinationId === selectedMarker.id);
+  const selectedHighlightActive = Boolean(selectedMarker && highlightedTargetId === selectedMarker.id);
+  const selectedCanHighlight = Boolean(
+    selectedMarker &&
+      selectedMarker.kind !== 'system' &&
+      selectedMarker.localPosition &&
+      selectedMarker.systemId === activeSystemId &&
+      (selectedMarker.kind !== 'ship' || hudMode === 'space' || hudMode === 'planet-surface'),
+  );
 
   const buildDestination = useCallback(
     (marker: SpaceTabletMarker): AutopilotDestination | null => {
@@ -4522,6 +4625,24 @@ function SpaceTablet({
       };
     },
     [shipAbsolutePosition],
+  );
+
+  const buildHighlightTarget = useCallback(
+    (marker: SpaceTabletMarker): HighlightTarget | null => {
+      if (!marker.localPosition || marker.kind === 'system') {
+        return null;
+      }
+
+      return {
+        id: marker.id,
+        name: marker.name,
+        kind: marker.kind,
+        systemId: marker.systemId,
+        localPosition: marker.localPosition,
+        bodyCenter: marker.localPosition,
+      };
+    },
+    [],
   );
 
   const selectedVisibleMarker = visibleMarkerLookup.get(selectedStationId) ?? visibleMarkerLookup.get(selectedMarker?.id ?? '');
@@ -4716,6 +4837,13 @@ function SpaceTablet({
                     ? estimateAutopilotEtaSeconds(etaDistance, marker.approachRadius, shipSpeed, marker.systemId !== activeSystemId)
                     : null;
                   const isAutopilotTarget = autopilotEngaged && autopilotDestinationId === marker.id;
+                  const isHighlightedTarget = highlightedTargetId === marker.id;
+                  const canHighlight = Boolean(
+                    marker.kind !== 'system' &&
+                    marker.localPosition &&
+                    marker.systemId === activeSystemId &&
+                    (marker.kind !== 'ship' || hudMode === 'space' || hudMode === 'planet-surface'),
+                  );
 
                   return (
                     <div
@@ -4773,6 +4901,22 @@ function SpaceTablet({
                                 {isAutopilotTarget ? 'Stop autopilot' : 'Engage autopilot'}
                               </button>
                             ) : null}
+
+                            {canHighlight ? (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (isHighlightedTarget) {
+                                    onHighlightTarget(null);
+                                  } else {
+                                    onHighlightTarget(buildHighlightTarget(marker));
+                                  }
+                                }}
+                                type="button"
+                              >
+                                {isHighlightedTarget ? 'Clear highlight' : 'Highlight'}
+                              </button>
+                            ) : null}
                           </div>
                         </div>
                       ) : null}
@@ -4821,12 +4965,14 @@ function GalaxyBackdrop({
   activeFrameOrigin,
   activeSystemId,
   autopilotTarget,
+  highlightedTarget,
   galaxy,
   localStateRef,
 }: {
   activeFrameOrigin: Vec3Tuple;
   activeSystemId: string;
   autopilotTarget: AutopilotDestination | null;
+  highlightedTarget: HighlightTarget | null;
   galaxy: GalaxyData;
   localStateRef: MutableRefObject<LocalGameState>;
 }): ReactElement {
@@ -4836,7 +4982,7 @@ function GalaxyBackdrop({
   return (
     <group>
       <GalaxyStarMarkers activeSystemId={activeSystemId} activeSystemPosition={activeSystemPosition} galaxy={galaxy} />
-      {activeSystem ? <StarSystem autopilotTarget={autopilotTarget} renderPosition={toFrameLocalPosition([0, 0, 0], activeFrameOrigin)} system={activeSystem} localStateRef={localStateRef} /> : null}
+      {activeSystem ? <StarSystem autopilotTarget={autopilotTarget} highlightedTarget={highlightedTarget} renderPosition={toFrameLocalPosition([0, 0, 0], activeFrameOrigin)} system={activeSystem} localStateRef={localStateRef} /> : null}
     </group>
   );
 }
@@ -4931,7 +5077,7 @@ function getStarScreenRadiusNdc(camera: THREE.Camera, distance: number, starRadi
 }
 
 
-function AutopilotTargetTag({ target, renderPosition, localStateRef }: { target: AutopilotDestination; renderPosition: Vec3Tuple; localStateRef: MutableRefObject<LocalGameState> }) {
+function AutopilotTargetTag({ target, renderPosition, localStateRef }: { target: Pick<HighlightTarget, 'name' | 'localPosition' | 'bodyCenter'>; renderPosition: Vec3Tuple; localStateRef: MutableRefObject<LocalGameState> }) {
   // We use bodyCenter except if it happens to be not provided, fallback to localPosition
   const pos = target.bodyCenter || target.localPosition;
   const targetPosition = useMemo(() => new THREE.Vector3(...tupleAdd(renderPosition, pos)), [pos, renderPosition]);
@@ -4958,7 +5104,39 @@ function AutopilotTargetTag({ target, renderPosition, localStateRef }: { target:
   );
 }
 
-function StarSystem({ autopilotTarget, renderPosition, system, localStateRef }: { autopilotTarget: AutopilotDestination | null; renderPosition: Vec3Tuple; system: StarSystemData; localStateRef: MutableRefObject<LocalGameState> }): ReactElement {
+function ShipHighlightTag({ target, localStateRef }: { target: HighlightTarget; localStateRef: MutableRefObject<LocalGameState> }) {
+  const groupRef = useRef<THREE.Group>(null);
+  const [distanceLabel, setDistanceLabel] = useState(() => formatDistance(localStateRef.current.position.distanceTo(localStateRef.current.shipPosition)));
+
+  useFrame(() => {
+    if (groupRef.current) {
+      groupRef.current.position.set(
+        localStateRef.current.shipPosition.x,
+        localStateRef.current.shipPosition.y + 4,
+        localStateRef.current.shipPosition.z,
+      );
+    }
+    const nextLabel = formatDistance(localStateRef.current.position.distanceTo(localStateRef.current.shipPosition));
+    setDistanceLabel((current) => (current === nextLabel ? current : nextLabel));
+  });
+
+  return (
+    <group ref={groupRef} position={[localStateRef.current.shipPosition.x, localStateRef.current.shipPosition.y + 4, localStateRef.current.shipPosition.z]}>
+      <Html center zIndexRange={[1, 0]}>
+        <div className="cyber-target-tag">
+          <div className="cyber-line-top"></div>
+          <div className="cyber-content">
+            <div className="cyber-id">{distanceLabel}</div>
+            <div className="cyber-name">{target.name.toUpperCase()}</div>
+          </div>
+          <div className="cyber-line-bottom"></div>
+        </div>
+      </Html>
+    </group>
+  );
+}
+
+function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system, localStateRef }: { autopilotTarget: AutopilotDestination | null; highlightedTarget: HighlightTarget | null; renderPosition: Vec3Tuple; system: StarSystemData; localStateRef: MutableRefObject<LocalGameState> }): ReactElement {
   const { camera, scene } = useThree();
   const haloRef = useRef<THREE.Mesh>(null);
   const haloMaterialRef = useRef<THREE.MeshBasicMaterial>(null);
@@ -5035,6 +5213,10 @@ function StarSystem({ autopilotTarget, renderPosition, system, localStateRef }: 
 
       {autopilotTarget && autopilotTarget.systemId === system.id ? (
         <AutopilotTargetTag target={autopilotTarget} renderPosition={renderPosition} localStateRef={localStateRef} />
+      ) : null}
+
+      {highlightedTarget && highlightedTarget.kind !== 'ship' && highlightedTarget.systemId === system.id && highlightedTarget.id !== autopilotTarget?.id ? (
+        <AutopilotTargetTag target={highlightedTarget} renderPosition={renderPosition} localStateRef={localStateRef} />
       ) : null}
 
       {system.asteroidGroups.map((asteroidGroup) => (
