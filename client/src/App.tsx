@@ -3195,48 +3195,22 @@ const turnSpeed = 1.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
             const rollQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), targetRoll);
             const shipTargetRotation = lookRotation.clone().multiply(rollQuat);
 
-            // Compute the target angular velocity to reach shipTargetRotation
-            // We find the difference quaternion and convert it back to an axis-angle
-            const qDiff = state.shipRotation.clone().invert().multiply(shipTargetRotation);
-            // qDiff.w might be negative, which corresponds to the long way around.
-            // We want the shortest path (positive w).
-            if (qDiff.w < 0) {
-              qDiff.w = -qDiff.w;
-              qDiff.x = -qDiff.x;
-              qDiff.y = -qDiff.y;
-              qDiff.z = -qDiff.z;
-            }
-            const angle = 2 * Math.acos(Math.max(-1, Math.min(1, qDiff.w)));
-            const axisSq = qDiff.x * qDiff.x + qDiff.y * qDiff.y + qDiff.z * qDiff.z;
-            let targetAngularVelLocal = new THREE.Vector3(0, 0, 0);
-            if (axisSq > 0.0001) {
-              const sinHalfAngle = Math.sqrt(axisSq);
-              const axis = new THREE.Vector3(qDiff.x, qDiff.y, qDiff.z).divideScalar(sinHalfAngle);
-              // Calculate desired rotational speed based on angle.
-              // Cap the maximum target rotation speed
-              const targetSpeed = Math.min(angle * 2.0, 1.5 * (shipConfig.turningSpeedMultiplier || 1.0));
-              targetAngularVelLocal = axis.multiplyScalar(targetSpeed);
-            }
-            
-            // Convert local target angular velocity to world space
-            const targetAngularVelWorld = targetAngularVelLocal.applyQuaternion(state.shipRotation);
+            state.shipRotation.slerp(shipTargetRotation, Math.min(1, turnSpeed));
+            state.shipAngularVelocity.set(0, 0, 0);
+            state.rotation.copy(state.shipRotation);
 
-            // "Fade in" the rotation by smoothly lerping the current angular velocity
-            // towards the target angular velocity. This creates the "weight/momentum" feel.
-            const angularAcceleration = 3.0 * (shipConfig.turningSpeedMultiplier || 1.0) * dt;
-            state.shipAngularVelocity.lerp(targetAngularVelWorld, Math.min(1, angularAcceleration));
+            const accelMul = shipConfig.accelerationMultiplier;
+            const shipForward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
+            const shipRight = new THREE.Vector3(1, 0, 0).applyQuaternion(state.shipRotation);
+            const shipUp = new THREE.Vector3(0, 1, 0).applyQuaternion(state.shipRotation);
 
-            // Apply the angular velocity directly here so the rotation updates smoothly
-            // instead of instant slerping
-            const deltaRotation = new THREE.Quaternion().setFromEuler(
-              new THREE.Euler(
-                state.shipAngularVelocity.x * dt,
-                state.shipAngularVelocity.y * dt,
-                state.shipAngularVelocity.z * dt,
-                'XYZ',
-              ),
-            );
-            state.shipRotation.multiply(deltaRotation).normalize();
+            // Turn in place: only apply forward thrust if the ship points roughly in the camera's direction.
+            // Starts fading out thrust at 120 degrees (2*PI/3) and zeroes it towards 180 degrees.
+            const startBrakeAngle = (2 * Math.PI) / 3;
+            let forwardAlignmentMultiplier = 1.0;
+            if (angleToTarget > startBrakeAngle) {
+              const maxAngleRemaining = Math.PI - startBrakeAngle;
+              forwardAlignmentMultiplier = Math.max(0, 1 - ((angleToTarget - startBrakeAngle) / maxAngleRemaining));
             }
             const effectiveForwardInput = forwardInput > 0 ? forwardInput * forwardAlignmentMultiplier : forwardInput;
 
