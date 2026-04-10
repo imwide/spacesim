@@ -2,13 +2,8 @@ Make asteroids higher poly. Keep the current poly for a further a way LOD but on
 
 
 
-
-
-
-
-
 Lets overhaul the ship models:
-1. There will be multiple kinds of ships. For now I have only provided one (ship.glb)
+1. There will be multiple kinds of ships. For now I have only provided one (aether.glb) Aether will be the default and starter spaceship.
 2. Ships should be rendered in two layers, that are never visible at the same time: Outside layer (visible when the player is outside of the ship) and inside layer (visible when the player is inside the ship, only displays the insides of the ship, the rooms and co).
 3. For each ship that we will have, there will be a config file that specifies the following things:
 - The name of the ship
