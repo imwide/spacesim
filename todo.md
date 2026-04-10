@@ -15,4 +15,7 @@ To the config file of each ship add two fields that can each be lists of relativ
 
 Instead of spawning the ship inside of the center of the station, make it spawn in a radius of 500m around the station, but at the same or higher height, randomly. Also spawn the player inside of the ship instead of in space
 
-In tghe space tablet, next to the option for engaging the autopilot, add an option to "Highlight" objects which will just cause the Tag to appear like the autopilot tag but without activating the autopilot and also while the player is outside of the ship. If the player is outside of the ship. also add the option to highlight the players ship in order to find it better.
+In the space tablet, next to the option for engaging the autopilot, add an option to "Highlight" objects which will just cause the Tag to appear like the autopilot tag but without activating the autopilot and also while the player is outside of the ship. If the player is outside of the ship. also add the option to highlight the players ship in order to find it better.
+
+
+Add subtle UI pills in the bottom left corner if there is an option to enter a ship or interact somehow for example enter pilot seat.

@@ -4529,15 +4529,9 @@ function SpaceTablet({
   const breadcrumbItems = useMemo(
     () => [
       {
-        key: 'galaxy',
-        label: 'Galaxy',
-        active: mapMode === 'galaxy',
-        onClick: () => setMapMode('galaxy'),
-      },
-      {
         key: 'system',
         label: selectedSystem?.name ?? 'System',
-        active: mapMode === 'system',
+        active: mapMode !== 'sector',
         onClick: () => {
           setSelectedSystemId(selectedSystem?.id ?? activeSystemId);
           setMapMode('system');
@@ -4596,8 +4590,8 @@ function SpaceTablet({
         <div className="tablet-header">
           <div>
             <span className="tablet-eyebrow">Space-Tablet</span>
-            <h3>Galaxy Navigation Grid</h3>
-            <p>Modern tactical map for galaxy travel, in-system routing, and live object tracking.</p>
+            <h3>System Navigation Grid</h3>
+            <p>Modern tactical map for local routing, station access, and live object tracking.</p>
             <div className="tablet-status-row">
               <span className="tablet-status-chip">You are near {currentLocationName}</span>
               <span className="tablet-status-chip">{hudMode === 'space' || hudMode === 'planet-surface' ? 'Fast-travel ready' : 'Autopilot routing online'}</span>
@@ -4627,9 +4621,6 @@ function SpaceTablet({
           <div className="tablet-map-panel">
             <div className="tablet-toolbar">
               <div className="tablet-tab-group">
-                <button className={mapMode === 'galaxy' ? 'tablet-tab-active' : ''} onClick={() => setMapMode('galaxy')} type="button">
-                  Galaxy
-                </button>
                 <button className={mapMode === 'system' ? 'tablet-tab-active' : ''} onClick={() => setMapMode('system')} type="button">
                   System
                 </button>
@@ -4668,8 +4659,8 @@ function SpaceTablet({
               ref={viewportRef}
             >
               <div className="tablet-map-hud">
-                <strong>{mapMode === 'galaxy' ? 'Galaxy overview' : mapMode === 'system' ? `${selectedSystem?.name ?? 'System'} map` : `${sectorFocusMarker?.name ?? 'Sector'} detail`}</strong>
-                <span>{mapMode === 'galaxy' ? 'All star systems and jump routes' : mapMode === 'system' ? 'Clean system overview with stations, worlds, belts, and your live position' : 'Detailed local sector with close-range contacts'}</span>
+                <strong>{mapMode === 'system' ? `${selectedSystem?.name ?? 'System'} map` : `${sectorFocusMarker?.name ?? 'Sector'} detail`}</strong>
+                <span>{mapMode === 'system' ? 'Clean system overview with stations, worlds, belts, and your live position' : 'Detailed local sector with close-range contacts'}</span>
               </div>
 
               <div
@@ -4758,12 +4749,6 @@ function SpaceTablet({
                           {canAutopilot ? <small>{autopilotEtaSeconds !== null ? `ETA ${formatEta(autopilotEtaSeconds)}` : 'ETA unavailable'}</small> : null}
 
                           <div className="tablet-label-actions">
-                            {mapMode === 'galaxy' ? (
-                              <button onClick={(e) => { e.stopPropagation(); focusMarker(marker.id, 'system'); }} type="button">
-                                Zoom in
-                              </button>
-                            ) : null}
-
                             {mapMode === 'system' && (marker.kind === 'star' || marker.kind === 'planet' || marker.kind === 'asteroid-belt') ? (
                               <button onClick={(e) => { e.stopPropagation(); focusMarker(marker.id, 'sector'); }} type="button">
                                 Zoom in
