@@ -16,24 +16,24 @@ const aetherConfig: ShipConfigRaw = {
   exitPoint: [0, 0, 4],
 
   // Where the player appears (ship-local) after boarding.
-  insideSpawnPoint: [0, 1.6, 2.5],
+  insideSpawnPoint: [0, -0.2, 1.3],
 
   // Where the player appears (ship-local offset, applied in world-space) after exiting.
-  outsideSpawnPoint: [0, 0, 9.5],
+  outsideSpawnPoint: [0, 1.5, 1],
 
   // Pilot seat location inside the interior model.
-  pilotSeatPosition: [0, 1.2, -3.2],
+  pilotSeatPosition: [0, -0.4, 0.5],
 
   // Engine exhaust anchors.
   thrusterPositions: [
-    [0.95, 0.1, 4.95],
-    [-0.95, 0.1, 4.95],
+    [0.5, -0.2, 2.1],
+    [-0.5, -0.2, 2.1],
   ],
 
   // Weapon muzzle anchors.
   gunPositions: [
-    [1.95, 0.08, -3.95],
-    [-1.95, 0.08, -3.95],
+    [1.82, -0.2, -1.8],
+    [-1.82, -0.2, -1.8],
   ],
 
   // ── Flight multipliers (1.0 = baseline) ───────────────────────────────

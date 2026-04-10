@@ -1,7 +1,13 @@
 import { Html } from '@react-three/drei';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { type ShipConfig, getShipConfig, DEFAULT_SHIP_ID } from './shipConfig';
-import { ShipExteriorModel, ShipInteriorModel, preloadShipModels } from './ShipModel';
+import {
+  ShipExteriorModel,
+  ShipInteriorModel,
+  preloadShipModels,
+  type ShipInteriorCollisionData,
+  useShipInteriorCollisionData,
+} from './ShipModel';
 import './ships'; // register all ship configs
 
 // Preload the default ship models so GLBs download early
@@ -93,6 +99,11 @@ const PLAYER_COLLISION_RADIUS = 0.46;
 const STATION_COLLISION_RADIUS_FACTOR = 4.25;
 const BOARDING_RADIUS_METERS = 10 * METERS_PER_WORLD_UNIT;
 const SEAT_INTERACTION_DISTANCE_METERS = 1.15 * METERS_PER_WORLD_UNIT;
+const INTERIOR_COLLISION_RADIUS = 0.28;
+const INTERIOR_STEP_HEIGHT = 0.5;
+const INTERIOR_GROUND_SNAP_DISTANCE = 0.22;
+const INTERIOR_CEILING_PADDING = 0.12;
+const INTERIOR_MAX_COLLISION_PASSES = 3;
 
 // ── Legacy constants derived from the default ship config ──────────────────
 // Used by autopilot and other code that doesn't have direct access to the
@@ -943,6 +954,190 @@ function moveBodyWithSceneColliders(
   }
 
   resolveStaticColliderOverlaps(position, velocity, actorRadius, colliders, ignoredColliderIds);
+}
+
+function getInteriorHitNormal(hit: THREE.Intersection<THREE.Object3D>): THREE.Vector3 {
+  return hit.face ? hit.face.normal.clone().normalize() : new THREE.Vector3(0, 1, 0);
+}
+
+function raycastInteriorMeshes(
+  origin: THREE.Vector3,
+  direction: THREE.Vector3,
+  maxDistance: number,
+  collision: ShipInteriorCollisionData,
+  predicate?: (hit: THREE.Intersection<THREE.Object3D>, normal: THREE.Vector3) => boolean,
+): THREE.Intersection<THREE.Object3D> | null {
+  if (!collision.colliderMeshes.length || maxDistance <= 0) {
+    return null;
+  }
+
+  const hits = new THREE.Raycaster(origin, direction, 0, maxDistance).intersectObjects(collision.colliderMeshes, false);
+  if (!predicate) {
+    return hits[0] ?? null;
+  }
+
+  for (const hit of hits) {
+    const normal = getInteriorHitNormal(hit);
+    if (predicate(hit, normal)) {
+      return hit;
+    }
+  }
+
+  return null;
+}
+
+function moveInteriorBodyWithCollision(
+  position: THREE.Vector3,
+  movement: THREE.Vector3,
+  collision: ShipInteriorCollisionData,
+): THREE.Vector3 {
+  if (!collision.colliderMeshes.length || movement.lengthSq() <= 1e-10) {
+    return position.clone().add(movement);
+  }
+
+  const nextPosition = position.clone();
+  const remaining = movement.clone();
+  const bodyOffsets = [0, -collision.standingHeight * 0.45, -Math.max(collision.standingHeight - 0.24, 0.24)];
+
+  for (let pass = 0; pass < INTERIOR_MAX_COLLISION_PASSES && remaining.lengthSq() > 1e-8; pass += 1) {
+    const travelDistance = remaining.length();
+    const direction = remaining.clone().normalize();
+    let blockingHit: THREE.Intersection<THREE.Object3D> | null = null;
+
+    for (const offsetY of bodyOffsets) {
+      const origin = nextPosition.clone();
+      origin.y += offsetY;
+      const hit = raycastInteriorMeshes(
+        origin,
+        direction,
+        travelDistance + INTERIOR_COLLISION_RADIUS + 0.02,
+        collision,
+        (_candidate, normal) => Math.abs(normal.y) < 0.7,
+      );
+
+      if (hit && (!blockingHit || hit.distance < blockingHit.distance)) {
+        blockingHit = hit;
+      }
+    }
+
+    if (!blockingHit) {
+      nextPosition.add(remaining);
+      break;
+    }
+
+    const safeDistance = Math.max(0, blockingHit.distance - INTERIOR_COLLISION_RADIUS - 0.01);
+    nextPosition.addScaledVector(direction, safeDistance);
+
+    const consumed = direction.clone().multiplyScalar(safeDistance);
+    remaining.sub(consumed);
+
+    const hitNormal = getInteriorHitNormal(blockingHit);
+    if (remaining.dot(hitNormal) < 0) {
+      remaining.projectOnPlane(hitNormal);
+    } else {
+      break;
+    }
+  }
+
+  return nextPosition;
+}
+
+function resolveInteriorVerticalPosition(
+  currentPosition: THREE.Vector3,
+  nextPosition: THREE.Vector3,
+  verticalVelocity: number,
+  collision: ShipInteriorCollisionData,
+): { positionY: number; velocityY: number; grounded: boolean } {
+  if (!collision.colliderMeshes.length) {
+    return {
+      positionY: nextPosition.y,
+      velocityY: verticalVelocity,
+      grounded: false,
+    };
+  }
+
+  let positionY = nextPosition.y;
+  let velocityY = verticalVelocity;
+  let grounded = false;
+
+  const downwardOrigin = new THREE.Vector3(
+    nextPosition.x,
+    Math.max(currentPosition.y, nextPosition.y) + INTERIOR_STEP_HEIGHT,
+    nextPosition.z,
+  );
+  const downwardDistance = collision.standingHeight
+    + INTERIOR_STEP_HEIGHT
+    + Math.max(0, currentPosition.y - nextPosition.y)
+    + INTERIOR_GROUND_SNAP_DISTANCE;
+  const groundHit = raycastInteriorMeshes(
+    downwardOrigin,
+    new THREE.Vector3(0, -1, 0),
+    downwardDistance,
+    collision,
+    (_candidate, normal) => normal.y > 0.25,
+  );
+
+  if (groundHit) {
+    const floorY = groundHit.point.y + collision.standingHeight;
+    const canStepUp = floorY >= currentPosition.y && floorY - currentPosition.y <= INTERIOR_STEP_HEIGHT;
+    const shouldSnapToGround = positionY <= floorY + INTERIOR_GROUND_SNAP_DISTANCE;
+    if (shouldSnapToGround || canStepUp) {
+      positionY = floorY;
+      velocityY = 0;
+      grounded = true;
+    }
+  }
+
+  if (!grounded && positionY > currentPosition.y) {
+    const upwardDistance = positionY - currentPosition.y + INTERIOR_CEILING_PADDING;
+    const ceilingHit = raycastInteriorMeshes(
+      currentPosition,
+      new THREE.Vector3(0, 1, 0),
+      upwardDistance,
+      collision,
+      (_candidate, normal) => normal.y < -0.25,
+    );
+
+    if (ceilingHit) {
+      positionY = Math.min(positionY, currentPosition.y + Math.max(0, ceilingHit.distance - INTERIOR_CEILING_PADDING));
+      velocityY = Math.min(0, velocityY);
+    }
+  }
+
+  return { positionY, velocityY, grounded };
+}
+
+function shouldResetInteriorPosition(
+  position: THREE.Vector3,
+  shipConfig: ShipConfig,
+  collision: ShipInteriorCollisionData,
+): boolean {
+  if (!collision.colliderMeshes.length) {
+    return position.y < shipConfig.interiorFloorHeight - 8
+      || Math.abs(position.x) > shipConfig.interiorClampX + 8
+      || Math.abs(position.z) > shipConfig.interiorClampZ + 8;
+  }
+
+  const safeBounds = collision.bounds.clone();
+  safeBounds.min.y -= Math.max(4, collision.standingHeight * 2);
+  safeBounds.max.y += 2;
+  safeBounds.expandByScalar(1.5);
+
+  if (!safeBounds.containsPoint(position)) {
+    return true;
+  }
+
+  const supportOrigin = position.clone();
+  supportOrigin.y += 0.15;
+  const supportHit = raycastInteriorMeshes(
+    supportOrigin,
+    new THREE.Vector3(0, -1, 0),
+    Math.max(12, collision.standingHeight + 8),
+    collision,
+    (_candidate, normal) => normal.y > 0.25,
+  );
+
+  return !supportHit && position.distanceToSquared(shipConfig.insideSpawnVec) > 36;
 }
 
 // ─── Planet proximity & terrain collision helpers ─────────────────────────────
@@ -2405,6 +2600,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
   const [activeSystemId, setActiveSystemId] = useState(homeSystemId);
   const [activeFrameOrigin, setActiveFrameOrigin] = useState<Vec3Tuple>(homeStation?.localPosition ?? [0, 0, 0]);
   const [tabletOpen, setTabletOpen] = useState(false);
+  const [showDebugAnchors, setShowDebugAnchors] = useState(true);
   const [teleporting, setTeleporting] = useState(false);
   const [autopilotDestination, setAutopilotDestination] = useState<AutopilotDestination | null>(null);
   const [autopilotEngaged, setAutopilotEngaged] = useState(false);
@@ -2561,12 +2757,33 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      if (event.repeat || event.code !== 'KeyT') {
+      const target = event.target;
+      const isTypingTarget =
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        (target instanceof HTMLElement && target.isContentEditable);
+
+      if (isTypingTarget) {
+        return;
+      }
+
+      if (event.repeat) {
+        return;
+      }
+
+      if (event.code === 'KeyT') {
+        event.preventDefault();
+        setTabletOpen((current) => !current);
+        return;
+      }
+
+      if (event.code !== 'Numpad0') {
         return;
       }
 
       event.preventDefault();
-      setTabletOpen((current) => !current);
+      setShowDebugAnchors((current) => !current);
     };
 
     window.addEventListener('keydown', handler);
@@ -2686,6 +2903,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           remotePlayers={remotePlayers}
           sendState={sendState}
           setHud={setHud}
+          showDebugAnchors={showDebugAnchors}
           shipConfig={getShipConfig(DEFAULT_SHIP_ID)}
           tabletOpen={tabletOpen}
         />
@@ -2810,6 +3028,7 @@ function GameScene({
   remotePlayers,
   sendState,
   setHud,
+  showDebugAnchors,
   shipConfig,
   tabletOpen,
 }: {
@@ -2832,10 +3051,12 @@ function GameScene({
   remotePlayers: PlayerSnapshot[];
   sendState: (payload: PlayerSnapshot) => void;
   setHud: Dispatch<SetStateAction<HudState>>;
+  showDebugAnchors: boolean;
   shipConfig: ShipConfig;
   tabletOpen: boolean;
 }): ReactElement {
   const { camera, gl } = useThree();
+  const interiorCollision = useShipInteriorCollisionData(shipConfig);
   const pressedKeys = useRef(new Set<string>());
   const actionQueue = useRef(new Set<string>());
   const shipGroupRef = useRef<THREE.Group>(null);
@@ -3088,22 +3309,47 @@ function GameScene({
         walk.normalize().multiplyScalar(INTERIOR_WALK_SPEED_METERS_PER_SECOND);
         state.interiorVelocity.x = walk.x;
         state.interiorVelocity.z = walk.z;
-        state.interiorPosition.addScaledVector(walk, dt);
+        if (interiorCollision.colliderMeshes.length) {
+          const nextInteriorPosition = moveInteriorBodyWithCollision(
+            state.interiorPosition,
+            walk.clone().multiplyScalar(dt),
+            interiorCollision,
+          );
+          state.interiorPosition.x = nextInteriorPosition.x;
+          state.interiorPosition.z = nextInteriorPosition.z;
+        } else {
+          state.interiorPosition.addScaledVector(walk, dt);
+          state.interiorPosition.x = clamp(state.interiorPosition.x, -shipConfig.interiorClampX, shipConfig.interiorClampX);
+          state.interiorPosition.z = clamp(state.interiorPosition.z, -shipConfig.interiorClampZ, shipConfig.interiorClampZ);
+        }
       } else {
         state.interiorVelocity.x = 0;
         state.interiorVelocity.z = 0;
       }
 
       state.interiorVelocity.y -= INTERIOR_GRAVITY_METERS_PER_SECOND * dt;
-      state.interiorPosition.y += state.interiorVelocity.y * dt;
-
-      if (state.interiorPosition.y < shipConfig.interiorFloorHeight) {
-        state.interiorPosition.y = shipConfig.interiorFloorHeight;
-        state.interiorVelocity.y = 0;
+      if (interiorCollision.colliderMeshes.length) {
+        const verticalResolution = resolveInteriorVerticalPosition(
+          state.interiorPosition,
+          state.interiorPosition.clone().add(new THREE.Vector3(0, state.interiorVelocity.y * dt, 0)),
+          state.interiorVelocity.y,
+          interiorCollision,
+        );
+        state.interiorPosition.y = verticalResolution.positionY;
+        state.interiorVelocity.y = verticalResolution.velocityY;
+      } else {
+        state.interiorPosition.y += state.interiorVelocity.y * dt;
+        if (state.interiorPosition.y < shipConfig.interiorFloorHeight) {
+          state.interiorPosition.y = shipConfig.interiorFloorHeight;
+          state.interiorVelocity.y = 0;
+        }
       }
 
-      state.interiorPosition.x = clamp(state.interiorPosition.x, -shipConfig.interiorClampX, shipConfig.interiorClampX);
-      state.interiorPosition.z = clamp(state.interiorPosition.z, -shipConfig.interiorClampZ, shipConfig.interiorClampZ);
+      if (shouldResetInteriorPosition(state.interiorPosition, shipConfig, interiorCollision)) {
+        state.interiorPosition.copy(shipConfig.insideSpawnVec);
+        state.interiorVelocity.set(0, 0, 0);
+      }
+
       state.position.copy(state.shipPosition);
       state.velocity.copy(state.shipVelocity);
       state.rotation.copy(state.shipRotation);
@@ -3543,16 +3789,16 @@ function GameScene({
       <GalaxyBackdrop activeFrameOrigin={activeFrameOrigin} activeSystemId={activeSystemId} galaxy={galaxy} autopilotTarget={activeAutopilotTarget} highlightedTarget={highlightedTarget} localStateRef={localStateRef} />
       <WarpSpeedEffect localStateRef={localStateRef} />
       <group ref={shipGroupRef}>
-        <ShipExteriorModel config={shipConfig} highlight />
+        <ShipExteriorModel config={shipConfig} highlight showDebugAnchors={showDebugAnchors} />
       </group>
       {highlightedTarget?.kind === 'ship' && (mode === 'space' || mode === 'planet-surface') ? (
         <ShipHighlightTag target={highlightedTarget} localStateRef={localStateRef} />
       ) : null}
       <group ref={interiorGroupRef} visible={false}>
-        <ShipInteriorModel config={shipConfig} />
+        <ShipInteriorModel config={shipConfig} showDebugAnchors={showDebugAnchors} />
       </group>
       {remotePlayers.map((player) => (
-        <RemotePlayer key={player.socketId} player={player} viewerFrameOrigin={activeFrameOrigin} />
+        <RemotePlayer key={player.socketId} player={player} viewerFrameOrigin={activeFrameOrigin} showDebugAnchors={showDebugAnchors} />
       ))}
     </>
   );
@@ -5838,7 +6084,15 @@ function ShipInterior({ isPilot = false }: { isPilot?: boolean }): ReactElement 
   );
 }
 
-function RemotePlayer({ player, viewerFrameOrigin }: { player: PlayerSnapshot; viewerFrameOrigin: Vec3Tuple }): ReactElement {
+function RemotePlayer({
+  player,
+  viewerFrameOrigin,
+  showDebugAnchors,
+}: {
+  player: PlayerSnapshot;
+  viewerFrameOrigin: Vec3Tuple;
+  showDebugAnchors: boolean;
+}): ReactElement {
   const remoteShipConfig = useMemo(() => getShipConfig(DEFAULT_SHIP_ID), []);
   const shipQuaternion = useMemo(
     () => new THREE.Quaternion(...player.ship.rotation),
@@ -5857,7 +6111,7 @@ function RemotePlayer({ player, viewerFrameOrigin }: { player: PlayerSnapshot; v
   return (
     <group>
       <group position={relativeShipPosition} quaternion={shipQuaternion}>
-        <ShipExteriorModel config={remoteShipConfig} />
+        <ShipExteriorModel config={remoteShipConfig} showDebugAnchors={showDebugAnchors} />
         <Html distanceFactor={18} position={[0, 1.9, 0]} transform>
           <div className="status-pill">{player.username}</div>
         </Html>

@@ -3,6 +3,16 @@ import { type ReactElement, useEffect, useMemo, useRef } from 'react';
 import * as THREE from 'three';
 import type { ShipConfig } from './shipConfig';
 
+export interface ShipInteriorCollisionData {
+  colliderMeshes: THREE.Mesh[];
+  bounds: THREE.Box3;
+  standingHeight: number;
+}
+
+const INTERIOR_COLLIDER_ROTATION = new THREE.Matrix4().makeRotationY(Math.PI);
+const INTERIOR_COLLIDER_RAY_DOWN = new THREE.Vector3(0, -1, 0);
+const INTERIOR_COLLIDER_MATERIAL = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+
 interface ShipAnchorMarkerProps {
   color: string;
   label: string;
@@ -93,14 +103,66 @@ export function preloadShipModels(config: ShipConfig): void {
   useGLTF.preload(config.interiorModel);
 }
 
+export function useShipInteriorCollisionData(config: ShipConfig): ShipInteriorCollisionData {
+  const { scene } = useGLTF(config.interiorModel);
+
+  return useMemo(() => {
+    scene.updateMatrixWorld(true);
+
+    const colliderMeshes: THREE.Mesh[] = [];
+    const bounds = new THREE.Box3();
+    scene.traverse((child) => {
+      if (!(child as THREE.Mesh).isMesh) {
+        return;
+      }
+
+      const mesh = child as THREE.Mesh;
+      if (!mesh.geometry) {
+        return;
+      }
+
+      const bakedGeometry = mesh.geometry.clone();
+      const bakedMatrix = INTERIOR_COLLIDER_ROTATION.clone().multiply(mesh.matrixWorld);
+      bakedGeometry.applyMatrix4(bakedMatrix);
+      bakedGeometry.computeBoundingBox();
+      bakedGeometry.computeBoundingSphere();
+
+      const colliderMesh = new THREE.Mesh(bakedGeometry, INTERIOR_COLLIDER_MATERIAL);
+      colliderMesh.matrixAutoUpdate = false;
+      colliderMesh.updateMatrixWorld(true);
+      colliderMeshes.push(colliderMesh);
+
+      if (bakedGeometry.boundingBox) {
+        bounds.union(bakedGeometry.boundingBox);
+      }
+    });
+
+    const standingOrigin = config.insideSpawnVec.clone();
+    standingOrigin.y += 0.05;
+
+    const standingHit = new THREE.Raycaster(standingOrigin, INTERIOR_COLLIDER_RAY_DOWN, 0, 6)
+      .intersectObjects(colliderMeshes, false)
+      .find((hit) => (hit.face?.normal.y ?? 0) > 0.25);
+
+    return {
+      colliderMeshes,
+      bounds,
+      standingHeight: standingHit
+        ? THREE.MathUtils.clamp(standingOrigin.y - standingHit.point.y, 0.6, 2.4)
+        : config.interiorFloorHeight,
+    };
+  }, [config, scene]);
+}
+
 // ─── Exterior layer ─────────────────────────────────────────────────────────
 
 interface ShipExteriorModelProps {
   config: ShipConfig;
   highlight?: boolean;
+  showDebugAnchors?: boolean;
 }
 
-export function ShipExteriorModel({ config, highlight = false }: ShipExteriorModelProps): ReactElement {
+export function ShipExteriorModel({ config, highlight = false, showDebugAnchors = true }: ShipExteriorModelProps): ReactElement {
   const { scene } = useGLTF(config.exteriorModel);
   const clonedScene = useMemo(() => {
     const clone = scene.clone(true);
@@ -139,7 +201,7 @@ export function ShipExteriorModel({ config, highlight = false }: ShipExteriorMod
       <group rotation={[0, Math.PI, 0]}>
         <primitive object={clonedScene} />
       </group>
-      <ShipAnchorDebugMarkers config={config} />
+      {showDebugAnchors ? <ShipAnchorDebugMarkers config={config} /> : null}
     </group>
   );
 }
@@ -148,9 +210,10 @@ export function ShipExteriorModel({ config, highlight = false }: ShipExteriorMod
 
 interface ShipInteriorModelProps {
   config: ShipConfig;
+  showDebugAnchors?: boolean;
 }
 
-export function ShipInteriorModel({ config }: ShipInteriorModelProps): ReactElement {
+export function ShipInteriorModel({ config, showDebugAnchors = true }: ShipInteriorModelProps): ReactElement {
   const { scene } = useGLTF(config.interiorModel);
   const clonedScene = useMemo(() => scene.clone(true), [scene]);
   return (
@@ -158,7 +221,7 @@ export function ShipInteriorModel({ config }: ShipInteriorModelProps): ReactElem
       <group rotation={[0, Math.PI, 0]}>
         <primitive object={clonedScene} />
       </group>
-      <ShipAnchorDebugMarkers config={config} interior />
+      {showDebugAnchors ? <ShipAnchorDebugMarkers config={config} interior /> : null}
     </group>
   );
 }

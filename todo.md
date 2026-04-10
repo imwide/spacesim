@@ -11,3 +11,4 @@ Improve the "hyperspeed effect" to not be a UI visual effect ontop of the camera
 The turning can happen really fast right now. The intensity that the turn and rotation of the ship is started at is really high. it should "fade in" and slowly start turning as it is has a lot of weight
 
 
+
