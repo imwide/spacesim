@@ -300,6 +300,19 @@ button {
   backdrop-filter: blur(4px);
 }
 
+.hud-speed-limit-banner.is-safezone-alert {
+  top: 5rem;
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.45);
+  box-shadow: 0 0 32px rgba(239, 68, 68, 0.15);
+  animation: none;
+}
+
+.hud-speed-limit-banner.is-safezone-alert::before,
+.hud-speed-limit-banner.is-safezone-alert::after {
+  border-color: rgba(239, 68, 68, 0.85);
+}
+
 .hud-interaction-pills {
   position: absolute;
   left: 1.25rem;

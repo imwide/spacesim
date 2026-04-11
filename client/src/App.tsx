@@ -104,6 +104,7 @@ const INTERIOR_STEP_HEIGHT = 0.3;
 const INTERIOR_GROUND_SNAP_DISTANCE = 0.22;
 const INTERIOR_CEILING_PADDING = 0.12;
 const INTERIOR_MAX_COLLISION_PASSES = 3;
+const SAFEZONE_NOTICE_DURATION_MS = 3000;
 
 // ── Legacy constants derived from the default ship config ──────────────────
 // Used by autopilot and other code that doesn't have direct access to the
@@ -183,6 +184,8 @@ interface HudState {
   prompt: string;
   playersOnline: number;
   speedLimitNotice: string;
+  speedLimitNoticeColor: string;
+  safezoneNotice: string;
   interactionPills: Array<{ key: string; label: string }>;
 }
 
@@ -263,6 +266,13 @@ interface SceneCollider {
   ownerId?: string;
 }
 
+interface StationForceFieldData {
+  id: string;
+  position: Vec3Tuple;
+  radius: number;
+  scale: number;
+}
+
 interface MotionCollisionResult {
   collider: SceneCollider;
   colliderLocalPosition: THREE.Vector3;
@@ -274,6 +284,14 @@ interface StationBorderSpeedLimitInfo {
   maxSpeed: number;
   active: boolean;
 }
+
+interface StationForceFieldHitResult {
+  distance: number;
+  field: StationForceFieldData;
+  point: THREE.Vector3;
+}
+
+const stationForceFieldImpactHandlers = new Map<string, (worldHitPoint: THREE.Vector3) => void>();
 
 interface LocalGameState {
   frameSystemId: string;
@@ -335,6 +353,30 @@ const LONG_DISTANCE_PHASE2_DURATION = 20; // seconds — fast accel to cruise
 const LONG_DISTANCE_DECEL_DURATION = 20; // seconds — deceleration phase
 // Decel trigger distance: 0.5 × cruiseSpeed × decelDuration ≈ 240 million km (1.6 AU)
 const LONG_DISTANCE_DECEL_TRIGGER = 0.5 * LONG_DISTANCE_CRUISE_SPEED * LONG_DISTANCE_DECEL_DURATION;
+const SHIP_WEAPON_FIRE_INTERVAL_SECONDS = 0.09;
+const SHIP_WEAPON_PROJECTILE_SPEED = 3_600;
+const SHIP_WEAPON_PROJECTILE_LIFETIME_SECONDS = 0.95;
+const SHIP_WEAPON_PROJECTILE_LENGTH = 30;
+const SHIP_WEAPON_PROJECTILE_RADIUS = 0.1;
+const SHIP_WEAPON_FLASH_LIFETIME_SECONDS = 0.09;
+const SHIP_WEAPON_MAX_PROJECTILES = 40;
+const SHIP_WEAPON_MAX_FLASHES = 8;
+const SHIP_WEAPON_IMPACT_LIFETIME_SECONDS = 0.4;
+const SHIP_WEAPON_IMPACT_PARTICLE_COUNT = 8;
+const SHIP_WEAPON_MAX_IMPACTS = 12;
+const SHIP_WEAPON_IMPACT_SCALE_MULTIPLIER = 3;
+const DUST_ASTEROID_HITS_TO_DESTROY = 4;
+const DUST_ASTEROID_EXPLOSION_LIFETIME_SECONDS = 1.05;
+const DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT = 12;
+const DUST_ASTEROID_EXPLOSION_SUB_BURSTS = 4;
+const DUST_ASTEROID_MAX_EXPLOSIONS = 10;
+const DUST_ASTEROID_BLAST_RADIUS = 150;
+const DUST_ASTEROID_BLAST_PUSH_VELOCITY = 85;
+const STATION_FORCE_FIELD_MARGIN_METERS = 750;
+const STATION_FORCE_FIELD_SPOT_LIFETIME_SECONDS = 0.3;
+const STATION_FORCE_FIELD_MAX_SPOTS = 6;
+const STATION_FORCE_FIELD_IMPACT_REVEAL_RADIUS_METERS = 12;
+const STATION_FORCE_FIELD_IMPACT_REVEAL_SOFTNESS_METERS = 16;
 // Steepness of the Gaussian bell-curve deceleration profile.
 // Higher → deceleration more concentrated in the middle; lower → more spread out.
 const LONG_DISTANCE_BELL_CURVE_K = 2.0;
@@ -692,6 +734,59 @@ function getStationCollisionRadius(scale: number): number {
   return scale * STATION_COLLISION_RADIUS_FACTOR;
 }
 
+function getStationVisualOuterRadius(scale: number): number {
+  return scale * 3.8;
+}
+
+function getStationForceFieldRadius(scale: number): number {
+  return getStationVisualOuterRadius(scale) + STATION_FORCE_FIELD_MARGIN_METERS;
+}
+
+function buildSystemStationForceFields(system: StarSystemData): StationForceFieldData[] {
+  const fields: StationForceFieldData[] = [
+    {
+      id: `${system.station.id}:force-field`,
+      position: system.station.position,
+      radius: getStationForceFieldRadius(STAR_STATION_SCALE),
+      scale: STAR_STATION_SCALE,
+    },
+  ];
+
+  system.planets.forEach((planet) => {
+    planet.stations.forEach((station) => {
+      fields.push({
+        id: `${station.id}:force-field`,
+        position: tupleAdd(planet.position, station.position),
+        radius: getStationForceFieldRadius(PLANET_STATION_SCALE),
+        scale: PLANET_STATION_SCALE,
+      });
+    });
+
+    planet.moons.forEach((moon) => {
+      const moonPosition = tupleAdd(planet.position, moon.position);
+      moon.stations.forEach((station) => {
+        fields.push({
+          id: `${station.id}:force-field`,
+          position: tupleAdd(moonPosition, station.position),
+          radius: getStationForceFieldRadius(PLANET_STATION_SCALE),
+          scale: PLANET_STATION_SCALE,
+        });
+      });
+    });
+  });
+
+  system.asteroidGroups.forEach((group) => {
+    fields.push({
+      id: `${group.station.id}:force-field`,
+      position: tupleAdd(group.position, group.station.position),
+      radius: getStationForceFieldRadius(ASTEROID_STATION_SCALE),
+      scale: ASTEROID_STATION_SCALE,
+    });
+  });
+
+  return fields;
+}
+
 function buildStationSceneColliders(id: string, position: Vec3Tuple, scale: number): SceneCollider[] {
   const basePosition = vectorFromTuple(position);
   const colliderSpecs = [
@@ -909,6 +1004,54 @@ function findSceneCollisionOnSegment(
       };
     }
   });
+
+  return nearestHit;
+}
+
+function findStationForceFieldHitOnSegment(
+  start: THREE.Vector3,
+  end: THREE.Vector3,
+  fields: StationForceFieldData[],
+): StationForceFieldHitResult | null {
+  const segment = end.clone().sub(start);
+  const segmentLength = segment.length();
+
+  if (segmentLength <= 1e-8) {
+    return null;
+  }
+
+  const direction = segment.clone().divideScalar(segmentLength);
+  let nearestHit: StationForceFieldHitResult | null = null;
+
+  for (const field of fields) {
+    const center = vectorFromTuple(field.position);
+    const offset = start.clone().sub(center);
+    const a = direction.dot(direction);
+    const b = 2 * offset.dot(direction);
+    const c = offset.dot(offset) - field.radius * field.radius;
+    const discriminant = b * b - 4 * a * c;
+
+    if (discriminant < 0) {
+      continue;
+    }
+
+    const sqrtDiscriminant = Math.sqrt(discriminant);
+    const tNear = (-b - sqrtDiscriminant) / (2 * a);
+    const tFar = (-b + sqrtDiscriminant) / (2 * a);
+    const travel = tNear >= 0 ? tNear : tFar >= 0 ? tFar : -1;
+
+    if (travel < 0 || travel > segmentLength) {
+      continue;
+    }
+
+    if (!nearestHit || travel < nearestHit.distance) {
+      nearestHit = {
+        distance: travel,
+        field,
+        point: start.clone().addScaledVector(direction, travel),
+      };
+    }
+  }
 
   return nearestHit;
 }
@@ -2654,6 +2797,8 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     prompt: 'Connecting to the sector…',
     playersOnline: 1,
     speedLimitNotice: '',
+    speedLimitNoticeColor: '#38bdf8',
+    safezoneNotice: '',
     interactionPills: [],
   });
   const activeSystem = useMemo(
@@ -2991,7 +3136,25 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           </button>
         </div>
 
-        {hud.speedLimitNotice ? <div className="hud-speed-limit-banner">{hud.speedLimitNotice}</div> : null}
+        {hud.speedLimitNotice ? (
+          <div
+            className="hud-speed-limit-banner"
+            style={{
+              color: hud.speedLimitNoticeColor,
+              borderColor:
+                hud.speedLimitNoticeColor === '#ef4444'
+                  ? 'rgba(239, 68, 68, 0.45)'
+                  : 'rgba(14, 165, 233, 0.35)',
+            }}
+          >
+            {hud.speedLimitNotice}
+          </div>
+        ) : null}
+        {hud.safezoneNotice ? (
+          <div className="hud-speed-limit-banner is-safezone-alert">
+            {hud.safezoneNotice}
+          </div>
+        ) : null}
 
         {hud.interactionPills.length ? (
           <div className="hud-interaction-pills">
@@ -3118,8 +3281,12 @@ function GameScene({
     shipScreenY: 0,
     aligned: false,
   });
+  const lastInsideSafezoneRef = useRef(false);
+  const safezoneTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pressedKeys = useRef(new Set<string>());
   const actionQueue = useRef(new Set<string>());
+  const firingPrimaryRef = useRef(false);
+  const lastWeaponBlockedNoticeAtRef = useRef(0);
   const shipGroupRef = useRef<THREE.Group>(null);
   const interiorGroupRef = useRef<THREE.Group>(null);
   const activeSystem = useMemo(
@@ -3133,6 +3300,15 @@ function GameScene({
   const localEnvironmentColliders = useMemo(
     () => mapSceneCollidersToFrame(environmentColliders, activeFrameOrigin),
     [activeFrameOrigin, environmentColliders],
+  );
+  const stationForceFields = useMemo(
+    () => (activeSystem
+      ? buildSystemStationForceFields(activeSystem).map((field) => ({
+          ...field,
+          position: toFrameLocalPosition(field.position, activeFrameOrigin),
+        }))
+      : []),
+    [activeFrameOrigin, activeSystem],
   );
   const remoteShipColliders = useMemo(
     () => buildRemoteShipColliders(remotePlayers, activeFrameOrigin),
@@ -3153,6 +3329,36 @@ function GameScene({
 
     const upHandler = (event: KeyboardEvent) => {
       pressedKeys.current.delete(event.code);
+    };
+
+    const mouseDownHandler = (event: MouseEvent) => {
+      if (event.button !== 0) {
+        return;
+      }
+
+      if (!tabletOpen && document.pointerLockElement !== gl.domElement) {
+        gl.domElement.requestPointerLock();
+      }
+
+      if (localStateRef.current.mode === 'pilot') {
+        firingPrimaryRef.current = true;
+      }
+    };
+
+    const mouseUpHandler = (event: MouseEvent) => {
+      if (event.button === 0) {
+        firingPrimaryRef.current = false;
+      }
+    };
+
+    const blurHandler = () => {
+      firingPrimaryRef.current = false;
+    };
+
+    const pointerLockChangeHandler = () => {
+      if (document.pointerLockElement !== gl.domElement) {
+        firingPrimaryRef.current = false;
+      }
     };
 
     const clickHandler = () => {
@@ -3181,12 +3387,20 @@ function GameScene({
 
     window.addEventListener('keydown', downHandler);
     window.addEventListener('keyup', upHandler);
+    window.addEventListener('mousedown', mouseDownHandler);
+    window.addEventListener('mouseup', mouseUpHandler);
+    window.addEventListener('blur', blurHandler);
+    document.addEventListener('pointerlockchange', pointerLockChangeHandler);
     document.addEventListener('mousemove', mouseHandler);
     gl.domElement.addEventListener('click', clickHandler);
 
     return () => {
       window.removeEventListener('keydown', downHandler);
       window.removeEventListener('keyup', upHandler);
+      window.removeEventListener('mousedown', mouseDownHandler);
+      window.removeEventListener('mouseup', mouseUpHandler);
+      window.removeEventListener('blur', blurHandler);
+      document.removeEventListener('pointerlockchange', pointerLockChangeHandler);
       document.removeEventListener('mousemove', mouseHandler);
       gl.domElement.removeEventListener('click', clickHandler);
     };
@@ -3199,6 +3413,7 @@ function GameScene({
 
     pressedKeys.current.clear();
     actionQueue.current.clear();
+    firingPrimaryRef.current = false;
   }, [tabletOpen]);
 
   useFrame((_frameState, delta) => {
@@ -3831,7 +4046,60 @@ function GameScene({
             SHIP_MAX_SPEED_METERS_PER_SECOND * shipConfig.speedMultiplier,
           )
         : { maxSpeed: SHIP_MAX_SPEED_METERS_PER_SECOND * shipConfig.speedMultiplier, active: false };
-      const speedLimitNotice = stationSpeedLimitInfo.active ? 'STATION TRAFFIC FIELD · VELOCITY LIMITED' : '';
+      
+      let insideSafezone = false;
+      const shipPos = state.shipPosition;
+      for (const field of stationForceFields) {
+        const dx = shipPos.x - field.position[0];
+        const dy = shipPos.y - field.position[1];
+        const dz = shipPos.z - field.position[2];
+        const distSq = dx * dx + dy * dy + dz * dz;
+        if (distSq < field.radius * field.radius) {
+          insideSafezone = true;
+          break;
+        }
+      }
+
+      if (insideSafezone !== lastInsideSafezoneRef.current) {
+        lastInsideSafezoneRef.current = insideSafezone;
+        if (safezoneTimeoutRef.current) {
+          clearTimeout(safezoneTimeoutRef.current);
+          safezoneTimeoutRef.current = null;
+        }
+        
+        const message = insideSafezone ? 'ENTERING SAFEZONE' : 'LEAVING SAFEZONE';
+        setHud((current) => ({
+          ...current,
+          safezoneNotice: message,
+        }));
+
+        safezoneTimeoutRef.current = setTimeout(() => {
+          setHud((current) => ({
+            ...current,
+            safezoneNotice: '',
+          }));
+          safezoneTimeoutRef.current = null;
+        }, SAFEZONE_NOTICE_DURATION_MS);
+      }
+
+      const weaponBlockedByField = firingPrimaryRef.current && state.mode === 'pilot' && insideSafezone;
+      if (weaponBlockedByField) {
+        lastWeaponBlockedNoticeAtRef.current = now;
+      }
+
+      const showWeaponBlockedNotice = now - lastWeaponBlockedNoticeAtRef.current < 3000;
+      
+      let speedLimitNotice = '';
+      let speedLimitNoticeColor = '#38bdf8';
+
+      if (showWeaponBlockedNotice) {
+        speedLimitNotice = 'WEAPONS INHIBITED · STATION ARMISTICE ZONE';
+        speedLimitNoticeColor = '#ef4444';
+      } else if (stationSpeedLimitInfo.active) {
+        speedLimitNotice = 'STATION TRAFFIC FIELD · VELOCITY LIMITED';
+        speedLimitNoticeColor = '#38bdf8';
+      }
+
       const interactionPills: Array<{ key: string; label: string }> = [];
       if (canEnter) {
         interactionPills.push({
@@ -3886,6 +4154,7 @@ function GameScene({
         prompt,
         playersOnline,
         speedLimitNotice,
+        speedLimitNoticeColor,
         interactionPills,
       }));
       state.lastHudAt = now;
@@ -3896,6 +4165,7 @@ function GameScene({
     <>
       <GalaxyBackdrop activeFrameOrigin={activeFrameOrigin} activeSystemId={activeSystemId} galaxy={galaxy} autopilotTarget={activeAutopilotTarget} highlightedTarget={highlightedTarget} localStateRef={localStateRef} />
       <WarpSpeedEffect localStateRef={localStateRef} />
+      <ShipWeaponEffects firingPrimaryRef={firingPrimaryRef} localShipRef={shipGroupRef} localStateRef={localStateRef} stationForceFields={stationForceFields} shipConfig={shipConfig} />
       <group ref={shipGroupRef}>
         <ShipExteriorModel config={shipConfig} highlight showDebugAnchors={showDebugAnchors} />
       </group>
@@ -5494,6 +5764,753 @@ function ShipHighlightTag({ target, localStateRef }: { target: HighlightTarget; 
   );
 }
 
+interface WeaponProjectileEffect {
+  active: boolean;
+  age: number;
+  position: THREE.Vector3;
+  previousPosition: THREE.Vector3;
+  velocity: THREE.Vector3;
+}
+
+interface WeaponFlashEffect {
+  active: boolean;
+  age: number;
+  life: number;
+  position: THREE.Vector3;
+  localOffset: THREE.Vector3;
+  scale: number;
+}
+
+interface WeaponImpactEffect {
+  active: boolean;
+  age: number;
+  life: number;
+  normal: THREE.Vector3;
+  particleOffsets: THREE.Vector3[];
+  particleVelocities: THREE.Vector3[];
+  position: THREE.Vector3;
+}
+
+function shouldIgnoreWeaponCollision(object: THREE.Object3D, localShipRef: MutableRefObject<THREE.Group | null>, weaponEffectsRef: MutableRefObject<THREE.Group | null>): boolean {
+  let current: THREE.Object3D | null = object;
+
+  while (current) {
+    if (current === localShipRef.current || current === weaponEffectsRef.current) {
+      return true;
+    }
+    if (current.userData?.ignoreWeaponCollision || current.userData?.ignoreMarkerOcclusion || current.userData?.ignoreStarOcclusion) {
+      return true;
+    }
+    current = current.parent;
+  }
+
+  return false;
+}
+
+function createHexPatternTexture(): THREE.CanvasTexture {
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const context = canvas.getContext('2d');
+
+  if (!context) {
+    const fallbackTexture = new THREE.CanvasTexture(canvas);
+    fallbackTexture.wrapS = THREE.RepeatWrapping;
+    fallbackTexture.wrapT = THREE.RepeatWrapping;
+    return fallbackTexture;
+  }
+
+  context.clearRect(0, 0, size, size);
+  context.strokeStyle = 'rgba(170, 245, 255, 0.82)';
+  context.lineWidth = 2.2;
+  context.shadowColor = 'rgba(34, 211, 238, 0.38)';
+  context.shadowBlur = 8;
+  const radius = 16;
+  const stepX = radius * 3;
+  const stepY = Math.sqrt(3) * radius;
+
+  const drawHex = (hx: number, hy: number) => {
+    context.beginPath();
+    for (let side = 0; side < 6; side += 1) {
+      const angle = (Math.PI / 3) * side + Math.PI / 6;
+      const x = hx + Math.cos(angle) * radius;
+      const y = hy + Math.sin(angle) * radius;
+      if (side === 0) {
+        context.moveTo(x, y);
+      } else {
+        context.lineTo(x, y);
+      }
+    }
+    context.closePath();
+    context.stroke();
+  };
+
+  for (let row = -3; row <= Math.ceil(size / (stepY * 0.5)) + 3; row += 1) {
+    const offsetX = row % 2 === 0 ? 0 : stepX * 0.5;
+    for (let col = -3; col <= Math.ceil(size / stepX) + 3; col += 1) {
+      drawHex(col * stepX + offsetX, row * stepY * 0.5);
+    }
+  }
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function StationForceField({ fieldId, radius }: { fieldId: string; radius: number }): ReactElement {
+  const shieldGroupRef = useRef<THREE.Group>(null);
+  const raycastMeshRef = useRef<THREE.Mesh>(null);
+  const shieldMaterialRef = useRef<THREE.ShaderMaterial>(null);
+  const localHitPoint = useMemo(() => new THREE.Vector3(), []);
+  const localNormal = useMemo(() => new THREE.Vector3(), []);
+  const shieldTexture = useMemo(() => createHexPatternTexture(), []);
+  const shieldUniforms = useMemo(
+    () => ({
+      shieldTexture: { value: shieldTexture },
+      shieldColor: { value: new THREE.Color('#7dd3fc') },
+      textureRepeat: { value: new THREE.Vector2(216, 108) },
+      impactNormals: { value: Array.from({ length: STATION_FORCE_FIELD_MAX_SPOTS }, () => new THREE.Vector3(0, 1, 0)) },
+      impactStrengths: { value: Array.from({ length: STATION_FORCE_FIELD_MAX_SPOTS }, () => 0) },
+      impactRadius: { value: STATION_FORCE_FIELD_IMPACT_REVEAL_RADIUS_METERS / Math.max(radius, 1) },
+      impactSoftness: { value: STATION_FORCE_FIELD_IMPACT_REVEAL_SOFTNESS_METERS / Math.max(radius, 1) },
+    }),
+    [radius, shieldTexture],
+  );
+  const spots = useMemo(() => Array.from({ length: STATION_FORCE_FIELD_MAX_SPOTS }, () => ({
+    active: false,
+    age: 0,
+    life: STATION_FORCE_FIELD_SPOT_LIFETIME_SECONDS,
+    normal: new THREE.Vector3(0, 1, 0),
+  })), []);
+  const nextImpactRef = useRef(0);
+
+  useEffect(() => {
+    if (!raycastMeshRef.current) {
+      return;
+    }
+
+    const handleShieldImpact = (hit: THREE.Intersection<THREE.Object3D>) => {
+      const idx = nextImpactRef.current % STATION_FORCE_FIELD_MAX_SPOTS;
+      nextImpactRef.current += 1;
+      const spot = spots[idx];
+      localHitPoint.copy(hit.point);
+      shieldGroupRef.current?.worldToLocal(localHitPoint);
+      localNormal.copy(localHitPoint).normalize();
+      spot.active = true;
+      spot.age = 0;
+      spot.life = STATION_FORCE_FIELD_SPOT_LIFETIME_SECONDS;
+      spot.normal.copy(localNormal);
+      return { suppressDefaultImpact: true };
+    };
+
+    raycastMeshRef.current.userData.onWeaponImpact = handleShieldImpact;
+    raycastMeshRef.current.userData.suppressWeaponImpactEffect = true;
+    stationForceFieldImpactHandlers.set(fieldId, (worldHitPoint) => {
+      const idx = nextImpactRef.current % STATION_FORCE_FIELD_MAX_SPOTS;
+      nextImpactRef.current += 1;
+      const spot = spots[idx];
+      localHitPoint.copy(worldHitPoint);
+      shieldGroupRef.current?.worldToLocal(localHitPoint);
+      localNormal.copy(localHitPoint).normalize();
+      spot.active = true;
+      spot.age = 0;
+      spot.life = STATION_FORCE_FIELD_SPOT_LIFETIME_SECONDS;
+      spot.normal.copy(localNormal);
+    });
+
+    return () => {
+      if (raycastMeshRef.current) {
+        delete raycastMeshRef.current.userData.onWeaponImpact;
+        delete raycastMeshRef.current.userData.suppressWeaponImpactEffect;
+      }
+      stationForceFieldImpactHandlers.delete(fieldId);
+    };
+  }, [fieldId, localHitPoint, localNormal, radius, spots]);
+
+  useEffect(() => () => {
+    shieldTexture.dispose();
+  }, [shieldTexture]);
+
+  useFrame((_state, delta) => {
+    const shaderMaterial = shieldMaterialRef.current;
+    const impactNormals = shieldUniforms.impactNormals.value;
+    const impactStrengths = shieldUniforms.impactStrengths.value;
+
+    for (let i = 0; i < STATION_FORCE_FIELD_MAX_SPOTS; i += 1) {
+      const spot = spots[i];
+
+      if (!spot.active) {
+        impactStrengths[i] = 0;
+        continue;
+      }
+
+      spot.age += delta;
+      if (spot.age >= spot.life) {
+        spot.active = false;
+        impactStrengths[i] = 0;
+        continue;
+      }
+
+      impactNormals[i].copy(spot.normal);
+      impactStrengths[i] = 1 - spot.age / spot.life;
+    }
+
+    if (shaderMaterial) {
+      shaderMaterial.uniformsNeedUpdate = true;
+    }
+  });
+
+  return (
+    <group ref={shieldGroupRef} userData={{ stationForceFieldId: fieldId }}>
+      {/* Invisible raycast-only sphere — always present, never visually rendered */}
+      <mesh ref={raycastMeshRef} userData={{ stationForceFieldId: fieldId }}>
+        <sphereGeometry args={[radius, 32, 24]} />
+        <meshBasicMaterial transparent opacity={0} depthWrite={false} side={THREE.DoubleSide} colorWrite={false} />
+      </mesh>
+      <mesh renderOrder={69} userData={{ ignoreWeaponCollision: true, stationForceFieldId: fieldId }}>
+        <sphereGeometry args={[radius + 1.5, 64, 48]} />
+        <shaderMaterial
+          ref={shieldMaterialRef}
+          uniforms={shieldUniforms}
+          transparent
+          depthWrite={false}
+          side={THREE.DoubleSide}
+          toneMapped={false}
+          vertexShader={`
+            varying vec2 vUv;
+            varying vec3 vWorldPosition;
+            varying vec3 vWorldNormal;
+            varying vec3 vLocalNormal;
+
+            void main() {
+              vUv = uv;
+              vLocalNormal = normalize(position);
+              vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+              vWorldPosition = worldPosition.xyz;
+              vWorldNormal = normalize(mat3(modelMatrix) * normal);
+              gl_Position = projectionMatrix * viewMatrix * worldPosition;
+            }
+          `}
+          fragmentShader={`
+            uniform sampler2D shieldTexture;
+            uniform vec3 shieldColor;
+            uniform vec2 textureRepeat;
+            uniform vec3 impactNormals[${STATION_FORCE_FIELD_MAX_SPOTS}];
+            uniform float impactStrengths[${STATION_FORCE_FIELD_MAX_SPOTS}];
+            uniform float impactRadius;
+            uniform float impactSoftness;
+
+            varying vec2 vUv;
+            varying vec3 vWorldPosition;
+            varying vec3 vWorldNormal;
+            varying vec3 vLocalNormal;
+
+            float getRevealMask(vec3 localNormal) {
+              float reveal = 0.0;
+              for (int i = 0; i < ${STATION_FORCE_FIELD_MAX_SPOTS}; i += 1) {
+                float strength = impactStrengths[i];
+                if (strength <= 0.0) {
+                  continue;
+                }
+
+                float normalDistance = distance(localNormal, normalize(impactNormals[i]));
+                float revealBand = 1.0 - smoothstep(impactRadius, impactRadius + impactSoftness, normalDistance);
+                reveal = max(reveal, revealBand * strength);
+              }
+              return reveal;
+            }
+
+            void main() {
+              vec3 localNormal = normalize(vLocalNormal);
+              float reveal = getRevealMask(localNormal);
+              if (reveal <= 0.001) {
+                discard;
+              }
+
+              vec2 tiledUv = vUv * textureRepeat;
+              vec4 tex = texture2D(shieldTexture, tiledUv);
+              float pattern = clamp(tex.a + dot(tex.rgb, vec3(0.2126, 0.7152, 0.0722)) * 0.35, 0.0, 1.0);
+              vec3 viewDir = normalize(cameraPosition - vWorldPosition);
+              float fresnel = pow(1.0 - max(dot(normalize(vWorldNormal), viewDir), 0.0), 2.4);
+              float alpha = reveal * pattern * (0.85 + fresnel * 0.45);
+              vec3 color = shieldColor * (0.48 + pattern * 1.15 + fresnel * 0.55);
+
+              gl_FragColor = vec4(color, alpha);
+            }
+          `}
+        />
+      </mesh>
+    </group>
+  );
+}
+
+function ShipWeaponEffects({
+  firingPrimaryRef,
+  localShipRef,
+  localStateRef,
+  stationForceFields,
+  shipConfig,
+}: {
+  firingPrimaryRef: MutableRefObject<boolean>;
+  localShipRef: MutableRefObject<THREE.Group | null>;
+  localStateRef: MutableRefObject<LocalGameState>;
+  stationForceFields: StationForceFieldData[];
+  shipConfig: ShipConfig;
+}): ReactElement {
+  const { scene } = useThree();
+  const weaponEffectsRef = useRef<THREE.Group>(null);
+  const projectileHeadRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const projectileTracerCoreRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const projectileTracerGlowRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const flashCoreRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const flashGlowRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const impactFlashRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const impactGlowRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const impactParticleRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const lastFireAtRef = useRef(-Infinity);
+  const nextGunIndexRef = useRef(0);
+  const nextProjectileIndexRef = useRef(0);
+  const nextFlashIndexRef = useRef(0);
+  const nextImpactIndexRef = useRef(0);
+  const fallbackGunAnchors = useMemo(() => [
+    new THREE.Vector3(0.92, -0.18, -2.2),
+    new THREE.Vector3(-0.92, -0.18, -2.2),
+  ], []);
+  const gunAnchors = shipConfig.gunVecs.length ? shipConfig.gunVecs : fallbackGunAnchors;
+  const projectiles = useMemo<WeaponProjectileEffect[]>(
+    () => Array.from({ length: SHIP_WEAPON_MAX_PROJECTILES }, () => ({
+      active: false,
+      age: 0,
+      position: new THREE.Vector3(),
+      previousPosition: new THREE.Vector3(),
+      velocity: new THREE.Vector3(),
+    })),
+    [],
+  );
+  const flashes = useMemo<WeaponFlashEffect[]>(
+    () => Array.from({ length: SHIP_WEAPON_MAX_FLASHES }, () => ({
+      active: false,
+      age: 0,
+      life: SHIP_WEAPON_FLASH_LIFETIME_SECONDS,
+      position: new THREE.Vector3(),
+      localOffset: new THREE.Vector3(),
+      scale: 1,
+    })),
+    [],
+  );
+  const impacts = useMemo<WeaponImpactEffect[]>(
+    () => Array.from({ length: SHIP_WEAPON_MAX_IMPACTS }, () => ({
+      active: false,
+      age: 0,
+      life: SHIP_WEAPON_IMPACT_LIFETIME_SECONDS,
+      normal: new THREE.Vector3(0, 1, 0),
+      particleOffsets: Array.from({ length: SHIP_WEAPON_IMPACT_PARTICLE_COUNT }, () => new THREE.Vector3()),
+      particleVelocities: Array.from({ length: SHIP_WEAPON_IMPACT_PARTICLE_COUNT }, () => new THREE.Vector3()),
+      position: new THREE.Vector3(),
+    })),
+    [],
+  );
+  const raycaster = useMemo(() => new THREE.Raycaster(), []);
+  const raycastTargets = useMemo<THREE.Mesh[]>(() => [], []);
+  const projectileDirection = useMemo(() => new THREE.Vector3(), []);
+  const tracerUp = useMemo(() => new THREE.Vector3(0, 1, 0), []);
+  const impactNormal = useMemo(() => new THREE.Vector3(), []);
+  const nextProjectilePosition = useMemo(() => new THREE.Vector3(), []);
+  const randomVector = useMemo(() => new THREE.Vector3(), []);
+  const shipForward = useMemo(() => new THREE.Vector3(), []);
+  const muzzleWorld = useMemo(() => new THREE.Vector3(), []);
+  const tracerDirection = useMemo(() => new THREE.Vector3(), []);
+  const tracerGlowScale = useMemo(
+    () => new THREE.Vector3(SHIP_WEAPON_PROJECTILE_RADIUS * 2.4, SHIP_WEAPON_PROJECTILE_LENGTH * 1.08, SHIP_WEAPON_PROJECTILE_RADIUS * 2.4),
+    [],
+  );
+  const tracerMidpoint = useMemo(() => new THREE.Vector3(), []);
+  const tracerQuaternion = useMemo(() => new THREE.Quaternion(), []);
+  const tracerScale = useMemo(
+    () => new THREE.Vector3(SHIP_WEAPON_PROJECTILE_RADIUS, SHIP_WEAPON_PROJECTILE_LENGTH, SHIP_WEAPON_PROJECTILE_RADIUS),
+    [],
+  );
+
+  useFrame((frameState, delta) => {
+    const state = localStateRef.current;
+    const insideStationForceField = stationForceFields.some((field) => state.shipPosition.distanceToSquared(vectorFromTuple(field.position)) < field.radius ** 2);
+    const isPilotFiring = state.mode === 'pilot' && firingPrimaryRef.current && !insideStationForceField;
+
+    if (state.mode !== 'pilot') {
+      firingPrimaryRef.current = false;
+    }
+
+    if (isPilotFiring) {
+      while (frameState.clock.elapsedTime - lastFireAtRef.current >= SHIP_WEAPON_FIRE_INTERVAL_SECONDS) {
+        const gunAnchor = gunAnchors[nextGunIndexRef.current % gunAnchors.length];
+        nextGunIndexRef.current += 1;
+
+        muzzleWorld.copy(gunAnchor).applyQuaternion(state.shipRotation).add(state.shipPosition);
+        shipForward.set(0, 0, -1).applyQuaternion(state.shipRotation).normalize();
+
+        const projectile = projectiles[nextProjectileIndexRef.current % projectiles.length];
+        nextProjectileIndexRef.current += 1;
+        projectile.active = true;
+        projectile.age = 0;
+        projectile.position.copy(muzzleWorld);
+        projectile.previousPosition.copy(muzzleWorld);
+        projectile.velocity.copy(shipForward).multiplyScalar(SHIP_WEAPON_PROJECTILE_SPEED).add(state.shipVelocity);
+
+        const flash = flashes[nextFlashIndexRef.current % flashes.length];
+        nextFlashIndexRef.current += 1;
+        flash.active = true;
+        flash.age = 0;
+        flash.life = SHIP_WEAPON_FLASH_LIFETIME_SECONDS;
+        flash.position.copy(muzzleWorld);
+        flash.localOffset.copy(gunAnchor);
+        flash.scale = 0.48 + Math.random() * 0.24;
+
+        lastFireAtRef.current = Number.isFinite(lastFireAtRef.current)
+          ? lastFireAtRef.current + SHIP_WEAPON_FIRE_INTERVAL_SECONDS
+          : frameState.clock.elapsedTime;
+
+        if (!Number.isFinite(lastFireAtRef.current)) {
+          lastFireAtRef.current = frameState.clock.elapsedTime;
+        }
+
+        if (frameState.clock.elapsedTime - lastFireAtRef.current < SHIP_WEAPON_FIRE_INTERVAL_SECONDS) {
+          break;
+        }
+      }
+    } else if (!Number.isFinite(lastFireAtRef.current) || lastFireAtRef.current === -Infinity) {
+      lastFireAtRef.current = frameState.clock.elapsedTime;
+    } else if (frameState.clock.elapsedTime - lastFireAtRef.current > SHIP_WEAPON_FIRE_INTERVAL_SECONDS * 3) {
+      lastFireAtRef.current = frameState.clock.elapsedTime - SHIP_WEAPON_FIRE_INTERVAL_SECONDS;
+    }
+
+    for (let index = 0; index < projectiles.length; index += 1) {
+      const projectile = projectiles[index];
+      const headMesh = projectileHeadRefs.current[index];
+      const tracerCoreMesh = projectileTracerCoreRefs.current[index];
+      const tracerGlowMesh = projectileTracerGlowRefs.current[index];
+
+      if (!headMesh || !tracerCoreMesh || !tracerGlowMesh) {
+        continue;
+      }
+
+      if (!projectile.active) {
+        headMesh.visible = false;
+        tracerCoreMesh.visible = false;
+        tracerGlowMesh.visible = false;
+        continue;
+      }
+
+      projectile.age += delta;
+      if (projectile.age >= SHIP_WEAPON_PROJECTILE_LIFETIME_SECONDS) {
+        projectile.active = false;
+        headMesh.visible = false;
+        tracerCoreMesh.visible = false;
+        tracerGlowMesh.visible = false;
+        continue;
+      }
+
+      projectile.previousPosition.copy(projectile.position);
+      nextProjectilePosition.copy(projectile.position).addScaledVector(projectile.velocity, delta);
+      projectileDirection.copy(nextProjectilePosition).sub(projectile.position);
+      const stepDistance = projectileDirection.length();
+
+      if (stepDistance > 1e-5) {
+        projectileDirection.divideScalar(stepDistance);
+        raycaster.set(projectile.position, projectileDirection);
+        raycaster.far = stepDistance;
+        const forceFieldHit = findStationForceFieldHitOnSegment(projectile.position, nextProjectilePosition, stationForceFields);
+        raycastTargets.length = 0;
+        scene.traverseVisible((object) => {
+          if (object instanceof THREE.Mesh && object.parent && !shouldIgnoreWeaponCollision(object, localShipRef, weaponEffectsRef)) {
+            raycastTargets.push(object);
+          }
+        });
+        const hits = raycaster.intersectObjects(raycastTargets, false);
+        const validHit = hits.find((hit) => {
+          if (!(hit.object instanceof THREE.Mesh)) {
+            return false;
+          }
+          const shouldIgnore = hit.object.userData?.shouldIgnoreWeaponImpact;
+          return typeof shouldIgnore === 'function' ? !shouldIgnore(hit) : true;
+        });
+
+        if (forceFieldHit && (!validHit || forceFieldHit.distance <= validHit.distance)) {
+          projectile.active = false;
+          headMesh.visible = false;
+          tracerCoreMesh.visible = false;
+          tracerGlowMesh.visible = false;
+
+          const handleForceFieldImpact = stationForceFieldImpactHandlers.get(forceFieldHit.field.id);
+          handleForceFieldImpact?.(forceFieldHit.point);
+
+          const impact = impacts[nextImpactIndexRef.current % impacts.length];
+          nextImpactIndexRef.current += 1;
+          impact.active = true;
+          impact.age = 0;
+          impact.life = SHIP_WEAPON_IMPACT_LIFETIME_SECONDS;
+          impact.position.copy(forceFieldHit.point);
+          impactNormal.copy(forceFieldHit.point).sub(vectorFromTuple(forceFieldHit.field.position)).normalize();
+          impact.normal.copy(impactNormal);
+
+          for (let particleIndex = 0; particleIndex < SHIP_WEAPON_IMPACT_PARTICLE_COUNT; particleIndex += 1) {
+            impact.particleOffsets[particleIndex].set(0, 0, 0);
+            randomVector.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
+            impact.particleVelocities[particleIndex]
+              .copy(impact.normal)
+              .multiplyScalar(7 + Math.random() * 8)
+              .addScaledVector(randomVector, 4 + Math.random() * 6);
+          }
+
+          continue;
+        }
+
+        if (validHit) {
+          projectile.active = false;
+          headMesh.visible = false;
+          tracerCoreMesh.visible = false;
+          tracerGlowMesh.visible = false;
+
+          const onWeaponImpact = validHit.object.userData?.onWeaponImpact;
+          const impactResult = typeof onWeaponImpact === 'function' ? onWeaponImpact(validHit) : null;
+          const suppressDefaultImpact = Boolean(impactResult?.suppressDefaultImpact || validHit.object.userData?.suppressWeaponImpactEffect);
+          if (suppressDefaultImpact) {
+            continue;
+          }
+
+          const impact = impacts[nextImpactIndexRef.current % impacts.length];
+          nextImpactIndexRef.current += 1;
+          impact.active = true;
+          impact.age = 0;
+          impact.life = SHIP_WEAPON_IMPACT_LIFETIME_SECONDS;
+          impact.position.copy(validHit.point);
+          impactNormal.copy(validHit.face?.normal ?? projectileDirection).normalize();
+          impactNormal.transformDirection((validHit.object as THREE.Mesh).matrixWorld);
+          impact.normal.copy(impactNormal.normalize());
+
+          for (let particleIndex = 0; particleIndex < SHIP_WEAPON_IMPACT_PARTICLE_COUNT; particleIndex += 1) {
+            impact.particleOffsets[particleIndex].set(0, 0, 0);
+            randomVector.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
+            impact.particleVelocities[particleIndex]
+              .copy(impact.normal)
+              .multiplyScalar(7 + Math.random() * 8)
+              .addScaledVector(randomVector, 4 + Math.random() * 6);
+          }
+
+          continue;
+        }
+      }
+
+      projectile.position.copy(nextProjectilePosition);
+      tracerDirection.copy(projectile.velocity).normalize();
+      tracerMidpoint.copy(projectile.position).addScaledVector(tracerDirection, -SHIP_WEAPON_PROJECTILE_LENGTH * 0.5);
+      tracerQuaternion.setFromUnitVectors(tracerUp, tracerDirection);
+
+      headMesh.visible = true;
+      headMesh.position.copy(projectile.position);
+      headMesh.scale.setScalar(SHIP_WEAPON_PROJECTILE_RADIUS * 3.25);
+
+      tracerCoreMesh.visible = true;
+      tracerCoreMesh.position.copy(tracerMidpoint);
+      tracerCoreMesh.quaternion.copy(tracerQuaternion);
+      tracerCoreMesh.scale.copy(tracerScale);
+
+      tracerGlowMesh.visible = true;
+      tracerGlowMesh.position.copy(tracerMidpoint);
+      tracerGlowMesh.quaternion.copy(tracerQuaternion);
+      tracerGlowMesh.scale.copy(tracerGlowScale);
+    }
+
+    for (let index = 0; index < flashes.length; index += 1) {
+      const flash = flashes[index];
+      const flashCoreMesh = flashCoreRefs.current[index];
+      const flashGlowMesh = flashGlowRefs.current[index];
+
+      if (!flashCoreMesh || !flashGlowMesh) {
+        continue;
+      }
+
+      if (!flash.active) {
+        flashCoreMesh.visible = false;
+        flashGlowMesh.visible = false;
+        continue;
+      }
+
+      flash.age += delta;
+      if (flash.age >= flash.life) {
+        flash.active = false;
+        flashCoreMesh.visible = false;
+        flashGlowMesh.visible = false;
+        continue;
+      }
+
+      const alpha = 1 - flash.age / flash.life;
+      const flashPosition = flash.position.copy(flash.localOffset).applyQuaternion(state.shipRotation).add(state.shipPosition);
+      flashCoreMesh.visible = true;
+      flashCoreMesh.position.copy(flashPosition);
+      flashCoreMesh.scale.setScalar(flash.scale * (0.45 + alpha * 1.2));
+      flashGlowMesh.visible = true;
+      flashGlowMesh.position.copy(flashPosition);
+      flashGlowMesh.scale.setScalar(flash.scale * (0.9 + alpha * 2.0));
+      const flashCoreMaterial = flashCoreMesh.material;
+      if (flashCoreMaterial instanceof THREE.MeshBasicMaterial) {
+        flashCoreMaterial.opacity = 0.78 + alpha * 0.22;
+      }
+      const flashGlowMaterial = flashGlowMesh.material;
+      if (flashGlowMaterial instanceof THREE.MeshBasicMaterial) {
+        flashGlowMaterial.opacity = 0.36 + alpha * 0.26;
+      }
+    }
+
+    for (let impactIndex = 0; impactIndex < impacts.length; impactIndex += 1) {
+      const impact = impacts[impactIndex];
+      const impactFlashMesh = impactFlashRefs.current[impactIndex];
+      const impactGlowMesh = impactGlowRefs.current[impactIndex];
+
+      if (!impactFlashMesh || !impactGlowMesh) {
+        continue;
+      }
+
+      if (!impact.active) {
+        impactFlashMesh.visible = false;
+        impactGlowMesh.visible = false;
+        for (let particleIndex = 0; particleIndex < SHIP_WEAPON_IMPACT_PARTICLE_COUNT; particleIndex += 1) {
+          const particleMesh = impactParticleRefs.current[impactIndex * SHIP_WEAPON_IMPACT_PARTICLE_COUNT + particleIndex];
+          if (particleMesh) {
+            particleMesh.visible = false;
+          }
+        }
+        continue;
+      }
+
+      impact.age += delta;
+      if (impact.age >= impact.life) {
+        impact.active = false;
+        impactFlashMesh.visible = false;
+        impactGlowMesh.visible = false;
+        for (let particleIndex = 0; particleIndex < SHIP_WEAPON_IMPACT_PARTICLE_COUNT; particleIndex += 1) {
+          const particleMesh = impactParticleRefs.current[impactIndex * SHIP_WEAPON_IMPACT_PARTICLE_COUNT + particleIndex];
+          if (particleMesh) {
+            particleMesh.visible = false;
+          }
+        }
+        continue;
+      }
+
+      const impactAlpha = 1 - impact.age / impact.life;
+      impactFlashMesh.visible = true;
+      impactFlashMesh.position.copy(impact.position);
+      impactFlashMesh.scale.setScalar((0.18 + impactAlpha * 0.72) * SHIP_WEAPON_IMPACT_SCALE_MULTIPLIER);
+      const impactFlashMaterial = impactFlashMesh.material;
+      if (impactFlashMaterial instanceof THREE.MeshBasicMaterial) {
+        impactFlashMaterial.opacity = 0.45 + impactAlpha * 0.55;
+      }
+
+      impactGlowMesh.visible = true;
+      impactGlowMesh.position.copy(impact.position);
+      impactGlowMesh.scale.setScalar((0.35 + impactAlpha * 1.4) * SHIP_WEAPON_IMPACT_SCALE_MULTIPLIER);
+      const impactGlowMaterial = impactGlowMesh.material;
+      if (impactGlowMaterial instanceof THREE.MeshBasicMaterial) {
+        impactGlowMaterial.opacity = 0.18 + impactAlpha * 0.2;
+      }
+
+      for (let particleIndex = 0; particleIndex < SHIP_WEAPON_IMPACT_PARTICLE_COUNT; particleIndex += 1) {
+        const particleMesh = impactParticleRefs.current[impactIndex * SHIP_WEAPON_IMPACT_PARTICLE_COUNT + particleIndex];
+        if (!particleMesh) {
+          continue;
+        }
+
+        impact.particleOffsets[particleIndex].addScaledVector(impact.particleVelocities[particleIndex], delta);
+        impact.particleVelocities[particleIndex].multiplyScalar(Math.max(0, 1 - 3.8 * delta));
+        impact.particleVelocities[particleIndex].addScaledVector(impact.normal, -2.2 * delta);
+
+        particleMesh.visible = true;
+        particleMesh.position.copy(impact.position).add(impact.particleOffsets[particleIndex]);
+        particleMesh.scale.setScalar((0.03 + impactAlpha * 0.08) * SHIP_WEAPON_IMPACT_SCALE_MULTIPLIER);
+        const particleMaterial = particleMesh.material;
+        if (particleMaterial instanceof THREE.MeshBasicMaterial) {
+          particleMaterial.opacity = 0.1 + impactAlpha * 0.5;
+        }
+      }
+    }
+  });
+
+  return (
+    <group ref={weaponEffectsRef} userData={{ ignoreWeaponCollision: true }}>
+      {projectiles.map((_, index) => (
+        <group key={`weapon-projectile-${index}`}>
+          <mesh ref={(mesh) => {
+            projectileTracerGlowRefs.current[index] = mesh;
+          }} visible={false} renderOrder={60}>
+            <cylinderGeometry args={[1, 1, 1, 8, 1, true]} />
+            <meshBasicMaterial color="#ff8a47" transparent opacity={0.22} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+          </mesh>
+          <mesh ref={(mesh) => {
+            projectileTracerCoreRefs.current[index] = mesh;
+          }} visible={false} renderOrder={61}>
+            <cylinderGeometry args={[1, 1, 1, 8, 1, true]} />
+            <meshBasicMaterial color="#ffffff" transparent opacity={0.96} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+          </mesh>
+          <mesh ref={(mesh) => {
+            projectileHeadRefs.current[index] = mesh;
+          }} visible={false} renderOrder={62}>
+            <sphereGeometry args={[1, 10, 10]} />
+            <meshBasicMaterial color="#fff3d6" transparent opacity={1} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+          </mesh>
+        </group>
+      ))}
+      {flashes.map((_, index) => (
+        <group key={`weapon-flash-${index}`}>
+          <mesh ref={(mesh) => {
+            flashGlowRefs.current[index] = mesh;
+          }} visible={false} renderOrder={63}>
+            <sphereGeometry args={[1, 12, 12]} />
+            <meshBasicMaterial color="#fff0d8" transparent opacity={0.6} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+          </mesh>
+          <mesh ref={(mesh) => {
+            flashCoreRefs.current[index] = mesh;
+          }} visible={false} renderOrder={64}>
+            <sphereGeometry args={[1, 12, 12]} />
+            <meshBasicMaterial color="#ffffff" transparent opacity={1} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+          </mesh>
+        </group>
+      ))}
+      {impacts.map((_, impactIndex) => (
+        <group key={`weapon-impact-${impactIndex}`}>
+          <mesh ref={(mesh) => {
+            impactGlowRefs.current[impactIndex] = mesh;
+          }} visible={false} renderOrder={65}>
+            <sphereGeometry args={[1, 12, 12]} />
+            <meshBasicMaterial color="#ff9d57" transparent opacity={0.35} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+          </mesh>
+          <mesh ref={(mesh) => {
+            impactFlashRefs.current[impactIndex] = mesh;
+          }} visible={false} renderOrder={66}>
+            <sphereGeometry args={[1, 12, 12]} />
+            <meshBasicMaterial color="#fff4df" transparent opacity={1} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+          </mesh>
+          {Array.from({ length: SHIP_WEAPON_IMPACT_PARTICLE_COUNT }, (_, particleIndex) => (
+            <mesh
+              key={`weapon-impact-${impactIndex}-particle-${particleIndex}`}
+              ref={(mesh) => {
+                impactParticleRefs.current[impactIndex * SHIP_WEAPON_IMPACT_PARTICLE_COUNT + particleIndex] = mesh;
+              }}
+              visible={false}
+              renderOrder={67}
+            >
+              <sphereGeometry args={[1, 8, 8]} />
+              <meshBasicMaterial color="#d9c2a3" transparent opacity={0.6} depthWrite={false} toneMapped={false} />
+            </mesh>
+          ))}
+        </group>
+      ))}
+    </group>
+  );
+}
+
 function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system, localStateRef }: { autopilotTarget: AutopilotDestination | null; highlightedTarget: HighlightTarget | null; renderPosition: Vec3Tuple; system: StarSystemData; localStateRef: MutableRefObject<LocalGameState> }): ReactElement {
   const { camera, scene } = useThree();
   const haloRef = useRef<THREE.Mesh>(null);
@@ -5583,7 +6600,7 @@ function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system
       ) : null}
 
       {system.asteroidGroups.map((asteroidGroup) => (
-        <AsteroidCluster key={asteroidGroup.id} group={asteroidGroup}  physicalPosition={tupleAdd(renderPosition, asteroidGroup.position)} />
+        <AsteroidCluster key={asteroidGroup.id} group={asteroidGroup} localStateRef={localStateRef} physicalPosition={tupleAdd(renderPosition, asteroidGroup.position)} />
       ))}
     </>
   );
@@ -5912,9 +6929,11 @@ function DistanceVisibleGroup({
 
 function AsteroidCluster({
   group,
+  localStateRef,
     physicalPosition: physicalPositionTuple,
 }: {
   group: AsteroidGroupData;
+  localStateRef: MutableRefObject<LocalGameState>;
     physicalPosition: Vec3Tuple;
 }): ReactElement {
   const { camera } = useThree();
@@ -5966,7 +6985,7 @@ function AsteroidCluster({
       
       {showCluster && (
         <group>
-          <AsteroidDust dust={group.dust} physicalPosition={physicalPositionTuple} show={showCluster} />
+          <AsteroidDust dust={group.dust} localStateRef={localStateRef} physicalPosition={physicalPositionTuple} show={showCluster} />
           <SpaceStation station={group.station} physicalPosition={tupleAdd(physicalPositionTuple, group.station.position)} scale={ASTEROID_STATION_SCALE} />
           {asteroidsToRender.map((asteroid) => (
             <AsteroidMesh key={asteroid.id} asteroid={asteroid} physicalPosition={tupleAdd(physicalPositionTuple, asteroid.position)} show={showCluster} />
@@ -5978,62 +6997,327 @@ function AsteroidCluster({
 }
 
 function SpaceStation({ station, physicalPosition, scale }: { station: StationData; physicalPosition: Vec3Tuple; scale: number }): ReactElement {
+  const fieldRadius = useMemo(() => getStationForceFieldRadius(scale), [scale]);
+
   return (
     <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={1_200_000_000}>
-      <group scale={scale}>
-        <mesh>
-          <cylinderGeometry args={[0.8, 0.8, 5.5, 18]} />
-          <meshStandardMaterial color="#cbd5e1" metalness={0.8} roughness={0.24} />
-        </mesh>
-        <mesh rotation={[0, 0, Math.PI / 2]}>
-          <torusGeometry args={[3.4, 0.4, 14, 32]} />
-          <meshStandardMaterial color="#60a5fa" metalness={0.55} roughness={0.32} emissive="#1d4ed8" emissiveIntensity={0.45} />
-        </mesh>
-        <mesh rotation={[Math.PI / 2, 0, 0]}>
-          <torusGeometry args={[2.2, 0.22, 14, 28]} />
-          <meshStandardMaterial color="#e2e8f0" metalness={0.65} roughness={0.28} />
-        </mesh>
-        <mesh position={[0, 0.3, 0]}>
-          <sphereGeometry args={[0.65, 18, 18]} />
-          <meshBasicMaterial color="#22d3ee" />
-        </mesh>
-      </group>
+      <>
+        <StationForceField fieldId={`${station.id}:force-field`} radius={fieldRadius} />
+        <group scale={scale}>
+          <mesh>
+            <cylinderGeometry args={[0.8, 0.8, 5.5, 18]} />
+            <meshStandardMaterial color="#cbd5e1" metalness={0.8} roughness={0.24} />
+          </mesh>
+          <mesh rotation={[0, 0, Math.PI / 2]}>
+            <torusGeometry args={[3.4, 0.4, 14, 32]} />
+            <meshStandardMaterial color="#60a5fa" metalness={0.55} roughness={0.32} emissive="#1d4ed8" emissiveIntensity={0.45} />
+          </mesh>
+          <mesh rotation={[Math.PI / 2, 0, 0]}>
+            <torusGeometry args={[2.2, 0.22, 14, 28]} />
+            <meshStandardMaterial color="#e2e8f0" metalness={0.65} roughness={0.28} />
+          </mesh>
+          <mesh position={[0, 0.3, 0]}>
+            <sphereGeometry args={[0.65, 18, 18]} />
+            <meshBasicMaterial color="#22d3ee" />
+          </mesh>
+        </group>
+      </>
     </PhysicalProxyGroup>
   );
 }
 
-function AsteroidDust({ dust, physicalPosition, show }: { dust: DustAsteroidData[]; physicalPosition: Vec3Tuple; show: boolean }): ReactElement {
+function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: DustAsteroidData[]; localStateRef: MutableRefObject<LocalGameState>; physicalPosition: Vec3Tuple; show: boolean }): ReactElement {
   const instancedMeshRef = useRef<THREE.InstancedMesh>(null);
-  
-  const matrices = useMemo(() => {
-    const _matrices = new Float32Array(dust.length * 16);
-    const dummy = new THREE.Object3D();
-
-    dust.forEach((d, i) => {
-      dummy.position.set(d.position[0], d.position[1], d.position[2]);
-      dummy.rotation.set(d.rotation[0], d.rotation[1], d.rotation[2]);
-      dummy.scale.set(d.size, d.size, d.size);
-      dummy.updateMatrix();
-      dummy.matrix.toArray(_matrices, i * 16);
-    });
-
-    return _matrices;
-  }, [dust]);
+  const dustGroupRef = useRef<THREE.Group>(null);
+  const explosionFlashRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const explosionGlowRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const explosionFragmentRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const nextExplosionIndexRef = useRef(0);
+  const shotCountsRef = useRef<number[]>([]);
+  const removedRef = useRef<boolean[]>([]);
+  const matrixDummy = useMemo(() => new THREE.Object3D(), []);
+  const hiddenPosition = useMemo(() => new THREE.Vector3(0, -1_000_000, 0), []);
+  const localHitPoint = useMemo(() => new THREE.Vector3(), []);
+  const worldHitPoint = useMemo(() => new THREE.Vector3(), []);
+  const randomDirection = useMemo(() => new THREE.Vector3(), []);
+  const upward = useMemo(() => new THREE.Vector3(0, 1, 0), []);
+  const explosionDirection = useMemo(() => new THREE.Vector3(), []);
+  const shipBlastDirection = useMemo(() => new THREE.Vector3(), []);
+  const currentShipForward = useMemo(() => new THREE.Vector3(), []);
+  const projectedForward = useMemo(() => new THREE.Vector3(), []);
+  const fallbackForward = useMemo(() => new THREE.Vector3(), []);
+  const targetShipRotation = useMemo(() => new THREE.Quaternion(), []);
+  const lookMatrix = useMemo(() => new THREE.Matrix4(), []);
+  const lookTarget = useMemo(() => new THREE.Vector3(), []);
+  const lookOrigin = useMemo(() => new THREE.Vector3(), []);
+  const baseMatrices = useMemo(() => dust.map((d) => {
+    const matrix = new THREE.Matrix4();
+    matrixDummy.position.set(d.position[0], d.position[1], d.position[2]);
+    matrixDummy.rotation.set(d.rotation[0], d.rotation[1], d.rotation[2]);
+    matrixDummy.scale.set(d.size, d.size, d.size);
+    matrixDummy.updateMatrix();
+    matrix.copy(matrixDummy.matrix);
+    return matrix;
+  }), [dust, matrixDummy]);
+  const explosions = useMemo(() => Array.from({ length: DUST_ASTEROID_MAX_EXPLOSIONS }, () => ({
+    active: false,
+    age: 0,
+    life: DUST_ASTEROID_EXPLOSION_LIFETIME_SECONDS,
+    position: new THREE.Vector3(),
+    scale: 1,
+    burstOffsets: Array.from({ length: DUST_ASTEROID_EXPLOSION_SUB_BURSTS }, () => new THREE.Vector3()),
+    burstScales: Array.from({ length: DUST_ASTEROID_EXPLOSION_SUB_BURSTS }, () => 1),
+    fragmentPositions: Array.from({ length: DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT }, () => new THREE.Vector3()),
+    fragmentVelocities: Array.from({ length: DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT }, () => new THREE.Vector3()),
+  })), []);
 
   useEffect(() => {
-    if (instancedMeshRef.current) {
-      instancedMeshRef.current.instanceMatrix.set(matrices);
-      instancedMeshRef.current.instanceMatrix.needsUpdate = true;
+    if (!instancedMeshRef.current) {
+      return;
     }
-  }, [matrices]);
+
+    shotCountsRef.current = Array.from({ length: dust.length }, () => 0);
+    removedRef.current = Array.from({ length: dust.length }, () => false);
+
+    dust.forEach((_, index) => {
+      instancedMeshRef.current?.setMatrixAt(index, baseMatrices[index]);
+    });
+    instancedMeshRef.current.instanceMatrix.needsUpdate = true;
+
+    const handleDustImpact = (hit: THREE.Intersection<THREE.Object3D>) => {
+      const instanceId = hit.instanceId;
+      if (instanceId === undefined || instanceId === null || removedRef.current[instanceId]) {
+        return;
+      }
+
+      shotCountsRef.current[instanceId] = (shotCountsRef.current[instanceId] ?? 0) + 1;
+      if (shotCountsRef.current[instanceId] < DUST_ASTEROID_HITS_TO_DESTROY) {
+        return;
+      }
+
+      removedRef.current[instanceId] = true;
+      matrixDummy.position.copy(hiddenPosition);
+      matrixDummy.rotation.set(0, 0, 0);
+      matrixDummy.scale.setScalar(0.0001);
+      matrixDummy.updateMatrix();
+      instancedMeshRef.current?.setMatrixAt(instanceId, matrixDummy.matrix);
+      if (instancedMeshRef.current) {
+        instancedMeshRef.current.instanceMatrix.needsUpdate = true;
+      }
+
+      const explosion = explosions[nextExplosionIndexRef.current % explosions.length];
+      nextExplosionIndexRef.current += 1;
+      explosion.active = true;
+      explosion.age = 0;
+      explosion.life = DUST_ASTEROID_EXPLOSION_LIFETIME_SECONDS;
+      explosion.scale = Math.max(0.6, dust[instanceId]?.size ?? 0.6) * 2.8;
+      worldHitPoint.copy(hit.point);
+      localHitPoint.copy(worldHitPoint);
+      dustGroupRef.current?.worldToLocal(localHitPoint);
+      explosion.position.copy(localHitPoint);
+
+      for (let burstIndex = 0; burstIndex < DUST_ASTEROID_EXPLOSION_SUB_BURSTS; burstIndex += 1) {
+        randomDirection.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
+        explosion.burstOffsets[burstIndex]
+          .copy(randomDirection)
+          .multiplyScalar(explosion.scale * (0.2 + Math.random() * 0.95));
+        explosion.burstScales[burstIndex] = 0.55 + Math.random() * 0.9;
+      }
+
+      for (let fragmentIndex = 0; fragmentIndex < DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT; fragmentIndex += 1) {
+        explosion.fragmentPositions[fragmentIndex].set(0, 0, 0);
+        randomDirection.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
+        explosionDirection.copy(upward).multiplyScalar(0.35 + Math.random() * 0.8).addScaledVector(randomDirection, 1.2 + Math.random() * 2.2).normalize();
+        explosion.fragmentVelocities[fragmentIndex].copy(explosionDirection).multiplyScalar(explosion.scale * (1.8 + Math.random() * 2.6));
+      }
+
+      const shipDistance = localStateRef.current.shipPosition.distanceTo(worldHitPoint);
+      if (shipDistance <= DUST_ASTEROID_BLAST_RADIUS && shipDistance > 1e-4) {
+        shipBlastDirection.copy(localStateRef.current.shipPosition).sub(worldHitPoint).normalize();
+        const blastStrength = (1 - shipDistance / DUST_ASTEROID_BLAST_RADIUS) * (DUST_ASTEROID_BLAST_PUSH_VELOCITY + explosion.scale * 10);
+        localStateRef.current.shipVelocity.addScaledVector(shipBlastDirection, blastStrength);
+
+        currentShipForward.set(0, 0, -1).applyQuaternion(localStateRef.current.shipRotation);
+        projectedForward.copy(currentShipForward).addScaledVector(shipBlastDirection, -currentShipForward.dot(shipBlastDirection));
+        if (projectedForward.lengthSq() < 1e-4) {
+          fallbackForward.set(1, 0, 0).addScaledVector(shipBlastDirection, -shipBlastDirection.x);
+          if (fallbackForward.lengthSq() < 1e-4) {
+            fallbackForward.set(0, 0, -1).addScaledVector(shipBlastDirection, shipBlastDirection.z);
+          }
+          projectedForward.copy(fallbackForward);
+        }
+        projectedForward.normalize();
+        lookOrigin.set(0, 0, 0);
+        lookTarget.copy(projectedForward);
+        lookMatrix.lookAt(lookOrigin, lookTarget, shipBlastDirection);
+        targetShipRotation.setFromRotationMatrix(lookMatrix);
+        localStateRef.current.shipRotation.slerp(targetShipRotation, 0.6);
+      }
+    };
+
+    const shouldIgnoreDustImpact = (hit: THREE.Intersection<THREE.Object3D>) => {
+      const instanceId = hit.instanceId;
+      return instanceId === undefined || instanceId === null || removedRef.current[instanceId];
+    };
+
+    instancedMeshRef.current.userData.onWeaponImpact = handleDustImpact;
+    instancedMeshRef.current.userData.shouldIgnoreWeaponImpact = shouldIgnoreDustImpact;
+
+    return () => {
+      if (instancedMeshRef.current) {
+        delete instancedMeshRef.current.userData.onWeaponImpact;
+        delete instancedMeshRef.current.userData.shouldIgnoreWeaponImpact;
+      }
+    };
+  }, [baseMatrices, dust, explosions, fallbackForward, hiddenPosition, localHitPoint, localStateRef, lookMatrix, lookOrigin, lookTarget, matrixDummy, nextExplosionIndexRef, projectedForward, randomDirection, shipBlastDirection, targetShipRotation, upward, worldHitPoint]);
+
+  useFrame((_state, delta) => {
+    for (let explosionIndex = 0; explosionIndex < explosions.length; explosionIndex += 1) {
+      const explosion = explosions[explosionIndex];
+      const hasAllBurstMeshes = Array.from({ length: DUST_ASTEROID_EXPLOSION_SUB_BURSTS }).every((_, burstIndex) => {
+        const refIndex = explosionIndex * DUST_ASTEROID_EXPLOSION_SUB_BURSTS + burstIndex;
+        return Boolean(explosionFlashRefs.current[refIndex] && explosionGlowRefs.current[refIndex]);
+      });
+
+      if (!hasAllBurstMeshes) {
+        continue;
+      }
+
+      if (!explosion.active) {
+        for (let burstIndex = 0; burstIndex < DUST_ASTEROID_EXPLOSION_SUB_BURSTS; burstIndex += 1) {
+          const refIndex = explosionIndex * DUST_ASTEROID_EXPLOSION_SUB_BURSTS + burstIndex;
+          const flashMesh = explosionFlashRefs.current[refIndex];
+          const glowMesh = explosionGlowRefs.current[refIndex];
+          if (flashMesh) {
+            flashMesh.visible = false;
+          }
+          if (glowMesh) {
+            glowMesh.visible = false;
+          }
+        }
+        for (let fragmentIndex = 0; fragmentIndex < DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT; fragmentIndex += 1) {
+          const fragmentMesh = explosionFragmentRefs.current[explosionIndex * DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT + fragmentIndex];
+          if (fragmentMesh) {
+            fragmentMesh.visible = false;
+          }
+        }
+        continue;
+      }
+
+      explosion.age += delta;
+      if (explosion.age >= explosion.life) {
+        explosion.active = false;
+        for (let burstIndex = 0; burstIndex < DUST_ASTEROID_EXPLOSION_SUB_BURSTS; burstIndex += 1) {
+          const refIndex = explosionIndex * DUST_ASTEROID_EXPLOSION_SUB_BURSTS + burstIndex;
+          const flashMesh = explosionFlashRefs.current[refIndex];
+          const glowMesh = explosionGlowRefs.current[refIndex];
+          if (flashMesh) {
+            flashMesh.visible = false;
+          }
+          if (glowMesh) {
+            glowMesh.visible = false;
+          }
+        }
+        for (let fragmentIndex = 0; fragmentIndex < DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT; fragmentIndex += 1) {
+          const fragmentMesh = explosionFragmentRefs.current[explosionIndex * DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT + fragmentIndex];
+          if (fragmentMesh) {
+            fragmentMesh.visible = false;
+          }
+        }
+        continue;
+      }
+
+      const alpha = 1 - explosion.age / explosion.life;
+      for (let burstIndex = 0; burstIndex < DUST_ASTEROID_EXPLOSION_SUB_BURSTS; burstIndex += 1) {
+        const refIndex = explosionIndex * DUST_ASTEROID_EXPLOSION_SUB_BURSTS + burstIndex;
+        const flashMesh = explosionFlashRefs.current[refIndex];
+        const glowMesh = explosionGlowRefs.current[refIndex];
+        if (!flashMesh || !glowMesh) {
+          continue;
+        }
+
+        const burstSpread = 0.35 + (1 - alpha) * 0.9;
+        const burstPosition = explosion.position.clone().addScaledVector(explosion.burstOffsets[burstIndex], burstSpread);
+        const burstScale = explosion.scale * explosion.burstScales[burstIndex];
+
+        flashMesh.visible = true;
+        flashMesh.position.copy(burstPosition);
+        flashMesh.scale.setScalar(burstScale * (0.65 + alpha * 1.2));
+        const flashMaterial = flashMesh.material;
+        if (flashMaterial instanceof THREE.MeshBasicMaterial) {
+          flashMaterial.opacity = 0.35 + alpha * 0.65;
+        }
+
+        glowMesh.visible = true;
+        glowMesh.position.copy(burstPosition);
+        glowMesh.scale.setScalar(burstScale * (1.25 + alpha * 2.1));
+        const glowMaterial = glowMesh.material;
+        if (glowMaterial instanceof THREE.MeshBasicMaterial) {
+          glowMaterial.opacity = 0.12 + alpha * 0.24;
+        }
+      }
+
+      for (let fragmentIndex = 0; fragmentIndex < DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT; fragmentIndex += 1) {
+        const fragmentMesh = explosionFragmentRefs.current[explosionIndex * DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT + fragmentIndex];
+        if (!fragmentMesh) {
+          continue;
+        }
+
+        explosion.fragmentPositions[fragmentIndex].addScaledVector(explosion.fragmentVelocities[fragmentIndex], delta);
+        explosion.fragmentVelocities[fragmentIndex].multiplyScalar(Math.max(0, 1 - 1.9 * delta));
+
+        fragmentMesh.visible = true;
+        fragmentMesh.position.copy(explosion.position).add(explosion.fragmentPositions[fragmentIndex]);
+        fragmentMesh.scale.setScalar(explosion.scale * (0.12 + alpha * 0.18));
+        const fragmentMaterial = fragmentMesh.material;
+        if (fragmentMaterial instanceof THREE.MeshStandardMaterial) {
+          fragmentMaterial.emissiveIntensity = alpha * 0.18;
+          fragmentMaterial.opacity = 0.22 + alpha * 0.78;
+        }
+      }
+    }
+  });
 
   return (
     <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={SMALL_ASTEROID_VISIBILITY_RANGE * 2} linearDistance={ASTEROID_PROXY_LINEAR_DISTANCE} logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}>
-      <group visible={show}>
-        <instancedMesh ref={instancedMeshRef} raycast={() => null} args={[null as any, null as any, dust.length]}>
+      <group ref={dustGroupRef} visible={show}>
+        <instancedMesh ref={instancedMeshRef} args={[null as any, null as any, dust.length]}>
           <dodecahedronGeometry args={[1, 0]} />
           <meshStandardMaterial color="#64748b" roughness={0.96} metalness={0.06} />
         </instancedMesh>
+        {explosions.map((_, explosionIndex) => (
+          <group key={`dust-explosion-${explosionIndex}`}>
+            {Array.from({ length: DUST_ASTEROID_EXPLOSION_SUB_BURSTS }, (_, burstIndex) => (
+              <group key={`dust-explosion-${explosionIndex}-burst-${burstIndex}`}>
+                <mesh ref={(mesh) => {
+                  explosionGlowRefs.current[explosionIndex * DUST_ASTEROID_EXPLOSION_SUB_BURSTS + burstIndex] = mesh;
+                }} visible={false} renderOrder={71}>
+                  <sphereGeometry args={[1, 12, 12]} />
+                  <meshBasicMaterial color="#ff9d57" transparent opacity={0.35} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+                </mesh>
+                <mesh ref={(mesh) => {
+                  explosionFlashRefs.current[explosionIndex * DUST_ASTEROID_EXPLOSION_SUB_BURSTS + burstIndex] = mesh;
+                }} visible={false} renderOrder={72}>
+                  <sphereGeometry args={[1, 12, 12]} />
+                  <meshBasicMaterial color="#fff4df" transparent opacity={1} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+                </mesh>
+              </group>
+            ))}
+            {Array.from({ length: DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT }, (_, fragmentIndex) => (
+              <mesh
+                key={`dust-explosion-${explosionIndex}-fragment-${fragmentIndex}`}
+                ref={(mesh) => {
+                  explosionFragmentRefs.current[explosionIndex * DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT + fragmentIndex] = mesh;
+                }}
+                visible={false}
+                renderOrder={73}
+              >
+                <dodecahedronGeometry args={[1, 0]} />
+                <meshStandardMaterial color="#64748b" transparent opacity={1} roughness={0.98} metalness={0.04} emissive="#f59e0b" emissiveIntensity={0.12} />
+              </mesh>
+            ))}
+          </group>
+        ))}
       </group>
     </PhysicalProxyGroup>
   );
