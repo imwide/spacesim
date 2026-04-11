@@ -302,6 +302,10 @@ const stationWalkableRoots = new Map<string, THREE.Object3D>();
 const CARTOON_OUTLINE_ANGLE_DEGREES = 35;
 const CARTOON_OUTLINE_DEPTH_THRESHOLD = 0.0025;
 
+/** Objects registered here are hidden during the outline normal/depth pass
+ *  so they don't receive cartoon outlines (e.g. star body, lens flare). */
+const outlineExcludedObjects = new Set<THREE.Object3D>();
+
 const CARTOON_OUTLINE_VERTEX_SHADER = /* glsl */ `
   varying vec2 vUv;
 
@@ -343,14 +347,11 @@ const CARTOON_OUTLINE_FRAGMENT_SHADER = /* glsl */ `
   void main() {
     vec4 baseColor = texture2D(tDiffuse, vUv);
     float centerDepthSample = texture2D(tDepth, vUv).x;
-
-    if (centerDepthSample >= 1.0) {
-      gl_FragColor = baseColor;
-      return;
-    }
-
-    vec3 centerNormal = decodeNormal(texture2D(tNormal, vUv).xyz);
-    float centerDepth = readLinearDepth(vUv);
+    bool centerHasGeometry = centerDepthSample < 1.0;
+    vec3 centerNormal = centerHasGeometry
+      ? decodeNormal(texture2D(tNormal, vUv).xyz)
+      : vec3(0.0, 0.0, 0.0);
+    float centerDepth = centerHasGeometry ? readLinearDepth(vUv) : 1e20;
 
     float normalEdge = 0.0;
     float depthEdge = 0.0;
@@ -368,9 +369,14 @@ const CARTOON_OUTLINE_FRAGMENT_SHADER = /* glsl */ `
     for (int i = 0; i < 8; i += 1) {
       vec2 sampleUv = vUv + offsets[i] * texelSize;
       float sampleDepthRaw = texture2D(tDepth, sampleUv).x;
+      bool sampleHasGeometry = sampleDepthRaw < 1.0;
 
-      if (sampleDepthRaw >= 1.0) {
+      if (centerHasGeometry != sampleHasGeometry) {
         depthEdge = 1.0;
+        continue;
+      }
+
+      if (!centerHasGeometry || !sampleHasGeometry) {
         continue;
       }
 
@@ -2789,15 +2795,17 @@ function CartoonOutlinePostProcess(): null {
   const renderPassRef = useRef<RenderPass | null>(null);
   const outlinePassRef = useRef<ShaderPass | null>(null);
   const outputPassRef = useRef<OutputPass | null>(null);
+  const renderPixelWidth = Math.max(1, Math.floor(size.width * gl.getPixelRatio()));
+  const renderPixelHeight = Math.max(1, Math.floor(size.height * gl.getPixelRatio()));
 
   useEffect(() => {
-    const normalTarget = new THREE.WebGLRenderTarget(size.width, size.height, {
-      minFilter: THREE.NearestFilter,
-      magFilter: THREE.NearestFilter,
+    const normalTarget = new THREE.WebGLRenderTarget(renderPixelWidth, renderPixelHeight, {
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
       depthBuffer: true,
       stencilBuffer: false,
     });
-    normalTarget.depthTexture = new THREE.DepthTexture(size.width, size.height);
+    normalTarget.depthTexture = new THREE.DepthTexture(renderPixelWidth, renderPixelHeight);
     normalTarget.depthTexture.minFilter = THREE.NearestFilter;
     normalTarget.depthTexture.magFilter = THREE.NearestFilter;
 
@@ -2811,7 +2819,7 @@ function CartoonOutlinePostProcess(): null {
         tDiffuse: { value: null },
         tNormal: { value: normalTarget.texture },
         tDepth: { value: normalTarget.depthTexture },
-        texelSize: { value: new THREE.Vector2(1 / size.width, 1 / size.height) },
+        texelSize: { value: new THREE.Vector2(1 / renderPixelWidth, 1 / renderPixelHeight) },
         outlineColor: { value: new THREE.Color('#000000') },
         normalDotThreshold: { value: Math.cos(THREE.MathUtils.degToRad(CARTOON_OUTLINE_ANGLE_DEGREES)) },
         depthThreshold: { value: CARTOON_OUTLINE_DEPTH_THRESHOLD },
@@ -2843,7 +2851,7 @@ function CartoonOutlinePostProcess(): null {
       outlinePassRef.current = null;
       outputPassRef.current = null;
     };
-  }, [camera, gl, scene, size.height, size.width]);
+  }, [camera, gl, renderPixelHeight, renderPixelWidth, scene, size.height, size.width]);
 
   useEffect(() => {
     if (composerRef.current) {
@@ -2852,10 +2860,10 @@ function CartoonOutlinePostProcess(): null {
     }
 
     if (normalTargetRef.current) {
-      normalTargetRef.current.setSize(size.width, size.height);
+      normalTargetRef.current.setSize(renderPixelWidth, renderPixelHeight);
       if (normalTargetRef.current.depthTexture) {
         normalTargetRef.current.depthTexture.dispose();
-        normalTargetRef.current.depthTexture = new THREE.DepthTexture(size.width, size.height);
+        normalTargetRef.current.depthTexture = new THREE.DepthTexture(renderPixelWidth, renderPixelHeight);
         normalTargetRef.current.depthTexture.minFilter = THREE.NearestFilter;
         normalTargetRef.current.depthTexture.magFilter = THREE.NearestFilter;
       }
@@ -2864,11 +2872,12 @@ function CartoonOutlinePostProcess(): null {
     if (outlinePassRef.current) {
       outlinePassRef.current.material.uniforms.tNormal.value = normalTargetRef.current?.texture ?? null;
       outlinePassRef.current.material.uniforms.tDepth.value = normalTargetRef.current?.depthTexture ?? null;
-      outlinePassRef.current.material.uniforms.texelSize.value.set(1 / size.width, 1 / size.height);
+      outlinePassRef.current.material.uniforms.texelSize.value.set(1 / renderPixelWidth, 1 / renderPixelHeight);
     }
-  }, [gl, size.height, size.width]);
 
-  useFrame(() => {
+  }, [gl, renderPixelHeight, renderPixelWidth, size.height, size.width]);
+
+  useFrame((_state, _delta) => {
     const composer = composerRef.current;
     const normalTarget = normalTargetRef.current;
     const outlinePass = outlinePassRef.current;
@@ -2881,19 +2890,32 @@ function CartoonOutlinePostProcess(): null {
     outlinePass.material.uniforms.cameraFar.value = camera.far;
     renderPass.camera = camera;
 
-    const previousBackground = scene.background;
     const previousOverrideMaterial = scene.overrideMaterial;
     const previousTarget = gl.getRenderTarget();
 
+    // 1. Hide excluded objects (star body, flare, etc.) for the normal/depth pass
+    const hiddenByUs: THREE.Object3D[] = [];
+    outlineExcludedObjects.forEach((obj) => {
+      if (obj.visible) {
+        obj.visible = false;
+        hiddenByUs.push(obj);
+      }
+    });
+
+    // 2. Render normals+depth (excluded objects are hidden)
     scene.overrideMaterial = normalMaterial;
-    scene.background = null;
     gl.setRenderTarget(normalTarget);
     gl.clear();
     gl.render(scene, camera);
-
     scene.overrideMaterial = previousOverrideMaterial;
-    scene.background = previousBackground;
     gl.setRenderTarget(previousTarget);
+
+    // 3. Restore excluded objects before the main color pass
+    for (const obj of hiddenByUs) {
+      obj.visible = true;
+    }
+
+    // 4. Composer renders the full scene with outline applied
     composer.render();
   }, 1);
 
@@ -4513,7 +4535,6 @@ function GameScene({
       <ShipWeaponEffects firingPrimaryRef={firingPrimaryRef} localShipRef={shipGroupRef} localStateRef={localStateRef} stationForceFields={stationForceFields} shipConfig={shipConfig} />
       <group ref={shipGroupRef}>
         <ShipExteriorModel config={shipConfig} highlight showDebugAnchors={showDebugAnchors} />
-        <ShipScaleReference />
       </group>
       {highlightedTarget?.kind === 'ship' && (mode === 'space' || mode === 'planet-surface') ? (
         <ShipHighlightTag target={highlightedTarget} localStateRef={localStateRef} />
@@ -4530,42 +4551,6 @@ function GameScene({
 
 function walkSpeed(state: LocalGameState): number {
   return Math.sqrt(state.interiorVelocity.x ** 2 + state.interiorVelocity.z ** 2);
-}
-
-function ShipScaleReference(): ReactElement {
-  return (
-    <group position={[7, -3, 0]}>
-      <mesh rotation={[0, 0, Math.PI / 2]}>
-        <cylinderGeometry args={[0.08, 0.08, 10, 12]} />
-        <meshBasicMaterial color="#22d3ee" toneMapped={false} />
-      </mesh>
-      <mesh position={[-5, 0, 0]}>
-        <boxGeometry args={[0.3, 0.3, 0.3]} />
-        <meshBasicMaterial color="#ffffff" toneMapped={false} />
-      </mesh>
-      <mesh position={[5, 0, 0]}>
-        <boxGeometry args={[0.3, 0.3, 0.3]} />
-        <meshBasicMaterial color="#ffffff" toneMapped={false} />
-      </mesh>
-      <Html center distanceFactor={14} position={[0, 0.8, 0]}>
-        <div
-          style={{
-            pointerEvents: 'none',
-            color: '#67e8f9',
-            fontFamily: 'monospace',
-            fontSize: '11px',
-            letterSpacing: '0.08em',
-            background: 'rgba(2, 6, 23, 0.82)',
-            border: '1px solid #22d3ee',
-            padding: '2px 6px',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          10 m reference
-        </div>
-      </Html>
-    </group>
-  );
 }
 
 function AutopilotPanel({
@@ -6895,6 +6880,7 @@ function ShipWeaponEffects({
 
 function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system, localStateRef }: { autopilotTarget: AutopilotDestination | null; highlightedTarget: HighlightTarget | null; renderPosition: Vec3Tuple; system: StarSystemData; localStateRef: MutableRefObject<LocalGameState> }): ReactElement {
   const { camera, scene } = useThree();
+  const starVisualsRef = useRef<THREE.Group>(null);
   const haloRef = useRef<THREE.Mesh>(null);
   const haloMaterialRef = useRef<THREE.MeshBasicMaterial>(null);
   const raycaster = useMemo(() => new THREE.Raycaster(), []);
@@ -6905,6 +6891,18 @@ function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system
   const toStarDirection = useMemo(() => new THREE.Vector3(), []);
   const lastOcclusionCheckRef = useRef(0);
   const haloOccludedRef = useRef(false);
+
+  useEffect(() => {
+    const group = starVisualsRef.current;
+    if (group) {
+      outlineExcludedObjects.add(group);
+    }
+    return () => {
+      if (group) {
+        outlineExcludedObjects.delete(group);
+      }
+    };
+  }, []);
 
   useFrame((state) => {
     if (!haloRef.current || !haloMaterialRef.current) {
@@ -6955,7 +6953,7 @@ function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system
         physicalPosition={renderPosition}
         visibleRange={STAR_LENS_FLARE_RANGE}
       >
-        <group>
+        <group ref={starVisualsRef}>
           <mesh userData={{ ignoreStarOcclusion: true }}>
             <sphereGeometry args={[system.radius, 24, 24]} />
             <meshBasicMaterial color={system.color} />
@@ -7007,7 +7005,14 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
   const occludedRef = useRef(false);
 
   useEffect(() => {
+    const group = groupRef.current;
+    if (group) {
+      outlineExcludedObjects.add(group);
+    }
     return () => {
+      if (group) {
+        outlineExcludedObjects.delete(group);
+      }
       flareTexture.dispose();
     };
   }, [flareTexture]);

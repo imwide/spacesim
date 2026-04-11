@@ -12,15 +12,18 @@ The turning can happen really fast right now. The intensity that the turn and ro
 
 While flying the ship (in the pilot seat) allow for switching perspectives. Currently its only third person perspective where the camera orbits around the ship. When pressing a hotkey for swithcing perspectives, it toggles between third person and first person perspective. In first person perspective, the camera should be fixed in place but not rotation, 1m above the ships "pilot seat" position. The ship inside should be rendered again isntead of the outside. The controls should be identical.
 
+Remove the outline effect from the smallest kind of asteroid (the dark blue kind that explodes when shot) and especially from billboards of far away objects since it makes them hard to see.
 
-Remove the 10m reference next to my ship
 
-if you want REAL crisp outlines (still 0 tris):
-post-process (best for games)
 
-in engine (like three.js):
+Prevent the third person camera from clipping through meshes while flying the ship in third person.
 
-use sobel edge detection shader
-or outline pass
 
-this is how most games do it → not in the model, but screen-space
+The outline postprocessing effect is visible through faces if their normals are facing the wrong way (inside out). This is to be expected and can be fixed in some models, but if you say it is not difficult to fix, please fix it and hide the effect even through faces with the wrong normals.
+
+
+
+Ship collisions with stations and asteroids need to work
+
+
+Ship landing in stations needs to work
