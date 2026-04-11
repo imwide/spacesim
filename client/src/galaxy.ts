@@ -16,6 +16,9 @@ export interface StationData {
   id: string;
   name: string;
   kind: StationKind;
+  modelPath?: string;
+  modelScale: number;
+  borderRadius: number;
   position: GalaxyVec3;
 }
 
@@ -125,6 +128,9 @@ function toStationData(station: GalaxyConfigStation): StationData {
     id: station.id,
     name: station.name,
     kind: station.kind,
+    modelPath: station.modelPath,
+    modelScale: station.modelScale ?? 1,
+    borderRadius: kmToMeters(station.borderRadiusKm),
     position: orbitToPosition(station.orbit),
   };
 }
@@ -297,10 +303,13 @@ function buildStationName(label: string, suffix: string): string {
 
 function createStation(random: () => number, id: string, name: string, kind: StationKind, orbitRadius: number): StationData {
   const angle = random() * Math.PI * 2;
+  const borderRadius = kind === 'star' ? 772.8 : kind === 'asteroid' ? 764.44 : 767.1;
   return {
     id,
     name,
     kind,
+    modelScale: 1,
+    borderRadius,
     position: [Math.cos(angle) * orbitRadius, (random() - 0.5) * orbitRadius * 0.12, Math.sin(angle) * orbitRadius],
   };
 }

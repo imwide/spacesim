@@ -1,4 +1,4 @@
-import { Html } from '@react-three/drei';
+import { Html, useGLTF } from '@react-three/drei';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { type ShipConfig, getShipConfig, DEFAULT_SHIP_ID } from './shipConfig';
 import {
@@ -56,6 +56,10 @@ import {
 } from 'react';
 import { io, Socket } from 'socket.io-client';
 import * as THREE from 'three';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 
 type Mode = 'space' | 'interior' | 'pilot' | 'planet-surface';
 type Vec3Tuple = [number, number, number];
@@ -80,11 +84,13 @@ const EVA_DAMPING = 0.85;
 const EVA_STOP_SPEED_THRESHOLD = 0.12 * METERS_PER_WORLD_UNIT;
 const INTERIOR_WALK_SPEED_METERS_PER_SECOND = 1.8 * METERS_PER_WORLD_UNIT;
 const INTERIOR_GRAVITY_METERS_PER_SECOND = 9.81 * METERS_PER_WORLD_UNIT;
+const INTERIOR_JUMP_VELOCITY = 5.0 * METERS_PER_WORLD_UNIT;
 const SHIP_THRUST_ACCELERATION = 14 * METERS_PER_WORLD_UNIT;
 const SHIP_MAX_SPEED_METERS_PER_SECOND = 240 * METERS_PER_WORLD_UNIT;
 const SHIP_STATION_SLOW_ZONE_START_METERS = 2_000;
 const SHIP_STATION_SLOW_ZONE_MIN_METERS = 100;
 const SHIP_STATION_SLOW_ZONE_MIN_SPEED_METERS_PER_SECOND = 10;
+const SHIP_STATION_MANUAL_HANDLING_MULTIPLIER = 0.2;
 const SHIP_LINEAR_DAMPING = 0.18;
 const SHIP_MANUAL_ANGULAR_ACCELERATION = 2.8;
 const SHIP_MANUAL_MAX_ANGULAR_SPEED = 1.85;
@@ -96,7 +102,6 @@ const SHIP_MANUAL_COAST_DAMPING = 0.16;
 const SHIP_MANUAL_LATERAL_DAMPING = 0.5;
 const SHIP_MANUAL_TURN_LATERAL_DAMPING = 1.35;
 const PLAYER_COLLISION_RADIUS = 0.46;
-const STATION_COLLISION_RADIUS_FACTOR = 4.25;
 const BOARDING_RADIUS_METERS = 10 * METERS_PER_WORLD_UNIT;
 const SEAT_INTERACTION_DISTANCE_METERS = 1.15 * METERS_PER_WORLD_UNIT;
 const INTERIOR_COLLISION_RADIUS = 0.28;
@@ -125,6 +130,7 @@ const PLANET_GRAVITY_TERMINAL_VELOCITY = 1000 * METERS_PER_WORLD_UNIT; // 1 km/s
 const PLANET_SURFACE_WALK_SPEED = 3.0 * METERS_PER_WORLD_UNIT;
 const PLANET_SURFACE_JUMP_VELOCITY = 5.0 * METERS_PER_WORLD_UNIT;
 const PLANET_SURFACE_EYE_HEIGHT = 1.7 * METERS_PER_WORLD_UNIT;
+const STATION_GRAVITY_DETECTION_RANGE = 30 * METERS_PER_WORLD_UNIT;
 // Max distance above terrain the player can be while still being "glued" to slope.
 // Large enough to handle steep descents at walk speed; small enough that a jump breaks free.
 const PLANET_SURFACE_GROUND_FOLLOW_DIST = 3.0 * METERS_PER_WORLD_UNIT;
@@ -292,6 +298,95 @@ interface StationForceFieldHitResult {
 }
 
 const stationForceFieldImpactHandlers = new Map<string, (worldHitPoint: THREE.Vector3) => void>();
+const stationWalkableRoots = new Map<string, THREE.Object3D>();
+const CARTOON_OUTLINE_ANGLE_DEGREES = 35;
+const CARTOON_OUTLINE_DEPTH_THRESHOLD = 0.0025;
+
+const CARTOON_OUTLINE_VERTEX_SHADER = /* glsl */ `
+  varying vec2 vUv;
+
+  void main() {
+    vUv = uv;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+const CARTOON_OUTLINE_FRAGMENT_SHADER = /* glsl */ `
+  #include <packing>
+
+  uniform sampler2D tDiffuse;
+  uniform sampler2D tNormal;
+  uniform sampler2D tDepth;
+  uniform vec2 texelSize;
+  uniform vec3 outlineColor;
+  uniform float normalDotThreshold;
+  uniform float depthThreshold;
+  uniform float cameraNear;
+  uniform float cameraFar;
+
+  varying vec2 vUv;
+
+  vec3 decodeNormal(vec3 encodedNormal) {
+    return normalize(encodedNormal * 2.0 - 1.0);
+  }
+
+  float readLinearDepth(vec2 uv) {
+    float fragCoordZ = texture2D(tDepth, uv).x;
+    if (fragCoordZ >= 1.0) {
+      return 1e20;
+    }
+
+    float viewZ = perspectiveDepthToViewZ(fragCoordZ, cameraNear, cameraFar);
+    return -viewZ;
+  }
+
+  void main() {
+    vec4 baseColor = texture2D(tDiffuse, vUv);
+    float centerDepthSample = texture2D(tDepth, vUv).x;
+
+    if (centerDepthSample >= 1.0) {
+      gl_FragColor = baseColor;
+      return;
+    }
+
+    vec3 centerNormal = decodeNormal(texture2D(tNormal, vUv).xyz);
+    float centerDepth = readLinearDepth(vUv);
+
+    float normalEdge = 0.0;
+    float depthEdge = 0.0;
+
+    vec2 offsets[8];
+    offsets[0] = vec2(1.0, 0.0);
+    offsets[1] = vec2(-1.0, 0.0);
+    offsets[2] = vec2(0.0, 1.0);
+    offsets[3] = vec2(0.0, -1.0);
+    offsets[4] = vec2(1.0, 1.0);
+    offsets[5] = vec2(-1.0, 1.0);
+    offsets[6] = vec2(1.0, -1.0);
+    offsets[7] = vec2(-1.0, -1.0);
+
+    for (int i = 0; i < 8; i += 1) {
+      vec2 sampleUv = vUv + offsets[i] * texelSize;
+      float sampleDepthRaw = texture2D(tDepth, sampleUv).x;
+
+      if (sampleDepthRaw >= 1.0) {
+        depthEdge = 1.0;
+        continue;
+      }
+
+      vec3 sampleNormal = decodeNormal(texture2D(tNormal, sampleUv).xyz);
+      float normalDot = dot(centerNormal, sampleNormal);
+      normalEdge = max(normalEdge, 1.0 - step(normalDotThreshold, normalDot));
+
+      float sampleDepth = readLinearDepth(sampleUv);
+      float relativeDepthDelta = abs(sampleDepth - centerDepth) / max(centerDepth, 1.0);
+      depthEdge = max(depthEdge, step(depthThreshold, relativeDepthDelta));
+    }
+
+    float edge = max(normalEdge, depthEdge);
+    gl_FragColor = mix(baseColor, vec4(outlineColor, baseColor.a), edge);
+  }
+`;
 
 interface LocalGameState {
   frameSystemId: string;
@@ -372,7 +467,6 @@ const DUST_ASTEROID_EXPLOSION_SUB_BURSTS = 4;
 const DUST_ASTEROID_MAX_EXPLOSIONS = 10;
 const DUST_ASTEROID_BLAST_RADIUS = 150;
 const DUST_ASTEROID_BLAST_PUSH_VELOCITY = 85;
-const STATION_FORCE_FIELD_MARGIN_METERS = 750;
 const STATION_FORCE_FIELD_SPOT_LIFETIME_SECONDS = 0.3;
 const STATION_FORCE_FIELD_MAX_SPOTS = 6;
 const STATION_FORCE_FIELD_IMPACT_REVEAL_RADIUS_METERS = 12;
@@ -633,7 +727,7 @@ function buildStationNetwork(galaxy: GalaxyData): StationNode[] {
       
       const pStations = planet.stations.map((station, stationIndex) => ({
         id: station.id,
-        name: `${system.name} Planet ${index + 1} Station ${stationIndex + 1}`,
+          name: station.name,
         kind: station.kind,
         systemId: system.id,
         systemName: system.name,
@@ -645,7 +739,7 @@ function buildStationNetwork(galaxy: GalaxyData): StationNode[] {
       const mStations = planet.moons.flatMap((moon, moonIndex) => 
         moon.stations.map((station, stationIndex) => ({
           id: station.id,
-          name: `${system.name} Planet ${index + 1} Moon ${moonIndex + 1} Station ${stationIndex + 1}`,
+            name: station.name,
           kind: station.kind,
           systemId: system.id,
           systemName: system.name,
@@ -660,7 +754,7 @@ function buildStationNetwork(galaxy: GalaxyData): StationNode[] {
 
     const asteroidStations = system.asteroidGroups.map((group, index) => ({
       id: group.station.id,
-      name: `${system.name} Belt ${index + 1} Station`,
+        name: group.station.name,
       kind: group.station.kind,
       systemId: system.id,
       systemName: system.name,
@@ -730,16 +824,8 @@ function buildAutopilotObstacles(system: StarSystemData): AutopilotObstacle[] {
   ];
 }
 
-function getStationCollisionRadius(scale: number): number {
-  return scale * STATION_COLLISION_RADIUS_FACTOR;
-}
-
-function getStationVisualOuterRadius(scale: number): number {
-  return scale * 3.8;
-}
-
-function getStationForceFieldRadius(scale: number): number {
-  return getStationVisualOuterRadius(scale) + STATION_FORCE_FIELD_MARGIN_METERS;
+function getStationForceFieldRadius(station: StationData): number {
+  return station.borderRadius;
 }
 
 function buildSystemStationForceFields(system: StarSystemData): StationForceFieldData[] {
@@ -747,7 +833,7 @@ function buildSystemStationForceFields(system: StarSystemData): StationForceFiel
     {
       id: `${system.station.id}:force-field`,
       position: system.station.position,
-      radius: getStationForceFieldRadius(STAR_STATION_SCALE),
+      radius: getStationForceFieldRadius(system.station),
       scale: STAR_STATION_SCALE,
     },
   ];
@@ -757,7 +843,7 @@ function buildSystemStationForceFields(system: StarSystemData): StationForceFiel
       fields.push({
         id: `${station.id}:force-field`,
         position: tupleAdd(planet.position, station.position),
-        radius: getStationForceFieldRadius(PLANET_STATION_SCALE),
+        radius: getStationForceFieldRadius(station),
         scale: PLANET_STATION_SCALE,
       });
     });
@@ -768,7 +854,7 @@ function buildSystemStationForceFields(system: StarSystemData): StationForceFiel
         fields.push({
           id: `${station.id}:force-field`,
           position: tupleAdd(moonPosition, station.position),
-          radius: getStationForceFieldRadius(PLANET_STATION_SCALE),
+          radius: getStationForceFieldRadius(station),
           scale: PLANET_STATION_SCALE,
         });
       });
@@ -779,7 +865,7 @@ function buildSystemStationForceFields(system: StarSystemData): StationForceFiel
     fields.push({
       id: `${group.station.id}:force-field`,
       position: tupleAdd(group.position, group.station.position),
-      radius: getStationForceFieldRadius(ASTEROID_STATION_SCALE),
+      radius: getStationForceFieldRadius(group.station),
       scale: ASTEROID_STATION_SCALE,
     });
   });
@@ -895,22 +981,18 @@ function getStationBorderLimitedManualSpeed(
   shipPosition: THREE.Vector3,
   shipVelocity: THREE.Vector3,
   shipRadius: number,
-  colliders: SceneCollider[],
+  fields: StationForceFieldData[],
   defaultMaxSpeed: number,
 ): StationBorderSpeedLimitInfo {
   let nearestBorderDistance = Number.POSITIVE_INFINITY;
   let nearestAwayDirection: THREE.Vector3 | null = null;
 
-  colliders.forEach((collider) => {
-    if (collider.kind !== 'station') {
-      return;
-    }
-
-    const dx = shipPosition.x - collider.position[0];
-    const dy = shipPosition.y - collider.position[1];
-    const dz = shipPosition.z - collider.position[2];
+  fields.forEach((field) => {
+    const dx = shipPosition.x - field.position[0];
+    const dy = shipPosition.y - field.position[1];
+    const dz = shipPosition.z - field.position[2];
     const centerDistance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    const borderDistance = centerDistance - collider.radius - shipRadius;
+    const borderDistance = centerDistance - field.radius - shipRadius;
     if (borderDistance < nearestBorderDistance) {
       nearestBorderDistance = borderDistance;
       nearestAwayDirection = centerDistance > 1e-6
@@ -918,7 +1000,6 @@ function getStationBorderLimitedManualSpeed(
         : null;
     }
   });
-
   if (!Number.isFinite(nearestBorderDistance) || nearestBorderDistance >= SHIP_STATION_SLOW_ZONE_START_METERS) {
     return { maxSpeed: defaultMaxSpeed, active: false };
   }
@@ -953,6 +1034,15 @@ function getStationBorderLimitedManualSpeed(
     maxSpeed: THREE.MathUtils.lerp(limitedSpeed, defaultMaxSpeed, 0.6),
     active: true,
   };
+}
+
+function isShipInsideStationBounds(shipPosition: THREE.Vector3, fields: StationForceFieldData[]): boolean {
+  return fields.some((field) => {
+    const dx = shipPosition.x - field.position[0];
+    const dy = shipPosition.y - field.position[1];
+    const dz = shipPosition.z - field.position[2];
+    return dx * dx + dy * dy + dz * dz <= field.radius * field.radius;
+  });
 }
 
 function findSceneCollisionOnSegment(
@@ -1132,7 +1222,12 @@ function moveBodyWithSceneColliders(
 }
 
 function getInteriorHitNormal(hit: THREE.Intersection<THREE.Object3D>): THREE.Vector3 {
-  return hit.face ? hit.face.normal.clone().normalize() : new THREE.Vector3(0, 1, 0);
+  if (!hit.face) {
+    return new THREE.Vector3(0, 1, 0);
+  }
+
+  const normalMatrix = new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld);
+  return hit.face.normal.clone().applyMatrix3(normalMatrix).normalize();
 }
 
 function raycastInteriorMeshes(
@@ -1146,7 +1241,7 @@ function raycastInteriorMeshes(
     return null;
   }
 
-  const hits = new THREE.Raycaster(origin, direction, 0, maxDistance).intersectObjects(collision.colliderMeshes, false);
+  const hits = new THREE.Raycaster(origin, direction, 0, maxDistance).intersectObjects(collision.colliderMeshes, true);
   if (!predicate) {
     return hits[0] ?? null;
   }
@@ -1156,6 +1251,58 @@ function raycastInteriorMeshes(
     if (predicate(hit, normal)) {
       return hit;
     }
+  }
+
+  return null;
+}
+
+function findStationCollisionRoot(object: THREE.Object3D | null): THREE.Object3D | null {
+  let current: THREE.Object3D | null = object;
+
+  while (current) {
+    if (typeof current.userData.stationCollisionRootId === 'string') {
+      return current;
+    }
+    current = current.parent;
+  }
+
+  return null;
+}
+
+function isObjectHierarchyVisible(object: THREE.Object3D): boolean {
+  let current: THREE.Object3D | null = object;
+  while (current) {
+    if (!current.visible) {
+      return false;
+    }
+    current = current.parent;
+  }
+  return true;
+}
+
+function findStationWalkCollision(position: THREE.Vector3): ShipInteriorCollisionData | null {
+  const roots = Array.from(stationWalkableRoots.values()).filter((root) => isObjectHierarchyVisible(root));
+  if (!roots.length) {
+    return null;
+  }
+
+  const hits = new THREE.Raycaster(position, new THREE.Vector3(0, -1, 0), 0, STATION_GRAVITY_DETECTION_RANGE).intersectObjects(roots, true);
+  for (const hit of hits) {
+    const normal = getInteriorHitNormal(hit);
+    if (normal.y <= 0.25) {
+      continue;
+    }
+
+    const root = findStationCollisionRoot(hit.object);
+    if (!root) {
+      continue;
+    }
+
+    return {
+      colliderMeshes: [root],
+      bounds: new THREE.Box3().setFromObject(root),
+      standingHeight: PLANET_SURFACE_EYE_HEIGHT,
+    };
   }
 
   return null;
@@ -1287,10 +1434,12 @@ function shouldResetInteriorPosition(
   shipConfig: ShipConfig,
   collision: ShipInteriorCollisionData,
 ): boolean {
-  if (!collision.colliderMeshes.length) {
-    return position.y < shipConfig.interiorFloorHeight - 8
-      || Math.abs(position.x) > shipConfig.interiorClampX + 8
-      || Math.abs(position.z) > shipConfig.interiorClampZ + 8;
+  if (
+    position.y < shipConfig.interiorFloorHeight - 8
+    || Math.abs(position.x) > shipConfig.interiorClampX + 8
+    || Math.abs(position.z) > shipConfig.interiorClampZ + 8
+  ) {
+    return true;
   }
 
   const safeBounds = collision.bounds.clone();
@@ -2494,9 +2643,14 @@ function updateAutopilotShip(
   return { arrived: false, distance };
 }
 
-function settleShipVelocity(state: LocalGameState, dt: number, sceneColliders?: SceneCollider[]): void {
+function settleShipVelocity(
+  state: LocalGameState,
+  dt: number,
+  sceneColliders?: SceneCollider[],
+  linearDampingMultiplier = 1,
+): void {
   integrateShipAngularVelocity(state, dt, SHIP_MANUAL_ANGULAR_DAMPING);
-  const shipDampFactor = Math.max(0, 1 - SHIP_LINEAR_DAMPING * dt);
+  const shipDampFactor = Math.max(0, 1 - SHIP_LINEAR_DAMPING * linearDampingMultiplier * dt);
   state.shipVelocity.multiplyScalar(shipDampFactor);
   if (state.shipVelocity.length() < 0.2) {
     state.shipVelocity.set(0, 0, 0);
@@ -2624,6 +2778,126 @@ function persistSession(session: AuthSession | null): void {
   }
 
   localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
+}
+
+function CartoonOutlinePostProcess(): null {
+  const { gl, scene, camera, size } = useThree();
+
+  const composerRef = useRef<EffectComposer | null>(null);
+  const normalTargetRef = useRef<THREE.WebGLRenderTarget | null>(null);
+  const normalMaterial = useMemo(() => new THREE.MeshNormalMaterial(), []);
+  const renderPassRef = useRef<RenderPass | null>(null);
+  const outlinePassRef = useRef<ShaderPass | null>(null);
+  const outputPassRef = useRef<OutputPass | null>(null);
+
+  useEffect(() => {
+    const normalTarget = new THREE.WebGLRenderTarget(size.width, size.height, {
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+      depthBuffer: true,
+      stencilBuffer: false,
+    });
+    normalTarget.depthTexture = new THREE.DepthTexture(size.width, size.height);
+    normalTarget.depthTexture.minFilter = THREE.NearestFilter;
+    normalTarget.depthTexture.magFilter = THREE.NearestFilter;
+
+    const composer = new EffectComposer(gl);
+    composer.setPixelRatio(gl.getPixelRatio());
+    composer.setSize(size.width, size.height);
+
+    const renderPass = new RenderPass(scene, camera);
+    const outlinePass = new ShaderPass({
+      uniforms: {
+        tDiffuse: { value: null },
+        tNormal: { value: normalTarget.texture },
+        tDepth: { value: normalTarget.depthTexture },
+        texelSize: { value: new THREE.Vector2(1 / size.width, 1 / size.height) },
+        outlineColor: { value: new THREE.Color('#000000') },
+        normalDotThreshold: { value: Math.cos(THREE.MathUtils.degToRad(CARTOON_OUTLINE_ANGLE_DEGREES)) },
+        depthThreshold: { value: CARTOON_OUTLINE_DEPTH_THRESHOLD },
+        cameraNear: { value: camera.near },
+        cameraFar: { value: camera.far },
+      },
+      vertexShader: CARTOON_OUTLINE_VERTEX_SHADER,
+      fragmentShader: CARTOON_OUTLINE_FRAGMENT_SHADER,
+    });
+    const outputPass = new OutputPass();
+
+    composer.addPass(renderPass);
+    composer.addPass(outlinePass);
+    composer.addPass(outputPass);
+
+    composerRef.current = composer;
+    normalTargetRef.current = normalTarget;
+    renderPassRef.current = renderPass;
+    outlinePassRef.current = outlinePass;
+    outputPassRef.current = outputPass;
+
+    return () => {
+      composer.dispose();
+      normalTarget.dispose();
+      normalTarget.depthTexture?.dispose();
+      composerRef.current = null;
+      normalTargetRef.current = null;
+      renderPassRef.current = null;
+      outlinePassRef.current = null;
+      outputPassRef.current = null;
+    };
+  }, [camera, gl, scene, size.height, size.width]);
+
+  useEffect(() => {
+    if (composerRef.current) {
+      composerRef.current.setPixelRatio(gl.getPixelRatio());
+      composerRef.current.setSize(size.width, size.height);
+    }
+
+    if (normalTargetRef.current) {
+      normalTargetRef.current.setSize(size.width, size.height);
+      if (normalTargetRef.current.depthTexture) {
+        normalTargetRef.current.depthTexture.dispose();
+        normalTargetRef.current.depthTexture = new THREE.DepthTexture(size.width, size.height);
+        normalTargetRef.current.depthTexture.minFilter = THREE.NearestFilter;
+        normalTargetRef.current.depthTexture.magFilter = THREE.NearestFilter;
+      }
+    }
+
+    if (outlinePassRef.current) {
+      outlinePassRef.current.material.uniforms.tNormal.value = normalTargetRef.current?.texture ?? null;
+      outlinePassRef.current.material.uniforms.tDepth.value = normalTargetRef.current?.depthTexture ?? null;
+      outlinePassRef.current.material.uniforms.texelSize.value.set(1 / size.width, 1 / size.height);
+    }
+  }, [gl, size.height, size.width]);
+
+  useFrame(() => {
+    const composer = composerRef.current;
+    const normalTarget = normalTargetRef.current;
+    const outlinePass = outlinePassRef.current;
+    const renderPass = renderPassRef.current;
+    if (!composer || !normalTarget || !outlinePass || !renderPass) {
+      return;
+    }
+
+    outlinePass.material.uniforms.cameraNear.value = camera.near;
+    outlinePass.material.uniforms.cameraFar.value = camera.far;
+    renderPass.camera = camera;
+
+    const previousBackground = scene.background;
+    const previousOverrideMaterial = scene.overrideMaterial;
+    const previousTarget = gl.getRenderTarget();
+
+    scene.overrideMaterial = normalMaterial;
+    scene.background = null;
+    gl.setRenderTarget(normalTarget);
+    gl.clear();
+    gl.render(scene, camera);
+
+    scene.overrideMaterial = previousOverrideMaterial;
+    scene.background = previousBackground;
+    gl.setRenderTarget(previousTarget);
+    composer.render();
+  }, 1);
+
+  return null;
 }
 
 function App(): ReactElement {
@@ -3092,6 +3366,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           shipConfig={getShipConfig(DEFAULT_SHIP_ID)}
           tabletOpen={tabletOpen}
         />
+        <CartoonOutlinePostProcess />
       </Canvas>
 
       <div className="hud">
@@ -3458,57 +3733,113 @@ function GameScene({
       shipNearPlanet = findNearestPlanet(state.shipPosition, activeSystem, state.frameOrigin);
     }
 
+    const stationWalkCollision = state.mode === 'space' ? findStationWalkCollision(state.position) : null;
+
     if (state.mode === 'space') {
       state.rotation.copy(lookRotation);
-      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.rotation);
-      const right = new THREE.Vector3(1, 0, 0).applyQuaternion(state.rotation);
-      const moveUp = new THREE.Vector3(0, 1, 0);
-      const hasDirectionalInput =
-        movementEnabled &&
-        (keys.has('KeyW') ||
-          keys.has('KeyS') ||
-          keys.has('KeyA') ||
-          keys.has('KeyD') ||
-          keys.has('Space') ||
-          keys.has('ShiftLeft') ||
-          keys.has('ShiftRight'));
+      if (stationWalkCollision) {
+        const localLook = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, state.yaw, 0, 'YXZ'));
+        const walkForward = new THREE.Vector3(0, 0, -1).applyQuaternion(localLook);
+        const walkRight = new THREE.Vector3(1, 0, 0).applyQuaternion(localLook);
+        const walk = new THREE.Vector3();
 
-      if (movementEnabled && keys.has('KeyW')) {
-        state.velocity.addScaledVector(forward, EVA_THRUST_ACCELERATION * dt);
-      }
-      if (movementEnabled && keys.has('KeyS')) {
-        state.velocity.addScaledVector(forward, -EVA_THRUST_ACCELERATION * dt);
-      }
-      if (movementEnabled && keys.has('KeyA')) {
-        state.velocity.addScaledVector(right, -EVA_THRUST_ACCELERATION * dt);
-      }
-      if (movementEnabled && keys.has('KeyD')) {
-        state.velocity.addScaledVector(right, EVA_THRUST_ACCELERATION * dt);
-      }
-      if (movementEnabled && keys.has('Space')) {
-        state.velocity.addScaledVector(moveUp, EVA_THRUST_ACCELERATION * dt);
-      }
-      if (movementEnabled && (keys.has('ShiftLeft') || keys.has('ShiftRight'))) {
-        state.velocity.addScaledVector(moveUp, -EVA_THRUST_ACCELERATION * dt);
-      }
-
-      const speed = state.velocity.length();
-
-      if (speed > PLAYER_MAX_EVA_SPEED_METERS_PER_SECOND) {
-        state.velocity.setLength(PLAYER_MAX_EVA_SPEED_METERS_PER_SECOND);
-      }
-
-      if (!hasDirectionalInput) {
-        const dampFactor = Math.max(0, 1 - EVA_DAMPING * dt);
-        state.velocity.multiplyScalar(dampFactor);
-
-        if (state.velocity.length() < EVA_STOP_SPEED_THRESHOLD) {
-          state.velocity.set(0, 0, 0);
+        if (movementEnabled && keys.has('KeyW')) {
+          walk.add(walkForward);
         }
+        if (movementEnabled && keys.has('KeyS')) {
+          walk.addScaledVector(walkForward, -1);
+        }
+        if (movementEnabled && keys.has('KeyA')) {
+          walk.addScaledVector(walkRight, -1);
+        }
+        if (movementEnabled && keys.has('KeyD')) {
+          walk.add(walkRight);
+        }
+
+        if (walk.lengthSq() > 0) {
+          walk.normalize().multiplyScalar(INTERIOR_WALK_SPEED_METERS_PER_SECOND);
+          state.velocity.x = walk.x;
+          state.velocity.z = walk.z;
+          const nextStationPosition = moveInteriorBodyWithCollision(
+            state.position,
+            walk.clone().multiplyScalar(dt),
+            stationWalkCollision,
+          );
+          state.position.x = nextStationPosition.x;
+          state.position.z = nextStationPosition.z;
+        } else {
+          state.velocity.x = 0;
+          state.velocity.z = 0;
+        }
+
+        if (movementEnabled && consumeAction('Space') && state.playerOnGround) {
+          state.velocity.y = INTERIOR_JUMP_VELOCITY;
+          state.playerOnGround = false;
+        }
+
+        state.velocity.y -= INTERIOR_GRAVITY_METERS_PER_SECOND * dt;
+        const stationVerticalResolution = resolveInteriorVerticalPosition(
+          state.position,
+          state.position.clone().add(new THREE.Vector3(0, state.velocity.y * dt, 0)),
+          state.velocity.y,
+          stationWalkCollision,
+        );
+        state.position.y = stationVerticalResolution.positionY;
+        state.velocity.y = stationVerticalResolution.velocityY;
+        state.playerOnGround = stationVerticalResolution.grounded;
+      } else {
+        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.rotation);
+        const right = new THREE.Vector3(1, 0, 0).applyQuaternion(state.rotation);
+        const moveUp = new THREE.Vector3(0, 1, 0);
+        const hasDirectionalInput =
+          movementEnabled &&
+          (keys.has('KeyW') ||
+            keys.has('KeyS') ||
+            keys.has('KeyA') ||
+            keys.has('KeyD') ||
+            keys.has('Space') ||
+            keys.has('ShiftLeft') ||
+            keys.has('ShiftRight'));
+
+        if (movementEnabled && keys.has('KeyW')) {
+          state.velocity.addScaledVector(forward, EVA_THRUST_ACCELERATION * dt);
+        }
+        if (movementEnabled && keys.has('KeyS')) {
+          state.velocity.addScaledVector(forward, -EVA_THRUST_ACCELERATION * dt);
+        }
+        if (movementEnabled && keys.has('KeyA')) {
+          state.velocity.addScaledVector(right, -EVA_THRUST_ACCELERATION * dt);
+        }
+        if (movementEnabled && keys.has('KeyD')) {
+          state.velocity.addScaledVector(right, EVA_THRUST_ACCELERATION * dt);
+        }
+        if (movementEnabled && keys.has('Space')) {
+          state.velocity.addScaledVector(moveUp, EVA_THRUST_ACCELERATION * dt);
+        }
+        if (movementEnabled && (keys.has('ShiftLeft') || keys.has('ShiftRight'))) {
+          state.velocity.addScaledVector(moveUp, -EVA_THRUST_ACCELERATION * dt);
+        }
+
+        const speed = state.velocity.length();
+
+        if (speed > PLAYER_MAX_EVA_SPEED_METERS_PER_SECOND) {
+          state.velocity.setLength(PLAYER_MAX_EVA_SPEED_METERS_PER_SECOND);
+        }
+
+        if (!hasDirectionalInput) {
+          const dampFactor = Math.max(0, 1 - EVA_DAMPING * dt);
+          state.velocity.multiplyScalar(dampFactor);
+
+          if (state.velocity.length() < EVA_STOP_SPEED_THRESHOLD) {
+            state.velocity.set(0, 0, 0);
+          }
+        }
+
+        state.playerOnGround = false;
       }
 
       // Apply planet gravity to EVA player within 100km of surface
-      if (nearestPlanet && nearestPlanet.distanceToSurface < PLANET_GRAVITY_RANGE) {
+      if (!stationWalkCollision && nearestPlanet && nearestPlanet.distanceToSurface < PLANET_GRAVITY_RANGE) {
         const onGround = applyPlanetGravityAndTerrainCollision(
           state.position, state.velocity,
           nearestPlanet.planetCenter, nearestPlanet.planetRadius,
@@ -3521,8 +3852,7 @@ function GameScene({
           state.mode = 'planet-surface';
           state.insideShip = false;
         }
-      } else {
-        state.playerOnGround = false;
+      } else if (!stationWalkCollision) {
         moveBodyWithSceneColliders(state.position, state.velocity, dt, PLAYER_COLLISION_RADIUS, playerSceneColliders);
       }
 
@@ -3603,6 +3933,11 @@ function GameScene({
         state.interiorVelocity.z = 0;
       }
 
+      if (movementEnabled && consumeAction('Space') && state.playerOnGround) {
+        state.interiorVelocity.y = INTERIOR_JUMP_VELOCITY;
+        state.playerOnGround = false;
+      }
+
       state.interiorVelocity.y -= INTERIOR_GRAVITY_METERS_PER_SECOND * dt;
       if (interiorCollision.colliderMeshes.length) {
         const verticalResolution = resolveInteriorVerticalPosition(
@@ -3613,11 +3948,15 @@ function GameScene({
         );
         state.interiorPosition.y = verticalResolution.positionY;
         state.interiorVelocity.y = verticalResolution.velocityY;
+        state.playerOnGround = verticalResolution.grounded;
       } else {
         state.interiorPosition.y += state.interiorVelocity.y * dt;
         if (state.interiorPosition.y < shipConfig.interiorFloorHeight) {
           state.interiorPosition.y = shipConfig.interiorFloorHeight;
           state.interiorVelocity.y = 0;
+          state.playerOnGround = true;
+        } else {
+          state.playerOnGround = false;
         }
       }
 
@@ -3783,6 +4122,8 @@ function GameScene({
       camera.quaternion.copy(state.rotation);
     } else {
         const exitPilotSeat = consumeAction('KeyX');
+      const insideStationBounds = isShipInsideStationBounds(state.shipPosition, stationForceFields);
+      const manualHandlingMultiplier = insideStationBounds ? SHIP_STATION_MANUAL_HANDLING_MULTIPLIER : 1;
         const forwardInput = movementEnabled && keys.has('KeyW') ? 1 : 0;
         const brakingInput = movementEnabled && keys.has('KeyS');
         const lateralInput =
@@ -3831,7 +4172,8 @@ function GameScene({
 
             state.rotation.copy(state.shipRotation);
 
-            const accelMul = shipConfig.accelerationMultiplier;
+            const accelMul = shipConfig.accelerationMultiplier * manualHandlingMultiplier;
+            const brakingMul = shipConfig.brakingMultiplier * manualHandlingMultiplier;
             const shipForward = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
             const shipRight = new THREE.Vector3(1, 0, 0).applyQuaternion(state.shipRotation);
             const shipUp = new THREE.Vector3(0, 1, 0).applyQuaternion(state.shipRotation);
@@ -3868,7 +4210,7 @@ function GameScene({
             const forwardVelocity = shipForward.clone().multiplyScalar(state.shipVelocity.dot(shipForward));
             const lateralVelocity = state.shipVelocity.clone().sub(forwardVelocity);
             const lateralDamping = 10.0;
-            lateralVelocity.multiplyScalar(Math.max(0, 1 - (lateralDamping * shipConfig.brakingMultiplier) * dt));
+            lateralVelocity.multiplyScalar(Math.max(0, 1 - (lateralDamping * brakingMul) * dt));
             
             // Also apply some braking to forward velocity for sharp turns (> 120 deg) so the ship doesn't fly off too far
             let turnBraking = 0;
@@ -3876,7 +4218,7 @@ function GameScene({
               const maxAngleRemaining = Math.PI - startBrakeAngle;
               turnBraking = Math.min(1, (angleToTarget - startBrakeAngle) / maxAngleRemaining) * 4.0;
             }
-            forwardVelocity.multiplyScalar(Math.max(0, 1 - (turnBraking * shipConfig.brakingMultiplier) * dt));
+            forwardVelocity.multiplyScalar(Math.max(0, 1 - (turnBraking * brakingMul) * dt));
             
             state.shipVelocity.copy(forwardVelocity).add(lateralVelocity);
 
@@ -3884,7 +4226,7 @@ function GameScene({
           state.shipPosition,
           state.shipVelocity,
           shipConfig.collisionRadius,
-          localEnvironmentColliders,
+          stationForceFields,
           SHIP_MAX_SPEED_METERS_PER_SECOND * shipConfig.speedMultiplier,
         );
         const maxSpeed = stationSpeedLimitInfo.maxSpeed;
@@ -3925,7 +4267,7 @@ function GameScene({
           }
         }
       } else {
-        settleShipVelocity(state, dt, shipSceneColliders);
+        settleShipVelocity(state, dt, shipSceneColliders, insideStationBounds ? SHIP_STATION_MANUAL_HANDLING_MULTIPLIER : 1);
       }
 
       const orbitRadius = shipConfig.cameraOrbitRadius;
@@ -4042,7 +4384,7 @@ function GameScene({
             state.shipPosition,
             state.shipVelocity,
             shipConfig.collisionRadius,
-            localEnvironmentColliders,
+            stationForceFields,
             SHIP_MAX_SPEED_METERS_PER_SECOND * shipConfig.speedMultiplier,
           )
         : { maxSpeed: SHIP_MAX_SPEED_METERS_PER_SECOND * shipConfig.speedMultiplier, active: false };
@@ -4120,6 +4462,9 @@ function GameScene({
       if (tabletOpen) {
         prompt = 'Space-Tablet open. Select any station in the network to fast travel.';
       }
+      if (state.mode === 'space' && state.playerOnGround) {
+        prompt = 'Walking on station. WASD to walk, Space to jump. Step clear to return to EVA thrusters.';
+      }
       if (state.mode === 'space' && canEnter) {
         prompt = 'Press E to enter your ship.';
       }
@@ -4132,7 +4477,7 @@ function GameScene({
         }
       }
       if (state.mode === 'interior') {
-        prompt = canPilot ? 'Press F near the seat to sit down, or use the autopilot panel to select a destination.' : 'Explore the ship interior with WASD. Use the autopilot panel or press X to exit.';
+        prompt = canPilot ? 'Press F near the seat to sit down, or use the autopilot panel to select a destination. Space jumps.' : 'Explore the ship interior with WASD, Space to jump. Use the autopilot panel or press X to exit.';
       }
       if (state.mode === 'pilot') {
         prompt = autopilotActive && autopilotDestination
@@ -4168,6 +4513,7 @@ function GameScene({
       <ShipWeaponEffects firingPrimaryRef={firingPrimaryRef} localShipRef={shipGroupRef} localStateRef={localStateRef} stationForceFields={stationForceFields} shipConfig={shipConfig} />
       <group ref={shipGroupRef}>
         <ShipExteriorModel config={shipConfig} highlight showDebugAnchors={showDebugAnchors} />
+        <ShipScaleReference />
       </group>
       {highlightedTarget?.kind === 'ship' && (mode === 'space' || mode === 'planet-surface') ? (
         <ShipHighlightTag target={highlightedTarget} localStateRef={localStateRef} />
@@ -4184,6 +4530,42 @@ function GameScene({
 
 function walkSpeed(state: LocalGameState): number {
   return Math.sqrt(state.interiorVelocity.x ** 2 + state.interiorVelocity.z ** 2);
+}
+
+function ShipScaleReference(): ReactElement {
+  return (
+    <group position={[7, -3, 0]}>
+      <mesh rotation={[0, 0, Math.PI / 2]}>
+        <cylinderGeometry args={[0.08, 0.08, 10, 12]} />
+        <meshBasicMaterial color="#22d3ee" toneMapped={false} />
+      </mesh>
+      <mesh position={[-5, 0, 0]}>
+        <boxGeometry args={[0.3, 0.3, 0.3]} />
+        <meshBasicMaterial color="#ffffff" toneMapped={false} />
+      </mesh>
+      <mesh position={[5, 0, 0]}>
+        <boxGeometry args={[0.3, 0.3, 0.3]} />
+        <meshBasicMaterial color="#ffffff" toneMapped={false} />
+      </mesh>
+      <Html center distanceFactor={14} position={[0, 0.8, 0]}>
+        <div
+          style={{
+            pointerEvents: 'none',
+            color: '#67e8f9',
+            fontFamily: 'monospace',
+            fontSize: '11px',
+            letterSpacing: '0.08em',
+            background: 'rgba(2, 6, 23, 0.82)',
+            border: '1px solid #22d3ee',
+            padding: '2px 6px',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          10 m reference
+        </div>
+      </Html>
+    </group>
+  );
 }
 
 function AutopilotPanel({
@@ -6996,31 +7378,60 @@ function AsteroidCluster({
   );
 }
 
+function StationModel({ modelPath }: { modelPath: string }): ReactElement {
+  const { scene } = useGLTF(modelPath);
+  const clonedScene = useMemo(() => scene.clone(true), [scene]);
+
+  return <primitive object={clonedScene} />;
+}
+
 function SpaceStation({ station, physicalPosition, scale }: { station: StationData; physicalPosition: Vec3Tuple; scale: number }): ReactElement {
-  const fieldRadius = useMemo(() => getStationForceFieldRadius(scale), [scale]);
+  const fieldRadius = useMemo(() => getStationForceFieldRadius(station), [station]);
+  const walkableRootRef = useRef<THREE.Group>(null);
+
+  useEffect(() => {
+    if (!walkableRootRef.current) {
+      return;
+    }
+
+    walkableRootRef.current.userData.stationCollisionRootId = station.id;
+    stationWalkableRoots.set(station.id, walkableRootRef.current);
+
+    return () => {
+      stationWalkableRoots.delete(station.id);
+    };
+  }, [station.id]);
 
   return (
     <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={1_200_000_000}>
       <>
         <StationForceField fieldId={`${station.id}:force-field`} radius={fieldRadius} />
-        <group scale={scale}>
-          <mesh>
-            <cylinderGeometry args={[0.8, 0.8, 5.5, 18]} />
-            <meshStandardMaterial color="#cbd5e1" metalness={0.8} roughness={0.24} />
-          </mesh>
-          <mesh rotation={[0, 0, Math.PI / 2]}>
-            <torusGeometry args={[3.4, 0.4, 14, 32]} />
-            <meshStandardMaterial color="#60a5fa" metalness={0.55} roughness={0.32} emissive="#1d4ed8" emissiveIntensity={0.45} />
-          </mesh>
-          <mesh rotation={[Math.PI / 2, 0, 0]}>
-            <torusGeometry args={[2.2, 0.22, 14, 28]} />
-            <meshStandardMaterial color="#e2e8f0" metalness={0.65} roughness={0.28} />
-          </mesh>
-          <mesh position={[0, 0.3, 0]}>
-            <sphereGeometry args={[0.65, 18, 18]} />
-            <meshBasicMaterial color="#22d3ee" />
-          </mesh>
-        </group>
+        {station.modelPath ? (
+          <group ref={walkableRootRef} scale={station.modelScale}>
+            <StationModel modelPath={station.modelPath} />
+          </group>
+        ) : (
+          <group ref={walkableRootRef} scale={scale}>
+            <>
+              <mesh>
+                <cylinderGeometry args={[0.8, 0.8, 5.5, 18]} />
+                <meshStandardMaterial color="#cbd5e1" metalness={0.8} roughness={0.24} />
+              </mesh>
+              <mesh rotation={[0, 0, Math.PI / 2]}>
+                <torusGeometry args={[3.4, 0.4, 14, 32]} />
+                <meshStandardMaterial color="#60a5fa" metalness={0.55} roughness={0.32} emissive="#1d4ed8" emissiveIntensity={0.45} />
+              </mesh>
+              <mesh rotation={[Math.PI / 2, 0, 0]}>
+                <torusGeometry args={[2.2, 0.22, 14, 28]} />
+                <meshStandardMaterial color="#e2e8f0" metalness={0.65} roughness={0.28} />
+              </mesh>
+              <mesh position={[0, 0.3, 0]}>
+                <sphereGeometry args={[0.65, 18, 18]} />
+                <meshBasicMaterial color="#22d3ee" />
+              </mesh>
+            </>
+          </group>
+        )}
       </>
     </PhysicalProxyGroup>
   );

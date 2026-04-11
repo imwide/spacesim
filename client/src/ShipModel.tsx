@@ -4,7 +4,7 @@ import * as THREE from 'three';
 import type { ShipConfig } from './shipConfig';
 
 export interface ShipInteriorCollisionData {
-  colliderMeshes: THREE.Mesh[];
+  colliderMeshes: THREE.Object3D[];
   bounds: THREE.Box3;
   standingHeight: number;
 }
