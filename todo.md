@@ -12,8 +12,16 @@ The turning can happen really fast right now. The intensity that the turn and ro
 
 
 
-
-When i asked you before how tall the player is you said 1.7m
-This would be good, but it doesnt seem true from when im inside the ship. THe camera is too low for this to be true. make sure the camera is at eye level / at the top of the player and that there is no confusion here. Right now the camera is a 90cm level at most
+I want to give stations custom models. I have prepared one already. In the config file for the star system you just made, add the option to configure stations more. I want to put a path to a glb there, set the "outmost border" radius for eachs tation (which is used for the speed limit field aswell as the safe zone/no shooting zone around stations) aswell as a stations name
 
 
+
+if you want REAL crisp outlines (still 0 tris):
+post-process (best for games)
+
+in engine (like three.js):
+
+use sobel edge detection shader
+or outline pass
+
+this is how most games do it → not in the model, but screen-space

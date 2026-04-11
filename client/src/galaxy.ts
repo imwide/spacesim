@@ -1,3 +1,13 @@
+import {
+  galaxyConfig,
+  type GalaxyConfigAsteroidGroup,
+  type GalaxyConfigMoon,
+  type GalaxyConfigOrbit,
+  type GalaxyConfigPlanet,
+  type GalaxyConfigStation,
+  type GalaxyConfigSystem,
+} from './galaxyConfig';
+
 export type GalaxyVec3 = [number, number, number];
 
 export type StationKind = 'star' | 'planet' | 'asteroid';
@@ -90,6 +100,102 @@ const LARGE_ASTEROID_THRESHOLD = 80;
 
 const starColors = ['#ffffff'];
 const planetColors = ['#7dd3fc', '#fca5a5', '#c4b5fd', '#86efac', '#fcd34d', '#fdba74', '#93c5fd'];
+const METERS_PER_KILOMETER = 1_000;
+
+function toGalaxyVec3([x, y, z]: readonly number[]): GalaxyVec3 {
+  return [x, y, z];
+}
+
+function kmToMeters(valueKm: number): number {
+  return valueKm * METERS_PER_KILOMETER;
+}
+
+function orbitToPosition(orbit: GalaxyConfigOrbit): GalaxyVec3 {
+  const radians = (orbit.angleDeg * Math.PI) / 180;
+  const distance = kmToMeters(orbit.distanceKm);
+  return [
+    Math.cos(radians) * distance,
+    kmToMeters(orbit.verticalOffsetKm ?? 0),
+    Math.sin(radians) * distance,
+  ];
+}
+
+function toStationData(station: GalaxyConfigStation): StationData {
+  return {
+    id: station.id,
+    name: station.name,
+    kind: station.kind,
+    position: orbitToPosition(station.orbit),
+  };
+}
+
+function toMoonData(moon: GalaxyConfigMoon): MoonData {
+  return {
+    id: moon.id,
+    name: moon.name,
+    position: orbitToPosition(moon.orbit),
+    radius: kmToMeters(moon.radiusKm),
+    color: moon.color,
+    stations: moon.stations.map(toStationData),
+  };
+}
+
+function toPlanetData(planet: GalaxyConfigPlanet): PlanetData {
+  return {
+    id: planet.id,
+    name: planet.name,
+    position: orbitToPosition(planet.orbit),
+    radius: kmToMeters(planet.radiusKm),
+    color: planet.color,
+    moons: planet.moons.map(toMoonData),
+    stations: planet.stations.map(toStationData),
+  };
+}
+
+function buildConfiguredDust(random: () => number, radius: number, dustCount: number): DustAsteroidData[] {
+  return Array.from({ length: dustCount }, () => {
+    const angle = random() * Math.PI * 2;
+    const dustRadius = Math.pow(random(), 0.7) * radius * 1.2;
+    return {
+      position: [
+        Math.cos(angle) * dustRadius,
+        (random() - 0.5) * Math.max(radius * 0.25, 400),
+        Math.sin(angle) * dustRadius,
+      ],
+      size: 1 + random() * 9,
+      rotation: [random() * Math.PI, random() * Math.PI, random() * Math.PI],
+    };
+  });
+}
+
+function buildConfiguredAsteroidGroup(group: GalaxyConfigAsteroidGroup): AsteroidGroupData {
+  const random = createSeededRandom(group.layoutSeed);
+  const radius = kmToMeters(group.radiusKm);
+  const dust = buildConfiguredDust(random, radius, group.dustCount);
+  return {
+    id: group.id,
+    position: orbitToPosition(group.orbit),
+    radius,
+    asteroids: Array.from({ length: group.asteroidCount }, (_, index) =>
+      createAsteroid(random, group.id, index + 1, radius),
+    ),
+    dust,
+    station: toStationData(group.station),
+  };
+}
+
+function buildConfiguredStarSystem(system: GalaxyConfigSystem): StarSystemData {
+  return {
+    id: system.id,
+    name: system.name,
+    mapPosition: toGalaxyVec3(system.mapPosition),
+    color: system.color,
+    radius: kmToMeters(system.radiusKm),
+    station: toStationData(system.station),
+    planets: system.planets.map(toPlanetData),
+    asteroidGroups: system.asteroidGroups.map(buildConfiguredAsteroidGroup),
+  };
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -356,26 +462,10 @@ export function createSeededRandom(seed: number): () => number {
 }
 
 export function generateGalaxy(seed: number): GalaxyData {
-  const random = createSeededRandom(seed);
-  const systems: StarSystemData[] = [];
-  const homeSystemPosition: GalaxyVec3 = [0, 0, 0];
-
-  systems.push(createStarSystem(random, 0, homeSystemPosition));
-
-  let attempts = 0;
-  while (systems.length < STAR_COUNT && attempts < STAR_COUNT * 120) {
-    attempts += 1;
-    const position = randomRadialPosition(random, GALAXY_MAP_RADIUS);
-    const farEnough = systems.every((system) => tupleDistance(system.mapPosition, position) >= GALAXY_MAP_SYSTEM_DISTANCE);
-
-    if (!farEnough) {
-      continue;
-    }
-
-    systems.push(createStarSystem(random, systems.length, position));
-  }
-
-  return { systems };
+  void seed;
+  return {
+    systems: galaxyConfig.systems.map(buildConfiguredStarSystem),
+  };
 }
 
 export function isLargeAsteroid(asteroid: AsteroidData): boolean {
