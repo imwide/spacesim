@@ -4767,7 +4767,9 @@ function isStarOccluded(
   intersections.length = 0;
 
   try {
-    const candidates = scene.children.filter((child): child is THREE.Object3D => Boolean(child));
+    const candidates = scene.children.filter((child): child is THREE.Object3D =>
+      Boolean(child) && !outlineExcludedObjects.has(child),
+    );
     raycaster.intersectObjects(candidates, true, intersections);
   } catch {
     intersections.length = 0;
@@ -6879,18 +6881,14 @@ function ShipWeaponEffects({
 }
 
 function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system, localStateRef }: { autopilotTarget: AutopilotDestination | null; highlightedTarget: HighlightTarget | null; renderPosition: Vec3Tuple; system: StarSystemData; localStateRef: MutableRefObject<LocalGameState> }): ReactElement {
-  const { camera, scene } = useThree();
+  const { camera } = useThree();
   const starVisualsRef = useRef<THREE.Group>(null);
   const haloRef = useRef<THREE.Mesh>(null);
   const haloMaterialRef = useRef<THREE.MeshBasicMaterial>(null);
-  const raycaster = useMemo(() => new THREE.Raycaster(), []);
-  const intersections = useMemo<THREE.Intersection[]>(() => [], []);
   const worldPosition = useMemo(() => new THREE.Vector3(...renderPosition), [renderPosition]);
   const projectedPosition = useMemo(() => new THREE.Vector3(), []);
   const cameraForward = useMemo(() => new THREE.Vector3(), []);
   const toStarDirection = useMemo(() => new THREE.Vector3(), []);
-  const lastOcclusionCheckRef = useRef(0);
-  const haloOccludedRef = useRef(false);
 
   useEffect(() => {
     const group = starVisualsRef.current;
@@ -6904,7 +6902,7 @@ function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system
     };
   }, []);
 
-  useFrame((state) => {
+  useFrame(() => {
     if (!haloRef.current || !haloMaterialRef.current) {
       return;
     }
@@ -6924,11 +6922,6 @@ function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system
       return;
     }
 
-    if (state.clock.elapsedTime - lastOcclusionCheckRef.current > 0.12) {
-      haloOccludedRef.current = isStarOccluded(scene, camera, raycaster, intersections, worldPosition, system.radius);
-      lastOcclusionCheckRef.current = state.clock.elapsedTime;
-    }
-
     haloRef.current.visible = true;
 
     const distanceFactor = THREE.MathUtils.clamp(1 - distance / LOCAL_STAR_BODY_VISIBILITY_RANGE, 0, 1);
@@ -6936,9 +6929,8 @@ function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system
     const screenRadiusNdc = getStarScreenRadiusNdc(camera, distance, system.radius);
     const screenFactor = THREE.MathUtils.clamp(Math.pow(screenRadiusNdc / 0.028, 0.65), 0.38, 4.2);
     const visibilityFactor = frontFactor * (0.28 + edgeFactor * 0.72);
-    const occlusionFactor = haloOccludedRef.current ? 0.34 : 1;
     const haloScale = 2.05 + closeBoost * 0.8 + screenFactor * 0.75;
-    const haloOpacity = THREE.MathUtils.clamp((0.08 + closeBoost * 0.12 + screenFactor * 0.03) * visibilityFactor * occlusionFactor, 0.03, 0.42);
+    const haloOpacity = THREE.MathUtils.clamp((0.08 + closeBoost * 0.12 + screenFactor * 0.03) * visibilityFactor, 0.03, 0.42);
 
     haloRef.current.scale.setScalar(haloScale);
     haloMaterialRef.current.opacity = haloOpacity;
@@ -6987,7 +6979,7 @@ function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system
 }
 
 function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; starRadius: number }): ReactElement {
-  const { camera, scene } = useThree();
+  const { camera } = useThree();
   const groupRef = useRef<THREE.Group>(null);
   const coreSpriteRef = useRef<THREE.Sprite>(null);
   const haloSpriteRef = useRef<THREE.Sprite>(null);
@@ -6996,13 +6988,9 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
   const flareTexture = useMemo(() => createLensFlareTexture(), []);
   const worldPosition = useMemo(() => new THREE.Vector3(...starPosition), [starPosition]);
   const projectedPosition = useMemo(() => new THREE.Vector3(), []);
-  const screenPosition = useMemo(() => new THREE.Vector3(), []);
   const cameraForward = useMemo(() => new THREE.Vector3(), []);
   const toStarDirection = useMemo(() => new THREE.Vector3(), []);
-  const raycaster = useMemo(() => new THREE.Raycaster(), []);
-  const intersections = useMemo<THREE.Intersection[]>(() => [], []);
-  const lastOcclusionCheckRef = useRef(0);
-  const occludedRef = useRef(false);
+  const proxyOffset = useMemo(() => new THREE.Vector3(), []);
 
   useEffect(() => {
     const group = groupRef.current;
@@ -7044,42 +7032,32 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
       return;
     }
 
-    if (state.clock.elapsedTime - lastOcclusionCheckRef.current > 0.12) {
-      occludedRef.current = isStarOccluded(scene, camera, raycaster, intersections, worldPosition, starRadius);
-      lastOcclusionCheckRef.current = state.clock.elapsedTime;
-    }
-
     groupRef.current.visible = true;
+    const compressedDistance = compressProxyDistance(distance, STAR_PROXY_LINEAR_DISTANCE, STAR_PROXY_LOG_FACTOR);
+    const proxyScale = clamp(compressedDistance / distance, MIN_PROXY_SCALE, 1);
 
-    groupRef.current.position.copy(camera.position);
+    proxyOffset.copy(toStarDirection).multiplyScalar(compressedDistance);
+    groupRef.current.position.copy(camera.position).add(proxyOffset);
+    groupRef.current.scale.setScalar(proxyScale);
     groupRef.current.quaternion.copy(camera.quaternion);
-
-    const planeDistance = 2;
-    const perspectiveCamera = camera as THREE.PerspectiveCamera;
-    const halfHeight = Math.tan(THREE.MathUtils.degToRad(perspectiveCamera.fov * 0.5)) * planeDistance;
-    const halfWidth = halfHeight * perspectiveCamera.aspect;
-    const baseX = projectedPosition.x * halfWidth;
-    const baseY = projectedPosition.y * halfHeight;
-
-    screenPosition.set(baseX, baseY, -planeDistance);
-    coreSpriteRef.current.position.copy(screenPosition);
-    haloSpriteRef.current.position.copy(screenPosition);
+    coreSpriteRef.current.position.setScalar(0);
+    haloSpriteRef.current.position.setScalar(0);
 
     const distanceFactor = THREE.MathUtils.clamp(1 - distance / STAR_LENS_FLARE_RANGE, 0, 1);
     const closeBoost = distanceFactor;
     const viewFactor = THREE.MathUtils.clamp(0.12 + edgeFactor * 0.88, 0, 1) * frontFactor;
     const screenRadiusNdc = getStarScreenRadiusNdc(camera, distance, starRadius);
     const screenFactor = THREE.MathUtils.clamp(Math.pow(screenRadiusNdc / 0.026, 0.7), 0.45, 4.8);
-    const occlusionFactor = occludedRef.current ? 0.28 : 1;
-    const opacity = THREE.MathUtils.clamp((0.035 + distanceFactor * 0.1 + closeBoost * 0.18) * viewFactor * (0.7 + screenFactor * 0.22) * occlusionFactor, 0.012, 0.38);
+    const opacity = THREE.MathUtils.clamp((0.035 + distanceFactor * 0.1 + closeBoost * 0.18) * viewFactor * (0.7 + screenFactor * 0.22), 0.012, 0.38);
 
     coreMaterialRef.current.opacity = opacity;
     haloMaterialRef.current.opacity = opacity * 0.68;
 
     const starScale = THREE.MathUtils.clamp(starRadius * 0.00012, 0.045, 0.12);
     const flareScale = starScale * (1.2 + distanceFactor * 0.7 + closeBoost * 0.95 + screenFactor * 0.45);
-    coreSpriteRef.current.scale.setScalar(flareScale);
-    haloSpriteRef.current.scale.setScalar(flareScale * 3.8);
+    const spriteDistanceScale = compressedDistance / 2;
+    coreSpriteRef.current.scale.setScalar((flareScale * spriteDistanceScale) / proxyScale);
+    haloSpriteRef.current.scale.setScalar((flareScale * 3.8 * spriteDistanceScale) / proxyScale);
   });
 
   return (
@@ -7092,7 +7070,7 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
           color="#ffffff"
           transparent
           depthWrite={false}
-          depthTest={false}
+          depthTest
           blending={THREE.AdditiveBlending}
         />
       </sprite>
@@ -7104,7 +7082,7 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
           color="#8eb8ff"
           transparent
           depthWrite={false}
-          depthTest={false}
+          depthTest
           blending={THREE.AdditiveBlending}
         />
       </sprite>

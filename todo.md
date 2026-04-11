@@ -19,11 +19,16 @@ Remove the outline effect from the smallest kind of asteroid (the dark blue kind
 Prevent the third person camera from clipping through meshes while flying the ship in third person.
 
 
-The outline postprocessing effect is visible through faces if their normals are facing the wrong way (inside out). This is to be expected and can be fixed in some models, but if you say it is not difficult to fix, please fix it and hide the effect even through faces with the wrong normals.
-
-
-
 Ship collisions with stations and asteroids need to work
 
+
+The outline shader doesnt show outlines if the face "behind" it has the same or similar direction normals. This doesnt look good. If the angle is enough at an edge, the outline should be shown regardless of the direction of the normals of the face behind it.
+
+BLENDER TODO: Apply array modifier, fix normal directions
+
+
+Show a glow around emissive materials.
+
+Add anti-aliasing to the outline shader.
 
 Ship landing in stations needs to work
