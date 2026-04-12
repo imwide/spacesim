@@ -311,6 +311,18 @@ const _walkBounds = new THREE.Box3();
 const CARTOON_OUTLINE_ANGLE_DEGREES = 35;
 const CARTOON_OUTLINE_DEPTH_THRESHOLD = 0.0025;
 
+/** When true, renders ALL mesh edges (Blender edit-mode style) instead of
+ *  the angle-threshold cartoon outlines. */
+const USE_BLENDER_EDGES = true;
+/** Opacity of the Blender-style edge overlay (0 = invisible, 1 = fully opaque). */
+const BLENDER_EDGE_OPACITY = 0.9;
+const BLENDER_EDGE_WIDTH = 1;
+const BLENDER_EDGE_COLOR = '#000000';
+const BLENDER_EDGE_SURFACE_SCALE = 1.00018;
+const BLENDER_EDGE_COPLANAR_DOT_THRESHOLD = 0.9999;
+const BLENDER_EDGE_QUAD_DOT_THRESHOLD = 0.985;
+const BLENDER_EDGE_WELD_EPSILON = 1e-5;
+
 /** Objects registered here are hidden during the outline normal/depth pass
  *  so they don't receive cartoon outlines (e.g. star body, lens flare). */
 const outlineExcludedObjects = new Set<THREE.Object3D>();
@@ -481,6 +493,221 @@ const CARTOON_OUTLINE_FRAGMENT_SHADER = /* glsl */ `
     gl_FragColor = mix(baseColor, vec4(outlineColor, baseColor.a), edge);
   }
 `;
+
+// =====================================================================
+// Blender edit-mode style: render ALL triangle edges via overlay line geometry
+// =====================================================================
+
+const wireframeGeometryCache = new WeakMap<THREE.BufferGeometry, THREE.BufferGeometry>();
+
+function orderQuadVerticesOnPlane(
+  vertices: THREE.Vector3[],
+  planeNormal: THREE.Vector3,
+): number[] {
+  const centroid = new THREE.Vector3();
+  vertices.forEach((vertex) => centroid.add(vertex));
+  centroid.multiplyScalar(1 / vertices.length);
+
+  const axisX = vertices[0].clone().sub(centroid).normalize();
+  let axisY = planeNormal.clone().cross(axisX).normalize();
+  if (axisY.lengthSq() <= 1e-12) {
+    axisY = new THREE.Vector3(0, 1, 0).cross(axisX).normalize();
+  }
+
+  return vertices
+    .map((vertex, index) => {
+      const local = vertex.clone().sub(centroid);
+      return {
+        index,
+        angle: Math.atan2(local.dot(axisY), local.dot(axisX)),
+      };
+    })
+    .sort((left, right) => left.angle - right.angle)
+    .map((entry) => entry.index);
+}
+
+function isLikelyQuadDiagonal(
+  edgeA: number,
+  edgeB: number,
+  oppositeA: number,
+  oppositeB: number,
+  normalA: THREE.Vector3,
+  normalB: THREE.Vector3,
+  positions: THREE.Vector3[],
+): boolean {
+  if (oppositeA === oppositeB) {
+    return false;
+  }
+
+  const normalDot = normalA.dot(normalB);
+  if (normalDot < BLENDER_EDGE_QUAD_DOT_THRESHOLD) {
+    return false;
+  }
+
+  const averageNormal = normalA.clone().add(normalB);
+  if (averageNormal.lengthSq() <= 1e-12) {
+    return false;
+  }
+  averageNormal.normalize();
+
+  const ids = [edgeA, edgeB, oppositeA, oppositeB];
+  const orderedLocal = orderQuadVerticesOnPlane(ids.map((id) => positions[id]), averageNormal);
+  const orderedIds = orderedLocal.map((localIndex) => ids[localIndex]);
+  const edgeAIndex = orderedIds.indexOf(edgeA);
+  const edgeBIndex = orderedIds.indexOf(edgeB);
+  if (edgeAIndex < 0 || edgeBIndex < 0) {
+    return false;
+  }
+
+  const cyclicDistance = Math.abs(edgeAIndex - edgeBIndex);
+  const wrappedDistance = Math.min(cyclicDistance, 4 - cyclicDistance);
+  if (wrappedDistance !== 2) {
+    return false;
+  }
+
+  const pa = positions[edgeA];
+  const pb = positions[edgeB];
+  const pc = positions[oppositeA];
+  const pd = positions[oppositeB];
+  const sharedLength = pa.distanceTo(pb);
+  const outerAverage = (
+    pa.distanceTo(pc)
+    + pb.distanceTo(pc)
+    + pa.distanceTo(pd)
+    + pb.distanceTo(pd)
+  ) / 4;
+
+  return sharedLength >= outerAverage * 0.92;
+}
+
+function getWireframeGeometry(source: THREE.BufferGeometry): THREE.BufferGeometry {
+  const cached = wireframeGeometryCache.get(source);
+  if (cached) {
+    return cached;
+  }
+
+  const position = source.getAttribute('position');
+  if (!position || position.count < 3) {
+    const empty = new THREE.BufferGeometry();
+    wireframeGeometryCache.set(source, empty);
+    return empty;
+  }
+
+  const index = source.getIndex();
+  const getVertexIndex = (offset: number): number => (index ? index.array[offset] as number : offset);
+  const triangleCount = index ? Math.floor(index.count / 3) : Math.floor(position.count / 3);
+  const weldedVertexIds = new Array<number>(position.count);
+  const weldedPositions: THREE.Vector3[] = [];
+  const weldMap = new Map<string, number>();
+
+  for (let vertexIndex = 0; vertexIndex < position.count; vertexIndex += 1) {
+    const x = position.getX(vertexIndex);
+    const y = position.getY(vertexIndex);
+    const z = position.getZ(vertexIndex);
+    const key = [
+      Math.round(x / BLENDER_EDGE_WELD_EPSILON),
+      Math.round(y / BLENDER_EDGE_WELD_EPSILON),
+      Math.round(z / BLENDER_EDGE_WELD_EPSILON),
+    ].join(':');
+
+    let weldedId = weldMap.get(key);
+    if (weldedId === undefined) {
+      weldedId = weldedPositions.length;
+      weldMap.set(key, weldedId);
+      weldedPositions.push(new THREE.Vector3(x, y, z));
+    }
+    weldedVertexIds[vertexIndex] = weldedId;
+  }
+
+  const tempA = new THREE.Vector3();
+  const tempB = new THREE.Vector3();
+  const tempC = new THREE.Vector3();
+  const edgeMap = new Map<string, Array<{ normal: THREE.Vector3; opposite: number }>>();
+
+  const addEdge = (a: number, b: number, normal: THREE.Vector3, opposite: number): void => {
+    const min = Math.min(a, b);
+    const max = Math.max(a, b);
+    const key = `${min}:${max}`;
+    const bucket = edgeMap.get(key);
+    const record = { normal: normal.clone(), opposite };
+    if (bucket) {
+      bucket.push(record);
+      return;
+    }
+    edgeMap.set(key, [record]);
+  };
+
+  for (let triangleIndex = 0; triangleIndex < triangleCount; triangleIndex += 1) {
+    const i0 = getVertexIndex(triangleIndex * 3);
+    const i1 = getVertexIndex(triangleIndex * 3 + 1);
+    const i2 = getVertexIndex(triangleIndex * 3 + 2);
+    const v0 = weldedVertexIds[i0];
+    const v1 = weldedVertexIds[i1];
+    const v2 = weldedVertexIds[i2];
+
+    if (v0 === v1 || v1 === v2 || v2 === v0) {
+      continue;
+    }
+
+    tempA.set(position.getX(i0), position.getY(i0), position.getZ(i0));
+    tempB.set(position.getX(i1), position.getY(i1), position.getZ(i1));
+    tempC.set(position.getX(i2), position.getY(i2), position.getZ(i2));
+
+    const normal = tempB.clone().sub(tempA).cross(tempC.clone().sub(tempA));
+    if (normal.lengthSq() <= 1e-12) {
+      continue;
+    }
+    normal.normalize();
+
+    addEdge(v0, v1, normal, v2);
+    addEdge(v1, v2, normal, v0);
+    addEdge(v2, v0, normal, v1);
+  }
+
+  const segments: number[] = [];
+  edgeMap.forEach((faces, key) => {
+    const [aText, bText] = key.split(':');
+    const a = Number(aText);
+    const b = Number(bText);
+    let keepEdge = false;
+
+    if (faces.length !== 2) {
+      keepEdge = true;
+    } else {
+      const dot = faces[0].normal.dot(faces[1].normal);
+      keepEdge = dot < BLENDER_EDGE_COPLANAR_DOT_THRESHOLD;
+
+      if (keepEdge && isLikelyQuadDiagonal(
+        a,
+        b,
+        faces[0].opposite,
+        faces[1].opposite,
+        faces[0].normal,
+        faces[1].normal,
+        weldedPositions,
+      )) {
+        keepEdge = false;
+      }
+    }
+
+    if (!keepEdge) {
+      return;
+    }
+
+    const pa = weldedPositions[a];
+    const pb = weldedPositions[b];
+
+    segments.push(pa.x, pa.y, pa.z, pb.x, pb.y, pb.z);
+  });
+
+  const wireframeGeometry = new THREE.BufferGeometry();
+  wireframeGeometry.setAttribute('position', new THREE.Float32BufferAttribute(segments, 3));
+  wireframeGeometry.computeBoundingSphere();
+  wireframeGeometry.computeBoundingBox();
+
+  wireframeGeometryCache.set(source, wireframeGeometry);
+  return wireframeGeometry;
+}
 
 interface LocalGameState {
   frameSystemId: string;
@@ -3294,6 +3521,155 @@ function CartoonOutlinePostProcess(): null {
   return null;
 }
 
+// =====================================================================
+// Blender edit-mode edge overlay using screen-space line geometry
+// =====================================================================
+
+function BlenderEdgePostProcess(): null {
+  const { gl, scene, camera, size } = useThree();
+
+  const composerRef = useRef<EffectComposer | null>(null);
+  const renderPassRef = useRef<RenderPass | null>(null);
+  const bloomPassRef = useRef<UnrealBloomPass | null>(null);
+  const outputPassRef = useRef<OutputPass | null>(null);
+  const lineMaterialRef = useRef<THREE.LineBasicMaterial | null>(null);
+  const overlayByMeshRef = useRef(new WeakMap<THREE.Mesh, THREE.Group>());
+  const ownedOverlaysRef = useRef<THREE.Group[]>([]);
+  const renderPixelWidth = Math.max(1, Math.floor(size.width * gl.getPixelRatio()));
+  const renderPixelHeight = Math.max(1, Math.floor(size.height * gl.getPixelRatio()));
+
+  useEffect(() => {
+    const composer = new EffectComposer(gl);
+    composer.setPixelRatio(gl.getPixelRatio());
+    composer.setSize(size.width, size.height);
+
+    const lineMaterial = new THREE.LineBasicMaterial({
+      color: new THREE.Color(BLENDER_EDGE_COLOR).multiplyScalar(BLENDER_EDGE_OPACITY),
+      transparent: false,
+      opacity: 1,
+      depthTest: true,
+      depthWrite: false,
+      toneMapped: false,
+      polygonOffset: true,
+      polygonOffsetFactor: 0,
+      polygonOffsetUnits: 0,
+    });
+
+    const renderPass = new RenderPass(scene, camera);
+    const bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(renderPixelWidth, renderPixelHeight),
+      /* strength */ 0.55,
+      /* radius   */ 0.6,
+      /* threshold */ 0.5,
+    );
+    const outputPass = new OutputPass();
+
+    composer.addPass(renderPass);
+    composer.addPass(bloomPass);
+    composer.addPass(outputPass);
+
+    composerRef.current = composer;
+    renderPassRef.current = renderPass;
+    bloomPassRef.current = bloomPass;
+    outputPassRef.current = outputPass;
+    lineMaterialRef.current = lineMaterial;
+
+    return () => {
+      for (const overlay of ownedOverlaysRef.current) {
+        overlay.removeFromParent();
+      }
+      ownedOverlaysRef.current = [];
+      lineMaterial.dispose();
+      composer.dispose();
+      composerRef.current = null;
+      renderPassRef.current = null;
+      bloomPassRef.current = null;
+      outputPassRef.current = null;
+      lineMaterialRef.current = null;
+      overlayByMeshRef.current = new WeakMap<THREE.Mesh, THREE.Group>();
+    };
+  }, [camera, gl, renderPixelHeight, renderPixelWidth, scene, size.height, size.width]);
+
+  useEffect(() => {
+    if (composerRef.current) {
+      composerRef.current.setPixelRatio(gl.getPixelRatio());
+      composerRef.current.setSize(size.width, size.height);
+    }
+
+    if (bloomPassRef.current) {
+      bloomPassRef.current.resolution.set(renderPixelWidth, renderPixelHeight);
+    }
+
+    if (lineMaterialRef.current) {
+      lineMaterialRef.current.color.set(BLENDER_EDGE_COLOR).multiplyScalar(BLENDER_EDGE_OPACITY);
+    }
+  }, [gl, renderPixelHeight, renderPixelWidth, size.height, size.width]);
+
+  useFrame((_state, _delta) => {
+    const composer = composerRef.current;
+    const renderPass = renderPassRef.current;
+    const lineMaterial = lineMaterialRef.current;
+    if (!composer || !renderPass || !lineMaterial) {
+      return;
+    }
+
+    renderPass.camera = camera;
+
+    scene.traverseVisible((obj) => {
+      if (obj.userData?.isBlenderEdgeOverlay) {
+        return;
+      }
+
+      if (!(obj instanceof THREE.Mesh) || !obj.geometry) {
+        return;
+      }
+
+      let suppressEdges = false;
+      let node: THREE.Object3D | null = obj;
+      while (node) {
+        if (node.userData?.ignoreOutline || node.userData?.isBlenderEdgeOverlay || outlineExcludedObjects.has(node)) {
+          suppressEdges = true;
+          break;
+        }
+        node = node.parent;
+      }
+
+      const wireframeGeometry = getWireframeGeometry(obj.geometry);
+      let overlayGroup = overlayByMeshRef.current.get(obj);
+      if (!overlayGroup) {
+        const innerOverlay = new THREE.LineSegments(wireframeGeometry, lineMaterial);
+        innerOverlay.renderOrder = 999;
+        innerOverlay.scale.setScalar(BLENDER_EDGE_SURFACE_SCALE);
+        innerOverlay.userData.ignoreOutline = true;
+        innerOverlay.userData.isBlenderEdgeOverlay = true;
+        innerOverlay.raycast = () => null;
+
+        overlayGroup = new THREE.Group();
+        overlayGroup.name = '__blender_edge_overlay__';
+        overlayGroup.frustumCulled = obj.frustumCulled;
+        overlayGroup.userData.ignoreOutline = true;
+        overlayGroup.userData.isBlenderEdgeOverlay = true;
+        overlayGroup.add(innerOverlay);
+        obj.add(overlayGroup);
+        overlayByMeshRef.current.set(obj, overlayGroup);
+        ownedOverlaysRef.current.push(overlayGroup);
+      } else {
+        const innerOverlay = overlayGroup.children[0] as THREE.LineSegments | undefined;
+        if (innerOverlay && innerOverlay.geometry !== wireframeGeometry) {
+          innerOverlay.geometry = wireframeGeometry;
+        }
+      }
+
+      overlayGroup.visible = obj.visible && !suppressEdges;
+    });
+
+    // Composer renders the full scene, including overlay edge geometry.
+    composer.render();
+  }, 1);
+
+  return null;
+}
+
 function App(): ReactElement {
   const [session, setSession] = useState<AuthSession | null>(() => getInitialSession());
 
@@ -3816,7 +4192,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           shipConfig={getShipConfig(DEFAULT_SHIP_ID)}
           tabletOpen={tabletOpen}
         />
-        <CartoonOutlinePostProcess />
+        {USE_BLENDER_EDGES ? <BlenderEdgePostProcess /> : <CartoonOutlinePostProcess />}
       </Canvas>
 
       <div className="hud">

@@ -27,6 +27,4 @@ Add a "arrival point" to the station configs
 Remove space tablet in favor of a new UI
 
 
-
-
 BLENDER TODO: decrease glow intensity, apply array, screw stickers dont work/have no outline.
