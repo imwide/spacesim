@@ -26,8 +26,6 @@ While travelling over 2km/s and/or while autopilto is enabled, shooting should n
 
 When the player leaves the ship/pilot seat, the ship should slowly turn horizontal.
 
-Using the relative thruster coordinates for each ship, display thruster particle effects at the thruster positions depending on the current acceleration and speed, just like the gun/shooting particles work using the relative config coordinates
-
 Add anti-aliasing to the outline shader.
 
 Ship landing in stations needs to work
@@ -36,3 +34,4 @@ Add light sequences to the station configs. This will allow every station to hav
 
 
 Remove space tablet in favor of a new UI
+

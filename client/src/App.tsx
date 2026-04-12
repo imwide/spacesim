@@ -524,6 +524,12 @@ const SHIP_WEAPON_IMPACT_LIFETIME_SECONDS = 0.4;
 const SHIP_WEAPON_IMPACT_PARTICLE_COUNT = 8;
 const SHIP_WEAPON_MAX_IMPACTS = 12;
 const SHIP_WEAPON_IMPACT_SCALE_MULTIPLIER = 3;
+const SHIP_THRUSTER_PARTICLE_COUNT = 6;
+const SHIP_THRUSTER_PLUME_LENGTH = 5.5;
+const SHIP_THRUSTER_PLUME_RADIUS = 0.18;
+const SHIP_THRUSTER_GLOW_RADIUS = 0.5;
+const SHIP_THRUSTER_PARTICLE_DRIFT = 0.22;
+const SHIP_THRUSTER_RESPONSE = 10;
 const DUST_ASTEROID_HITS_TO_DESTROY = 4;
 const DUST_ASTEROID_EXPLOSION_LIFETIME_SECONDS = 1.05;
 const DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT = 12;
@@ -3375,28 +3381,56 @@ function AuthScreen({
 }
 
 /**
- * Directional light that always faces from the star (physical origin) toward the
- * player, so all scene geometry is lit as though the sun were in the correct place.
+ * Directional light that points from the active system's star toward the ship.
+ *
+ * The ship position stored in local state is frame-local, not star-local, so the
+ * correct sun direction is based on `shipPosition + frameOrigin` (ship position in
+ * system coordinates relative to the star at system origin).
+ *
+ * To avoid needless per-frame updates, the light is only recomputed when the frame
+ * origin changes (loading / reframing the world) and while travelling faster than
+ * light speed.
  */
-function SunDirectionalLight({ localStateRef }: { localStateRef: MutableRefObject<LocalGameState> }): ReactElement {
+function SunDirectionalLight({
+  activeFrameOrigin,
+  localStateRef,
+}: {
+  activeFrameOrigin: Vec3Tuple;
+  localStateRef: MutableRefObject<LocalGameState>;
+}): ReactElement {
   const lightRef = useRef<THREE.DirectionalLight>(null);
-  const _dir = useMemo(() => new THREE.Vector3(), []);
+  const systemSpaceShipPosition = useMemo(() => new THREE.Vector3(), []);
+  const frameOriginVector = useMemo(() => new THREE.Vector3(), []);
+
+  const updateLightDirection = useCallback(() => {
+    const light = lightRef.current;
+    if (!light) {
+      return;
+    }
+
+    frameOriginVector.set(...activeFrameOrigin);
+    systemSpaceShipPosition.copy(localStateRef.current.shipPosition).add(frameOriginVector);
+
+    const len = systemSpaceShipPosition.length();
+    if (len < 1) {
+      systemSpaceShipPosition.set(0, 1, 0);
+    } else {
+      systemSpaceShipPosition.divideScalar(len);
+    }
+
+    // DirectionalLight shines from `position` toward its target (origin by default).
+    // Invert the direction so the incoming light matches the star position visually.
+    light.position.copy(systemSpaceShipPosition).multiplyScalar(-1e6);
+  }, [activeFrameOrigin, frameOriginVector, localStateRef, systemSpaceShipPosition]);
+
+  useEffect(() => {
+    updateLightDirection();
+  }, [updateLightDirection]);
 
   useFrame(() => {
-    const light = lightRef.current;
-    if (!light) return;
-    // Ship is at physical position shipPosition; star is at origin (0,0,0).
-    // The sun direction (from player toward star) = -shipPosition.
-    // We want the light to come FROM the star, so light.position = normalize(shipPos) * large.
-    _dir.copy(localStateRef.current.shipPosition);
-    const len = _dir.length();
-    if (len < 1) {
-      // Player is essentially at the star — use a stable fallback.
-      _dir.set(0, 1, 0);
-    } else {
-      _dir.divideScalar(len);
+    if (localStateRef.current.shipVelocity.length() > SPEED_OF_LIGHT_MPS) {
+      updateLightDirection();
     }
-    light.position.copy(_dir).multiplyScalar(1e6);
   });
 
   return <directionalLight ref={lightRef} intensity={1.25} color="#dbeafe" />;
@@ -3703,7 +3737,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
       <Canvas camera={{ fov: 75, near: 0.05, far: GALAXY_CAMERA_FAR }} gl={{ logarithmicDepthBuffer: true }}>
         <color attach="background" args={['#02030b']} />
         <ambientLight intensity={0.85} />
-        <SunDirectionalLight localStateRef={localStateRef} />
+        <SunDirectionalLight activeFrameOrigin={activeFrameOrigin} localStateRef={localStateRef} />
         <pointLight intensity={10} distance={120} position={[0, 0, 0]} color="#60a5fa" />
         <GameScene
           activeFrameOrigin={activeFrameOrigin}
@@ -4901,6 +4935,7 @@ function GameScene({
       <WarpSpeedEffect localStateRef={localStateRef} />
       <ShipWeaponEffects firingPrimaryRef={firingPrimaryRef} localShipRef={shipGroupRef} localStateRef={localStateRef} stationForceFields={stationForceFields} shipConfig={shipConfig} />
       <group ref={shipGroupRef} userData={{ ignoreCameraCollision: true }}>
+        <ShipThrusterEffects localStateRef={localStateRef} shipConfig={shipConfig} />
         <ShipExteriorModel config={shipConfig} highlight showDebugAnchors={showDebugAnchors} />
       </group>
       {highlightedTarget?.kind === 'ship' && (mode === 'space' || mode === 'planet-surface') ? (
@@ -7316,6 +7351,196 @@ function ShipWeaponEffects({
             >
               <sphereGeometry args={[1, 8, 8]} />
               <meshBasicMaterial color="#d9c2a3" transparent opacity={0.6} depthWrite={false} toneMapped={false} />
+            </mesh>
+          ))}
+        </group>
+      ))}
+    </group>
+  );
+}
+
+function ShipThrusterEffects({
+  localStateRef,
+  shipConfig,
+}: {
+  localStateRef: MutableRefObject<LocalGameState>;
+  shipConfig: ShipConfig;
+}): ReactElement {
+  const thrusterCoreRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const thrusterGlowRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const thrusterParticleRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const previousVelocityRef = useRef(new THREE.Vector3());
+  const intensityRef = useRef(0);
+  const initializedRef = useRef(false);
+  const fallbackThrusters = useMemo(
+    () => [
+      new THREE.Vector3(0.5, -0.2, 2.1),
+      new THREE.Vector3(-0.5, -0.2, 2.1),
+    ],
+    [],
+  );
+  const thrusterAnchors = shipConfig.thrusterVecs.length ? shipConfig.thrusterVecs : fallbackThrusters;
+  const inverseRotation = useMemo(() => new THREE.Quaternion(), []);
+  const localVelocity = useMemo(() => new THREE.Vector3(), []);
+  const localAcceleration = useMemo(() => new THREE.Vector3(), []);
+  const baseOffset = useMemo(() => new THREE.Vector3(0, 0, 0.15), []);
+  const corePosition = useMemo(() => new THREE.Vector3(), []);
+  const glowPosition = useMemo(() => new THREE.Vector3(), []);
+  const particlePosition = useMemo(() => new THREE.Vector3(), []);
+  const plumeScale = useMemo(() => new THREE.Vector3(), []);
+  const glowScale = useMemo(() => new THREE.Vector3(), []);
+
+  useFrame((frameState, delta) => {
+    const state = localStateRef.current;
+
+    if (!initializedRef.current) {
+      previousVelocityRef.current.copy(state.shipVelocity);
+      initializedRef.current = true;
+    }
+
+    if (delta > 1e-5) {
+      localAcceleration.copy(state.shipVelocity).sub(previousVelocityRef.current).divideScalar(delta);
+    } else {
+      localAcceleration.set(0, 0, 0);
+    }
+    previousVelocityRef.current.copy(state.shipVelocity);
+
+    inverseRotation.copy(state.shipRotation).invert();
+    localVelocity.copy(state.shipVelocity).applyQuaternion(inverseRotation);
+    localAcceleration.applyQuaternion(inverseRotation);
+
+    const forwardSpeed = Math.max(0, -localVelocity.z);
+    const accelerationMagnitude = localAcceleration.length();
+    const forwardAcceleration = Math.max(0, -localAcceleration.z);
+    const speedFactor = clamp(
+      forwardSpeed / Math.max(1, SHIP_MAX_SPEED_METERS_PER_SECOND * shipConfig.speedMultiplier),
+      0,
+      1,
+    );
+    const accelFactor = clamp(
+      forwardAcceleration / Math.max(1, SHIP_MANUAL_FORWARD_THRUST * shipConfig.accelerationMultiplier * 1.1),
+      0,
+      1,
+    );
+    const maneuverFactor = clamp(
+      accelerationMagnitude / Math.max(1, SHIP_MANUAL_FORWARD_THRUST * shipConfig.accelerationMultiplier * 2.2),
+      0,
+      1,
+    );
+    const targetIntensity = state.mode === 'interior'
+      ? 0
+      : clamp(Math.max(speedFactor * 0.22 + accelFactor, maneuverFactor * 0.5), 0, 1);
+
+    intensityRef.current = THREE.MathUtils.lerp(
+      intensityRef.current,
+      targetIntensity,
+      1 - Math.exp(-SHIP_THRUSTER_RESPONSE * delta),
+    );
+
+    const intensity = intensityRef.current;
+    const plumeLength = SHIP_THRUSTER_PLUME_LENGTH * (0.35 + intensity * 1.25 + speedFactor * 0.45);
+    const plumeRadius = SHIP_THRUSTER_PLUME_RADIUS * (0.65 + intensity * 1.1);
+    const elapsed = frameState.clock.elapsedTime;
+
+    for (let thrusterIndex = 0; thrusterIndex < thrusterAnchors.length; thrusterIndex += 1) {
+      const anchor = thrusterAnchors[thrusterIndex];
+      const coreMesh = thrusterCoreRefs.current[thrusterIndex];
+      const glowMesh = thrusterGlowRefs.current[thrusterIndex];
+      const visible = intensity > 0.03;
+
+      if (coreMesh) {
+        coreMesh.visible = visible;
+        if (visible) {
+          corePosition.copy(anchor).add(baseOffset);
+          corePosition.z += plumeLength * 0.38;
+          coreMesh.position.copy(corePosition);
+          plumeScale.set(plumeRadius, plumeLength, plumeRadius);
+          coreMesh.scale.copy(plumeScale);
+          const coreMaterial = coreMesh.material;
+          if (coreMaterial instanceof THREE.MeshBasicMaterial) {
+            coreMaterial.opacity = 0.18 + intensity * 0.62;
+          }
+        }
+      }
+
+      if (glowMesh) {
+        glowMesh.visible = visible;
+        if (visible) {
+          glowPosition.copy(anchor).add(baseOffset);
+          glowMesh.position.copy(glowPosition);
+          const flicker = 0.88 + 0.12 * Math.sin(elapsed * 22 + thrusterIndex * 1.73);
+          glowScale.setScalar((SHIP_THRUSTER_GLOW_RADIUS * (0.5 + intensity * 1.25)) * flicker);
+          glowMesh.scale.copy(glowScale);
+          const glowMaterial = glowMesh.material;
+          if (glowMaterial instanceof THREE.MeshBasicMaterial) {
+            glowMaterial.opacity = 0.12 + intensity * 0.32;
+          }
+        }
+      }
+
+      for (let particleIndex = 0; particleIndex < SHIP_THRUSTER_PARTICLE_COUNT; particleIndex += 1) {
+        const mesh = thrusterParticleRefs.current[thrusterIndex * SHIP_THRUSTER_PARTICLE_COUNT + particleIndex];
+        if (!mesh) {
+          continue;
+        }
+
+        mesh.visible = visible;
+        if (!visible) {
+          continue;
+        }
+
+        const phase = (elapsed * (1.8 + intensity * 5.2) + thrusterIndex * 0.37 + particleIndex / SHIP_THRUSTER_PARTICLE_COUNT) % 1;
+        const driftAngle = thrusterIndex * 2.4 + particleIndex * 1.7;
+        particlePosition.copy(anchor).add(baseOffset);
+        particlePosition.x += Math.cos(driftAngle) * SHIP_THRUSTER_PARTICLE_DRIFT * phase;
+        particlePosition.y += Math.sin(driftAngle) * SHIP_THRUSTER_PARTICLE_DRIFT * phase;
+        particlePosition.z += phase * plumeLength;
+        mesh.position.copy(particlePosition);
+        mesh.scale.setScalar(0.05 + intensity * 0.11 + (1 - phase) * 0.08);
+        const particleMaterial = mesh.material;
+        if (particleMaterial instanceof THREE.MeshBasicMaterial) {
+          particleMaterial.opacity = (0.08 + intensity * 0.3) * (1 - phase * 0.72);
+        }
+      }
+    }
+  });
+
+  return (
+    <group userData={{ ignoreOutline: true, ignoreWeaponCollision: true }}>
+      {thrusterAnchors.map((_, thrusterIndex) => (
+        <group key={`thruster-${thrusterIndex}`}>
+          <mesh
+            ref={(mesh) => {
+              thrusterCoreRefs.current[thrusterIndex] = mesh;
+            }}
+            visible={false}
+            rotation={[Math.PI / 2, 0, 0]}
+            renderOrder={58}
+          >
+            <cylinderGeometry args={[1, 0.2, 1, 10, 1, true]} />
+            <meshBasicMaterial color="#c9fbff" transparent opacity={0.6} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+          </mesh>
+          <mesh
+            ref={(mesh) => {
+              thrusterGlowRefs.current[thrusterIndex] = mesh;
+            }}
+            visible={false}
+            renderOrder={59}
+          >
+            <sphereGeometry args={[1, 12, 12]} />
+            <meshBasicMaterial color="#4fe7ff" transparent opacity={0.3} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+          </mesh>
+          {Array.from({ length: SHIP_THRUSTER_PARTICLE_COUNT }, (_, particleIndex) => (
+            <mesh
+              key={`thruster-${thrusterIndex}-particle-${particleIndex}`}
+              ref={(mesh) => {
+                thrusterParticleRefs.current[thrusterIndex * SHIP_THRUSTER_PARTICLE_COUNT + particleIndex] = mesh;
+              }}
+              visible={false}
+              renderOrder={57}
+            >
+              <sphereGeometry args={[1, 8, 8]} />
+              <meshBasicMaterial color="#8bf3ff" transparent opacity={0.22} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
             </mesh>
           ))}
         </group>
