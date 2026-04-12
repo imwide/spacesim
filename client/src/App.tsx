@@ -3374,6 +3374,34 @@ function AuthScreen({
   );
 }
 
+/**
+ * Directional light that always faces from the star (physical origin) toward the
+ * player, so all scene geometry is lit as though the sun were in the correct place.
+ */
+function SunDirectionalLight({ localStateRef }: { localStateRef: MutableRefObject<LocalGameState> }): ReactElement {
+  const lightRef = useRef<THREE.DirectionalLight>(null);
+  const _dir = useMemo(() => new THREE.Vector3(), []);
+
+  useFrame(() => {
+    const light = lightRef.current;
+    if (!light) return;
+    // Ship is at physical position shipPosition; star is at origin (0,0,0).
+    // The sun direction (from player toward star) = -shipPosition.
+    // We want the light to come FROM the star, so light.position = normalize(shipPos) * large.
+    _dir.copy(localStateRef.current.shipPosition);
+    const len = _dir.length();
+    if (len < 1) {
+      // Player is essentially at the star — use a stable fallback.
+      _dir.set(0, 1, 0);
+    } else {
+      _dir.divideScalar(len);
+    }
+    light.position.copy(_dir).multiplyScalar(1e6);
+  });
+
+  return <directionalLight ref={lightRef} intensity={1.25} color="#dbeafe" />;
+}
+
 function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () => void }): ReactElement {
   const galaxy = useMemo(() => generateGalaxy(42), []);
   const stationNetwork = useMemo(() => buildStationNetwork(galaxy), [galaxy]);
@@ -3675,7 +3703,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
       <Canvas camera={{ fov: 75, near: 0.05, far: GALAXY_CAMERA_FAR }} gl={{ logarithmicDepthBuffer: true }}>
         <color attach="background" args={['#02030b']} />
         <ambientLight intensity={0.85} />
-        <directionalLight intensity={1.25} position={[12, 18, 4]} color="#dbeafe" />
+        <SunDirectionalLight localStateRef={localStateRef} />
         <pointLight intensity={10} distance={120} position={[0, 0, 0]} color="#60a5fa" />
         <GameScene
           activeFrameOrigin={activeFrameOrigin}

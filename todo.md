@@ -32,8 +32,6 @@ Add anti-aliasing to the outline shader.
 
 Ship landing in stations needs to work
 
-In three.js everything is somehow directionally shaded. can you change the light direction of the client to be to wherever the sun is relative to the player?
-
 Add light sequences to the station configs. This will allow every station to have a array of relative coordinates (that will also be shown with the debug crosshairs)
 
 
