@@ -6742,7 +6742,7 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
   }, []);
 
   return (
-    <group ref={shieldGroupRef} userData={{ stationForceFieldId: fieldId }}>
+    <group ref={shieldGroupRef} userData={{ stationForceFieldId: fieldId, ignoreCameraCollision: true }}>
       {/* Invisible raycast-only sphere — always present, never visually rendered */}
       <mesh ref={raycastMeshRef} userData={{ stationForceFieldId: fieldId }}>
         <sphereGeometry args={[radius, 32, 24]} />

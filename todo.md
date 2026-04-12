@@ -37,7 +37,4 @@ In three.js everything is somehow directionally shaded. can you change the light
 Add light sequences to the station configs. This will allow every station to have a array of relative coordinates (that will also be shown with the debug crosshairs)
 
 
-The force field sphere should not have any effect on third person camera clipping
-
-
 Remove space tablet in favor of a new UI
