@@ -59,6 +59,7 @@ import * as THREE from 'three';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 
 type Mode = 'space' | 'interior' | 'pilot' | 'planet-surface';
@@ -322,6 +323,29 @@ function setOutlineExcluded(object: THREE.Object3D | null, excluded: boolean): v
   outlineExcludedObjects.delete(object);
 }
 
+/**
+ * Material used during the normal/depth pass for objects that should BLOCK the outline
+ * of geometry behind them, but should NOT have any outline drawn on themselves.
+ * Writes depth normally so it occludes other geometry, but writes alpha=0 to the
+ * normal colour buffer so the outline shader skips edge detection at those pixels.
+ */
+const outlineSentinelMaterial = new THREE.ShaderMaterial({
+  vertexShader: /* glsl */ `
+    void main() {
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */ `
+    void main() {
+      gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+    }
+  `,
+  depthWrite: true,
+  depthTest: true,
+  colorWrite: true,
+  side: THREE.DoubleSide,
+});
+
 const CARTOON_OUTLINE_VERTEX_SHADER = /* glsl */ `
   varying vec2 vUv;
 
@@ -369,6 +393,13 @@ const CARTOON_OUTLINE_FRAGMENT_SHADER = /* glsl */ `
       : vec3(0.0, 0.0, 0.0);
     float centerDepth = centerHasGeometry ? readLinearDepth(vUv) : 1e20;
 
+    // Sentinel: objects with userData.ignoreOutline write alpha=0 to the normal buffer.
+    // They block depth behind them but must not receive any outline themselves.
+    if (centerHasGeometry && texture2D(tNormal, vUv).a < 0.5) {
+      gl_FragColor = baseColor;
+      return;
+    }
+
     float normalEdge = 0.0;
     float depthEdge = 0.0;
 
@@ -386,6 +417,12 @@ const CARTOON_OUTLINE_FRAGMENT_SHADER = /* glsl */ `
       vec2 sampleUv = vUv + offsets[i] * texelSize;
       float sampleDepthRaw = texture2D(tDepth, sampleUv).x;
       bool sampleHasGeometry = sampleDepthRaw < 1.0;
+
+      // Skip edge detection against sentinel neighbour pixels so no outline
+      // appears at the boundary between regular geometry and sentinel objects.
+      if (sampleHasGeometry && texture2D(tNormal, sampleUv).a < 0.5) {
+        continue;
+      }
 
       if (centerHasGeometry != sampleHasGeometry) {
         depthEdge = 1.0;
@@ -3028,8 +3065,10 @@ function CartoonOutlinePostProcess(): null {
   const normalTargetRef = useRef<THREE.WebGLRenderTarget | null>(null);
   const normalMaterial = useMemo(() => new THREE.MeshNormalMaterial(), []);
   const renderPassRef = useRef<RenderPass | null>(null);
+  const bloomPassRef = useRef<UnrealBloomPass | null>(null);
   const outlinePassRef = useRef<ShaderPass | null>(null);
   const outputPassRef = useRef<OutputPass | null>(null);
+  const sentinelMeshBuffer = useMemo<Array<[THREE.Mesh, THREE.Material | THREE.Material[]]>>(() => [], []);
   const renderPixelWidth = Math.max(1, Math.floor(size.width * gl.getPixelRatio()));
   const renderPixelHeight = Math.max(1, Math.floor(size.height * gl.getPixelRatio()));
 
@@ -3049,6 +3088,12 @@ function CartoonOutlinePostProcess(): null {
     composer.setSize(size.width, size.height);
 
     const renderPass = new RenderPass(scene, camera);
+    const bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(renderPixelWidth, renderPixelHeight),
+      /* strength */ 0.55,
+      /* radius   */ 0.6,
+      /* threshold */ 0.5,
+    );
     const outlinePass = new ShaderPass({
       uniforms: {
         tDiffuse: { value: null },
@@ -3067,12 +3112,14 @@ function CartoonOutlinePostProcess(): null {
     const outputPass = new OutputPass();
 
     composer.addPass(renderPass);
+    composer.addPass(bloomPass);
     composer.addPass(outlinePass);
     composer.addPass(outputPass);
 
     composerRef.current = composer;
     normalTargetRef.current = normalTarget;
     renderPassRef.current = renderPass;
+    bloomPassRef.current = bloomPass;
     outlinePassRef.current = outlinePass;
     outputPassRef.current = outputPass;
 
@@ -3083,6 +3130,7 @@ function CartoonOutlinePostProcess(): null {
       composerRef.current = null;
       normalTargetRef.current = null;
       renderPassRef.current = null;
+      bloomPassRef.current = null;
       outlinePassRef.current = null;
       outputPassRef.current = null;
     };
@@ -3092,6 +3140,10 @@ function CartoonOutlinePostProcess(): null {
     if (composerRef.current) {
       composerRef.current.setPixelRatio(gl.getPixelRatio());
       composerRef.current.setSize(size.width, size.height);
+    }
+
+    if (bloomPassRef.current) {
+      bloomPassRef.current.resolution.set(renderPixelWidth, renderPixelHeight);
     }
 
     if (normalTargetRef.current) {
@@ -3137,13 +3189,40 @@ function CartoonOutlinePostProcess(): null {
       }
     });
 
-    // 2. Render normals+depth (excluded objects are hidden)
-    scene.overrideMaterial = normalMaterial;
+    // 2a. For objects tagged userData.ignoreOutline, swap their material to the
+    //     sentinel so they write depth (blocking outline behind) but write alpha=0
+    //     to the normal colour buffer so edge detection is suppressed on them.
+    //     All other visible meshes get normalMaterial as usual.
+    sentinelMeshBuffer.length = 0;
+    scene.traverseVisible((obj) => {
+      if (!(obj instanceof THREE.Mesh) || !obj.geometry || !obj.matrixWorld) {
+        return;
+      }
+      let isSentinel = false;
+      let node: THREE.Object3D | null = obj;
+      while (node) {
+        if (node.userData?.ignoreOutline) {
+          isSentinel = true;
+          break;
+        }
+        node = node.parent;
+      }
+      sentinelMeshBuffer.push([obj, obj.material]);
+      // eslint-disable-next-line no-param-reassign
+      (obj as THREE.Mesh).material = isSentinel ? outlineSentinelMaterial : normalMaterial;
+    });
+
+    // 2b. Render normals+depth without scene.overrideMaterial (each mesh already
+    //     has the right material set above).
     gl.setRenderTarget(normalTarget);
     gl.clear();
     gl.render(scene, camera);
-    scene.overrideMaterial = previousOverrideMaterial;
     gl.setRenderTarget(previousTarget);
+
+    // 2c. Restore all mesh materials.
+    for (const [mesh, mat] of sentinelMeshBuffer) {
+      (mesh as THREE.Mesh).material = mat;
+    }
 
     // 3. Restore excluded objects before the main color pass
     for (const obj of hiddenByUs) {
@@ -6580,7 +6659,7 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
   });
 
   return (
-    <group ref={shieldGroupRef} userData={{ stationForceFieldId: fieldId }}>
+    <group ref={shieldGroupRef} userData={{ stationForceFieldId: fieldId, ignoreOutline: true }}>
       {/* Invisible raycast-only sphere — always present, never visually rendered */}
       <mesh ref={raycastMeshRef} userData={{ stationForceFieldId: fieldId }}>
         <sphereGeometry args={[radius, 32, 24]} />
@@ -7054,7 +7133,7 @@ function ShipWeaponEffects({
   });
 
   return (
-    <group ref={weaponEffectsRef} userData={{ ignoreWeaponCollision: true }}>
+    <group ref={weaponEffectsRef} userData={{ ignoreWeaponCollision: true, ignoreOutline: true }}>
       {projectiles.map((_, index) => (
         <group key={`weapon-projectile-${index}`}>
           <mesh ref={(mesh) => {
@@ -7940,9 +8019,8 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
       visibleRange={SMALL_ASTEROID_VISIBILITY_RANGE * 2}
       linearDistance={ASTEROID_PROXY_LINEAR_DISTANCE}
       logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}
-      excludeFromOutline
     >
-      <group ref={dustGroupRef} visible={show}>
+      <group ref={dustGroupRef} visible={show} userData={{ ignoreOutline: true }}>
         <instancedMesh ref={instancedMeshRef} args={[null as any, null as any, dust.length]}>
           <dodecahedronGeometry args={[1, 0]} />
           <meshStandardMaterial color="#64748b" roughness={0.96} metalness={0.06} />
@@ -8011,9 +8089,8 @@ function AsteroidMesh({
       visibleRange={SMALL_ASTEROID_VISIBILITY_RANGE * 2}
       linearDistance={ASTEROID_PROXY_LINEAR_DISTANCE}
       logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}
-      excludeFromOutlineWhenProxy
     >
-      <group rotation={asteroid.rotation} scale={visualScale} visible={show}>
+      <group rotation={asteroid.rotation} scale={visualScale} visible={show} userData={{ ignoreOutline: true }}>
         {asteroid.shape === 'abstract' ? (
           <mesh>
             <icosahedronGeometry args={[1, 1]} />
