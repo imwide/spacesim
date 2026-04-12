@@ -331,12 +331,17 @@ function setOutlineExcluded(object: THREE.Object3D | null, excluded: boolean): v
  */
 const outlineSentinelMaterial = new THREE.ShaderMaterial({
   vertexShader: /* glsl */ `
+    #include <common>
+    #include <logdepthbuf_pars_vertex>
     void main() {
       gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      #include <logdepthbuf_vertex>
     }
   `,
   fragmentShader: /* glsl */ `
+    #include <logdepthbuf_pars_fragment>
     void main() {
+      #include <logdepthbuf_fragment>
       gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
     }
   `,
@@ -3198,6 +3203,15 @@ function CartoonOutlinePostProcess(): null {
       if (!(obj instanceof THREE.Mesh) || !obj.geometry || !obj.matrixWorld) {
         return;
       }
+
+      // Per-mesh custom outline material takes highest priority.
+      if (obj.userData?.customOutlineMaterial) {
+        sentinelMeshBuffer.push([obj, obj.material]);
+        // eslint-disable-next-line no-param-reassign
+        (obj as THREE.Mesh).material = obj.userData.customOutlineMaterial;
+        return;
+      }
+
       let isSentinel = false;
       let node: THREE.Object3D | null = obj;
       while (node) {
@@ -6558,6 +6572,7 @@ function createHexPatternTexture(): THREE.CanvasTexture {
 function StationForceField({ fieldId, radius }: { fieldId: string; radius: number }): ReactElement {
   const shieldGroupRef = useRef<THREE.Group>(null);
   const raycastMeshRef = useRef<THREE.Mesh>(null);
+  const shieldMeshRef = useRef<THREE.Mesh>(null);
   const shieldMaterialRef = useRef<THREE.ShaderMaterial>(null);
   const localHitPoint = useMemo(() => new THREE.Vector3(), []);
   const localNormal = useMemo(() => new THREE.Vector3(), []);
@@ -6658,14 +6673,70 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
     }
   });
 
+  /** Sentinel material for the outline pass: uses the same reveal logic as the
+   *  visual shield shader.  Where the field is visible (projectile hit), it writes
+   *  alpha=0 to the normal colour buffer so the outline shader skips edge detection
+   *  at those pixels, hiding station outlines behind the visible shield.
+   *  depthWrite is FALSE so the sphere never creates false depth discontinuities
+   *  (which would cause a phantom outline on the invisible sphere). Where the field
+   *  is not revealed, the fragment discards entirely, preserving station normals
+   *  and outlines behind it. */
+  const forceFieldSentinelMaterial = useMemo(() => new THREE.ShaderMaterial({
+    vertexShader: /* glsl */ `
+      #include <common>
+      #include <logdepthbuf_pars_vertex>
+      varying vec3 vLocalNormal;
+      void main() {
+        vLocalNormal = normalize(position);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        #include <logdepthbuf_vertex>
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      #include <logdepthbuf_pars_fragment>
+      uniform vec3 impactNormals[${STATION_FORCE_FIELD_MAX_SPOTS}];
+      uniform float impactStrengths[${STATION_FORCE_FIELD_MAX_SPOTS}];
+      uniform float impactRadius;
+      uniform float impactSoftness;
+      varying vec3 vLocalNormal;
+      void main() {
+        #include <logdepthbuf_fragment>
+        vec3 localNormal = normalize(vLocalNormal);
+        float reveal = 0.0;
+        for (int i = 0; i < ${STATION_FORCE_FIELD_MAX_SPOTS}; i++) {
+          float strength = impactStrengths[i];
+          if (strength <= 0.0) continue;
+          float normalDistance = distance(localNormal, normalize(impactNormals[i]));
+          float revealBand = 1.0 - smoothstep(impactRadius, impactRadius + impactSoftness, normalDistance);
+          reveal = max(reveal, revealBand * strength);
+        }
+        if (reveal <= 0.001) {
+          discard;
+        }
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+      }
+    `,
+    uniforms: {
+      impactNormals: shieldUniforms.impactNormals,
+      impactStrengths: shieldUniforms.impactStrengths,
+      impactRadius: shieldUniforms.impactRadius,
+      impactSoftness: shieldUniforms.impactSoftness,
+    },
+    depthWrite: false,
+    depthTest: true,
+    colorWrite: true,
+    side: THREE.DoubleSide,
+  }), [shieldUniforms]);
+
+  // Exclude the invisible raycast sphere from the outline pass entirely.
   useEffect(() => {
-    const group = shieldGroupRef.current;
-    if (group) {
-      outlineExcludedObjects.add(group);
+    const mesh = raycastMeshRef.current;
+    if (mesh) {
+      outlineExcludedObjects.add(mesh);
     }
     return () => {
-      if (group) {
-        outlineExcludedObjects.delete(group);
+      if (mesh) {
+        outlineExcludedObjects.delete(mesh);
       }
     };
   }, []);
@@ -6677,7 +6748,7 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
         <sphereGeometry args={[radius, 32, 24]} />
         <meshBasicMaterial transparent opacity={0} depthWrite={false} side={THREE.DoubleSide} colorWrite={false} />
       </mesh>
-      <mesh renderOrder={69} userData={{ ignoreWeaponCollision: true, stationForceFieldId: fieldId }}>
+      <mesh ref={shieldMeshRef} renderOrder={69} userData={{ ignoreWeaponCollision: true, stationForceFieldId: fieldId, customOutlineMaterial: forceFieldSentinelMaterial }}>
         <sphereGeometry args={[radius + 1.5, 64, 48]} />
         <shaderMaterial
           ref={shieldMaterialRef}
