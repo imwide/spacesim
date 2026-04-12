@@ -304,6 +304,10 @@ interface StationForceFieldHitResult {
 
 const stationForceFieldImpactHandlers = new Map<string, (worldHitPoint: THREE.Vector3) => void>();
 const stationWalkableRoots = new Map<string, THREE.Object3D>();
+// Reusable instances for findStationWalkCollision — avoids per-frame GC pressure.
+const _walkRaycaster = new THREE.Raycaster();
+const _walkDownDir = new THREE.Vector3(0, -1, 0);
+const _walkBounds = new THREE.Box3();
 const CARTOON_OUTLINE_ANGLE_DEGREES = 35;
 const CARTOON_OUTLINE_DEPTH_THRESHOLD = 0.0025;
 
@@ -1580,7 +1584,10 @@ function findStationWalkCollision(position: THREE.Vector3): ShipInteriorCollisio
     return null;
   }
 
-  const hits = new THREE.Raycaster(position, new THREE.Vector3(0, -1, 0), 0, STATION_GRAVITY_DETECTION_RANGE).intersectObjects(roots, true);
+  _walkRaycaster.set(position, _walkDownDir);
+  _walkRaycaster.near = 0;
+  _walkRaycaster.far = STATION_GRAVITY_DETECTION_RANGE;
+  const hits = _walkRaycaster.intersectObjects(roots, true);
   for (const hit of hits) {
     const normal = getInteriorHitNormal(hit);
     if (normal.y <= 0.25) {
@@ -1594,7 +1601,7 @@ function findStationWalkCollision(position: THREE.Vector3): ShipInteriorCollisio
 
     return {
       colliderMeshes: [root],
-      bounds: new THREE.Box3().setFromObject(root),
+      bounds: _walkBounds.setFromObject(root),
       standingHeight: PLANET_SURFACE_EYE_HEIGHT,
     };
   }
