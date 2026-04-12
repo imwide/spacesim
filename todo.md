@@ -12,11 +12,6 @@ The turning can happen really fast right now. The intensity that the turn and ro
 
 While flying the ship (in the pilot seat) allow for switching perspectives. Currently its only third person perspective where the camera orbits around the ship. When pressing a hotkey for swithcing perspectives, it toggles between third person and first person perspective. In first person perspective, the camera should be fixed in place but not rotation, 1m above the ships "pilot seat" position. The ship inside should be rendered again isntead of the outside. The controls should be identical.
 
-Remove the outline effect from the smallest kind of asteroid (the dark blue kind that explodes when shot) and especially from billboards of far away objects since it makes them hard to see.
-
-
-
-Prevent the third person camera from clipping through meshes while flying the ship in third person.
 
 
 Ship collisions with stations and asteroids need to work
@@ -25,6 +20,8 @@ Ship collisions with stations and asteroids need to work
 The outline shader doesnt show outlines if the face "behind" it has the same or similar direction normals. This doesnt look good. If the angle is enough at an edge, the outline should be shown regardless of the direction of the normals of the face behind it.
 
 BLENDER TODO: Apply array modifier, fix normal directions
+
+Using the relative thruster coordinates for each ship, display thruster particle effects at the thruster positions depending on the current acceleration and speed, just like the gun/shooting particles work using teh relative config coordinates
 
 
 Show a glow around emissive materials.

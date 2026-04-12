@@ -166,7 +166,9 @@ export function ShipExteriorModel({ config, highlight = false, showDebugAnchors 
   const { scene } = useGLTF(config.exteriorModel);
   const clonedScene = useMemo(() => {
     const clone = scene.clone(true);
+    clone.userData.ignoreCameraCollision = true;
     clone.traverse((child) => {
+      child.userData.ignoreCameraCollision = true;
       if ((child as THREE.Mesh).isMesh) {
         const mesh = child as THREE.Mesh;
         // Clone materials so we can tint per-instance without affecting the cache
@@ -215,7 +217,14 @@ interface ShipInteriorModelProps {
 
 export function ShipInteriorModel({ config, showDebugAnchors = true }: ShipInteriorModelProps): ReactElement {
   const { scene } = useGLTF(config.interiorModel);
-  const clonedScene = useMemo(() => scene.clone(true), [scene]);
+  const clonedScene = useMemo(() => {
+    const clone = scene.clone(true);
+    clone.userData.ignoreCameraCollision = true;
+    clone.traverse((child) => {
+      child.userData.ignoreCameraCollision = true;
+    });
+    return clone;
+  }, [scene]);
   return (
     <group>
       <group rotation={[0, Math.PI, 0]}>

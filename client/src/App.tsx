@@ -101,6 +101,9 @@ const SHIP_MANUAL_STRAFE_THRUST = SHIP_THRUST_ACCELERATION * 1.05;
 const SHIP_MANUAL_COAST_DAMPING = 0.16;
 const SHIP_MANUAL_LATERAL_DAMPING = 0.5;
 const SHIP_MANUAL_TURN_LATERAL_DAMPING = 1.35;
+const THIRD_PERSON_CAMERA_COLLISION_RADIUS = 0.8;
+const THIRD_PERSON_CAMERA_COLLISION_BUFFER = 0.45;
+const THIRD_PERSON_CAMERA_TERRAIN_SAMPLES = 10;
 const PLAYER_COLLISION_RADIUS = 0.46;
 const BOARDING_RADIUS_METERS = 10 * METERS_PER_WORLD_UNIT;
 const SEAT_INTERACTION_DISTANCE_METERS = 1.15 * METERS_PER_WORLD_UNIT;
@@ -305,6 +308,19 @@ const CARTOON_OUTLINE_DEPTH_THRESHOLD = 0.0025;
 /** Objects registered here are hidden during the outline normal/depth pass
  *  so they don't receive cartoon outlines (e.g. star body, lens flare). */
 const outlineExcludedObjects = new Set<THREE.Object3D>();
+
+function setOutlineExcluded(object: THREE.Object3D | null, excluded: boolean): void {
+  if (!object) {
+    return;
+  }
+
+  if (excluded) {
+    outlineExcludedObjects.add(object);
+    return;
+  }
+
+  outlineExcludedObjects.delete(object);
+}
 
 const CARTOON_OUTLINE_VERTEX_SHADER = /* glsl */ `
   varying vec2 vUv;
@@ -1102,6 +1118,225 @@ function findSceneCollisionOnSegment(
   });
 
   return nearestHit;
+}
+
+function findPreciseSceneCollisionOnSegment(
+  start: THREE.Vector3,
+  end: THREE.Vector3,
+  actorRadius: number,
+  colliders: SceneCollider[],
+  ignoredColliderIds: Set<string>,
+): MotionCollisionResult | null {
+  const delta = end.clone().sub(start);
+  const lengthSq = delta.lengthSq();
+
+  if (lengthSq <= 1e-8) {
+    return null;
+  }
+
+  let nearestHit: MotionCollisionResult | null = null;
+
+  colliders.forEach((collider) => {
+    if (ignoredColliderIds.has(collider.id) || (collider.ownerId && ignoredColliderIds.has(collider.ownerId))) {
+      return;
+    }
+
+    const colliderLocalPosition = vectorFromTuple(collider.position);
+    const expandedRadius = collider.radius + actorRadius;
+    const startOffset = start.clone().sub(colliderLocalPosition);
+    const c = startOffset.lengthSq() - expandedRadius * expandedRadius;
+
+    if (c <= 0) {
+      const normal = startOffset.lengthSq() > 1e-8
+        ? startOffset.normalize()
+        : delta.clone().normalize().multiplyScalar(-1);
+      if (!nearestHit || 0 < nearestHit.travelFraction) {
+        nearestHit = {
+          collider,
+          colliderLocalPosition,
+          normal,
+          travelFraction: 0,
+        };
+      }
+      return;
+    }
+
+    const a = lengthSq;
+    const b = 2 * startOffset.dot(delta);
+    const discriminant = b * b - 4 * a * c;
+
+    if (discriminant < 0) {
+      return;
+    }
+
+    const sqrtDiscriminant = Math.sqrt(discriminant);
+    const tNear = (-b - sqrtDiscriminant) / (2 * a);
+    const tFar = (-b + sqrtDiscriminant) / (2 * a);
+    const travelFraction = tNear >= 0 && tNear <= 1
+      ? tNear
+      : tFar >= 0 && tFar <= 1
+        ? tFar
+        : null;
+
+    if (travelFraction === null) {
+      return;
+    }
+
+    const hitPoint = start.clone().addScaledVector(delta, travelFraction);
+    let normal = hitPoint.sub(colliderLocalPosition);
+    if (normal.lengthSq() <= 1e-8) {
+      normal = delta.clone().normalize().multiplyScalar(-1);
+    } else {
+      normal.normalize();
+    }
+
+    if (!nearestHit || travelFraction < nearestHit.travelFraction) {
+      nearestHit = {
+        collider,
+        colliderLocalPosition,
+        normal,
+        travelFraction,
+      };
+    }
+  });
+
+  return nearestHit;
+}
+
+function findThirdPersonCameraTerrainFraction(
+  start: THREE.Vector3,
+  end: THREE.Vector3,
+  system: StarSystemData,
+  frameOrigin: THREE.Vector3,
+): number | null {
+  const segment = end.clone().sub(start);
+  const segmentLength = segment.length();
+
+  if (segmentLength <= 1e-6) {
+    return null;
+  }
+
+  const isTerrainBlocked = (point: THREE.Vector3): boolean => {
+    const nearestPlanet = findNearestPlanet(point, system, frameOrigin);
+    if (!nearestPlanet) {
+      return false;
+    }
+
+    const minimumAltitude = getTerrainAltitudeAtPosition(
+      point,
+      nearestPlanet.planetCenter,
+      nearestPlanet.planetRadius,
+      nearestPlanet.planetId,
+    ) + THIRD_PERSON_CAMERA_COLLISION_RADIUS + THIRD_PERSON_CAMERA_COLLISION_BUFFER;
+
+    return point.distanceTo(nearestPlanet.planetCenter) <= minimumAltitude;
+  };
+
+  if (isTerrainBlocked(start)) {
+    return 0;
+  }
+
+  let previousFraction = 0;
+  const samplePoint = new THREE.Vector3();
+
+  for (let sampleIndex = 1; sampleIndex <= THIRD_PERSON_CAMERA_TERRAIN_SAMPLES; sampleIndex += 1) {
+    const fraction = sampleIndex / THIRD_PERSON_CAMERA_TERRAIN_SAMPLES;
+    samplePoint.copy(start).addScaledVector(segment, fraction);
+
+    if (!isTerrainBlocked(samplePoint)) {
+      previousFraction = fraction;
+      continue;
+    }
+
+    let safeFraction = previousFraction;
+    let blockedFraction = fraction;
+    for (let iteration = 0; iteration < 5; iteration += 1) {
+      const midFraction = (safeFraction + blockedFraction) * 0.5;
+      samplePoint.copy(start).addScaledVector(segment, midFraction);
+      if (isTerrainBlocked(samplePoint)) {
+        blockedFraction = midFraction;
+      } else {
+        safeFraction = midFraction;
+      }
+    }
+    return safeFraction;
+  }
+
+  return null;
+}
+
+function shouldIgnoreThirdPersonCameraCollision(
+  object: THREE.Object3D,
+  ignoredRoots: Array<THREE.Object3D | null>,
+): boolean {
+  let current: THREE.Object3D | null = object;
+
+  while (current) {
+    if (ignoredRoots.some((root) => root === current)) {
+      return true;
+    }
+
+    if (
+      current.userData?.ignoreCameraCollision
+      || current.userData?.ignoreWeaponCollision
+      || current.userData?.ignoreMarkerOcclusion
+      || current.userData?.ignoreStarOcclusion
+      || current.userData?.suppressWeaponImpactEffect
+    ) {
+      return true;
+    }
+
+    current = current.parent;
+  }
+
+  return false;
+}
+
+const _thirdPersonCameraTargetBuffer: THREE.Object3D[] = [];
+
+function resolveThirdPersonCameraPosition(
+  scene: THREE.Scene,
+  raycaster: THREE.Raycaster,
+  focusPosition: THREE.Vector3,
+  desiredPosition: THREE.Vector3,
+  ignoredRoots: Array<THREE.Object3D | null>,
+): THREE.Vector3 {
+  const segment = desiredPosition.clone().sub(focusPosition);
+  const segmentLength = segment.length();
+
+  if (segmentLength <= 1e-6) {
+    return desiredPosition.clone();
+  }
+
+  const direction = segment.clone().divideScalar(segmentLength);
+  const CAMERA_PULLBACK_BUFFER = 0.5;
+
+  // Build a flat list of candidate meshes via traverseVisible so we only
+  // touch objects that are fully mounted (non-null matrixWorld).
+  _thirdPersonCameraTargetBuffer.length = 0;
+  scene.traverseVisible((object) => {
+    if (
+      object instanceof THREE.Mesh
+      && object.geometry
+      && object.matrixWorld
+      && !shouldIgnoreThirdPersonCameraCollision(object, ignoredRoots)
+    ) {
+      _thirdPersonCameraTargetBuffer.push(object);
+    }
+  });
+
+  raycaster.near = 0;
+  raycaster.far = segmentLength;
+  raycaster.set(focusPosition, direction);
+
+  // recursive: false because the list is already flat
+  const hits = raycaster.intersectObjects(_thirdPersonCameraTargetBuffer, false);
+  if (hits.length > 0) {
+    const safeDistance = Math.max(0, hits[0].distance - CAMERA_PULLBACK_BUFFER);
+    return focusPosition.clone().addScaledVector(direction, safeDistance);
+  }
+
+  return desiredPosition.clone();
 }
 
 function findStationForceFieldHitOnSegment(
@@ -3569,7 +3804,7 @@ function GameScene({
   shipConfig: ShipConfig;
   tabletOpen: boolean;
 }): ReactElement {
-  const { camera, gl } = useThree();
+  const { camera, gl, scene } = useThree();
   const interiorCollision = useShipInteriorCollisionData(shipConfig);
   const lastPilotCrosshairRef = useRef<PilotCrosshairState>({
     visible: false,
@@ -3598,6 +3833,7 @@ function GameScene({
     () => mapSceneCollidersToFrame(environmentColliders, activeFrameOrigin),
     [activeFrameOrigin, environmentColliders],
   );
+  const thirdPersonCameraRaycaster = useMemo(() => new THREE.Raycaster(), []);
   const stationForceFields = useMemo(
     () => (activeSystem
       ? buildSystemStationForceFields(activeSystem).map((field) => ({
@@ -4292,10 +4528,6 @@ function GameScene({
         settleShipVelocity(state, dt, shipSceneColliders, insideStationBounds ? SHIP_STATION_MANUAL_HANDLING_MULTIPLIER : 1);
       }
 
-      const orbitRadius = shipConfig.cameraOrbitRadius;
-      const cameraOffset = new THREE.Vector3(0, 2, orbitRadius).applyQuaternion(lookRotation);
-      camera.position.copy(state.shipPosition).add(cameraOffset);
-      camera.quaternion.copy(lookRotation);
     }
 
     // ── Apply ship gravity when touching ground (any mode except flying) ───
@@ -4328,6 +4560,20 @@ function GameScene({
       }
     } else {
       state.shipOnGround = false;
+    }
+
+    if (state.mode === 'pilot') {
+      const desiredCameraOffset = new THREE.Vector3(0, 2, shipConfig.cameraOrbitRadius).applyQuaternion(lookRotation);
+      const desiredCameraPosition = state.shipPosition.clone().add(desiredCameraOffset);
+      const resolvedCameraPosition = resolveThirdPersonCameraPosition(
+        scene,
+        thirdPersonCameraRaycaster,
+        state.shipPosition,
+        desiredCameraPosition,
+        [shipGroupRef.current, interiorGroupRef.current],
+      );
+      camera.position.copy(resolvedCameraPosition);
+      camera.quaternion.copy(lookRotation);
     }
 
     // ── Dual-layer visibility ─────────────────────────────────────────────
@@ -4533,13 +4779,13 @@ function GameScene({
       <GalaxyBackdrop activeFrameOrigin={activeFrameOrigin} activeSystemId={activeSystemId} galaxy={galaxy} autopilotTarget={activeAutopilotTarget} highlightedTarget={highlightedTarget} localStateRef={localStateRef} />
       <WarpSpeedEffect localStateRef={localStateRef} />
       <ShipWeaponEffects firingPrimaryRef={firingPrimaryRef} localShipRef={shipGroupRef} localStateRef={localStateRef} stationForceFields={stationForceFields} shipConfig={shipConfig} />
-      <group ref={shipGroupRef}>
+      <group ref={shipGroupRef} userData={{ ignoreCameraCollision: true }}>
         <ShipExteriorModel config={shipConfig} highlight showDebugAnchors={showDebugAnchors} />
       </group>
       {highlightedTarget?.kind === 'ship' && (mode === 'space' || mode === 'planet-surface') ? (
         <ShipHighlightTag target={highlightedTarget} localStateRef={localStateRef} />
       ) : null}
-      <group ref={interiorGroupRef} visible={false}>
+      <group ref={interiorGroupRef} visible={false} userData={{ ignoreCameraCollision: true }}>
         <ShipInteriorModel config={shipConfig} showDebugAnchors={showDebugAnchors} />
       </group>
       {remotePlayers.map((player) => (
@@ -7092,12 +7338,16 @@ function StarLensFlare({ starPosition, starRadius }: { starPosition: Vec3Tuple; 
 
 function PhysicalProxyGroup({
   children,
+  excludeFromOutline = false,
+  excludeFromOutlineWhenProxy = false,
   linearDistance = CELESTIAL_PROXY_LINEAR_DISTANCE,
   logarithmicFactor = CELESTIAL_PROXY_LOG_FACTOR,
   physicalPosition,
   visibleRange,
 }: {
   children: ReactNode;
+  excludeFromOutline?: boolean;
+  excludeFromOutlineWhenProxy?: boolean;
   linearDistance?: number;
   logarithmicFactor?: number;
   physicalPosition: Vec3Tuple;
@@ -7105,8 +7355,14 @@ function PhysicalProxyGroup({
 }): ReactElement {
   const { camera } = useThree();
   const groupRef = useRef<THREE.Group>(null);
+  const outlineExcludedRef = useRef(false);
   const physicalPositionVector = useMemo(() => new THREE.Vector3(...physicalPosition), [physicalPosition]);
   const direction = useMemo(() => new THREE.Vector3(), []);
+
+  useEffect(() => () => {
+    setOutlineExcluded(groupRef.current, false);
+    outlineExcludedRef.current = false;
+  }, []);
 
   useFrame(() => {
     if (!groupRef.current) {
@@ -7115,6 +7371,12 @@ function PhysicalProxyGroup({
 
     direction.copy(physicalPositionVector).sub(camera.position);
     const physicalDistance = direction.length();
+    const shouldExcludeFromOutline = excludeFromOutline || (excludeFromOutlineWhenProxy && physicalDistance > linearDistance);
+
+    if (shouldExcludeFromOutline !== outlineExcludedRef.current) {
+      setOutlineExcluded(groupRef.current, shouldExcludeFromOutline);
+      outlineExcludedRef.current = shouldExcludeFromOutline;
+    }
 
     if (physicalDistance > visibleRange) {
       groupRef.current.visible = false;
@@ -7673,7 +7935,13 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
   });
 
   return (
-    <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={SMALL_ASTEROID_VISIBILITY_RANGE * 2} linearDistance={ASTEROID_PROXY_LINEAR_DISTANCE} logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}>
+    <PhysicalProxyGroup
+      physicalPosition={physicalPosition}
+      visibleRange={SMALL_ASTEROID_VISIBILITY_RANGE * 2}
+      linearDistance={ASTEROID_PROXY_LINEAR_DISTANCE}
+      logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}
+      excludeFromOutline
+    >
       <group ref={dustGroupRef} visible={show}>
         <instancedMesh ref={instancedMeshRef} args={[null as any, null as any, dust.length]}>
           <dodecahedronGeometry args={[1, 0]} />
@@ -7738,7 +8006,13 @@ function AsteroidMesh({
   });
 
   return (
-    <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={SMALL_ASTEROID_VISIBILITY_RANGE * 2} linearDistance={ASTEROID_PROXY_LINEAR_DISTANCE} logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}>
+    <PhysicalProxyGroup
+      physicalPosition={physicalPosition}
+      visibleRange={SMALL_ASTEROID_VISIBILITY_RANGE * 2}
+      linearDistance={ASTEROID_PROXY_LINEAR_DISTANCE}
+      logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}
+      excludeFromOutlineWhenProxy
+    >
       <group rotation={asteroid.rotation} scale={visualScale} visible={show}>
         {asteroid.shape === 'abstract' ? (
           <mesh>
