@@ -380,77 +380,102 @@ const CARTOON_OUTLINE_FRAGMENT_SHADER = /* glsl */ `
 
   varying vec2 vUv;
 
-  vec3 decodeNormal(vec3 encodedNormal) {
-    return normalize(encodedNormal * 2.0 - 1.0);
+  vec3 decodeNormal(vec3 enc) {
+    return normalize(enc * 2.0 - 1.0);
   }
 
-  float readLinearDepth(vec2 uv) {
-    float fragCoordZ = texture2D(tDepth, uv).x;
-    if (fragCoordZ >= 1.0) {
-      return 1e20;
-    }
+  // Read a neighbour sample → vec4(normal.xyz, linearDepth).
+  // Sentinel pixels are substituted with centre values to suppress false edges.
+  // Background pixels use the centre normal and an inflated depth so the Sobel
+  // operator sees a clean silhouette discontinuity on the depth channel only.
+  vec4 readSample(vec2 uv, vec3 cNormal, float cDepth, bool cHasGeo) {
+    float rawZ = texture2D(tDepth, uv).x;
+    vec4  ns   = texture2D(tNormal, uv);
+    bool  hasGeo   = rawZ < 1.0;
+    bool  sentinel = hasGeo && ns.a < 0.5;
 
-    float viewZ = perspectiveDepthToViewZ(fragCoordZ, cameraNear, cameraFar);
-    return -viewZ;
+    if (sentinel) {
+      return vec4(cNormal, cDepth);
+    }
+    if (!hasGeo) {
+      float bgDepth = cHasGeo ? cDepth * 200.0 : cDepth;
+      return vec4(cNormal, bgDepth);
+    }
+    return vec4(
+      decodeNormal(ns.xyz),
+      -perspectiveDepthToViewZ(rawZ, cameraNear, cameraFar)
+    );
   }
 
   void main() {
     vec4 baseColor = texture2D(tDiffuse, vUv);
-    float centerDepthSample = texture2D(tDepth, vUv).x;
-    bool centerHasGeometry = centerDepthSample < 1.0;
-    vec3 centerNormal = centerHasGeometry
-      ? decodeNormal(texture2D(tNormal, vUv).xyz)
-      : vec3(0.0, 0.0, 0.0);
-    float centerDepth = centerHasGeometry ? readLinearDepth(vUv) : 1e20;
 
-    // Sentinel: objects with userData.ignoreOutline write alpha=0 to the normal buffer.
-    // They block depth behind them but must not receive any outline themselves.
-    if (centerHasGeometry && texture2D(tNormal, vUv).a < 0.5) {
+    // ---- centre pixel ----
+    float cRawZ = texture2D(tDepth, vUv).x;
+    vec4  cNS   = texture2D(tNormal, vUv);
+    bool  cHasGeo = cRawZ < 1.0;
+
+    if (cHasGeo && cNS.a < 0.5) {            // sentinel — skip outlines
       gl_FragColor = baseColor;
       return;
     }
 
-    float normalEdge = 0.0;
-    float depthEdge = 0.0;
+    float cDepth  = cHasGeo
+      ? -perspectiveDepthToViewZ(cRawZ, cameraNear, cameraFar)
+      : 1e10;
+    vec3  cNormal = cHasGeo ? decodeNormal(cNS.xyz) : vec3(0.0, 0.0, 1.0);
 
-    vec2 offsets[8];
-    offsets[0] = vec2(1.0, 0.0);
-    offsets[1] = vec2(-1.0, 0.0);
-    offsets[2] = vec2(0.0, 1.0);
-    offsets[3] = vec2(0.0, -1.0);
-    offsets[4] = vec2(1.0, 1.0);
-    offsets[5] = vec2(-1.0, 1.0);
-    offsets[6] = vec2(1.0, -1.0);
-    offsets[7] = vec2(-1.0, -1.0);
+    // ---- 3×3 Sobel neighbourhood ----
+    //   TL  T  TR
+    //    L  C   R
+    //   BL  B  BR
+    vec4 TL = readSample(vUv + vec2(-1.0,  1.0) * texelSize, cNormal, cDepth, cHasGeo);
+    vec4 T  = readSample(vUv + vec2( 0.0,  1.0) * texelSize, cNormal, cDepth, cHasGeo);
+    vec4 TR = readSample(vUv + vec2( 1.0,  1.0) * texelSize, cNormal, cDepth, cHasGeo);
+    vec4 L  = readSample(vUv + vec2(-1.0,  0.0) * texelSize, cNormal, cDepth, cHasGeo);
+    vec4 R  = readSample(vUv + vec2( 1.0,  0.0) * texelSize, cNormal, cDepth, cHasGeo);
+    vec4 BL = readSample(vUv + vec2(-1.0, -1.0) * texelSize, cNormal, cDepth, cHasGeo);
+    vec4 B  = readSample(vUv + vec2( 0.0, -1.0) * texelSize, cNormal, cDepth, cHasGeo);
+    vec4 BR = readSample(vUv + vec2( 1.0, -1.0) * texelSize, cNormal, cDepth, cHasGeo);
 
-    for (int i = 0; i < 8; i += 1) {
-      vec2 sampleUv = vUv + offsets[i] * texelSize;
-      float sampleDepthRaw = texture2D(tDepth, sampleUv).x;
-      bool sampleHasGeometry = sampleDepthRaw < 1.0;
+    // ---- Depth edge: Sobel on log-relative depth ----
+    float refD = max(cDepth, 1.0);
+    float dTL = min(TL.w / refD, 200.0);
+    float dT  = min(T.w  / refD, 200.0);
+    float dTR = min(TR.w / refD, 200.0);
+    float dL  = min(L.w  / refD, 200.0);
+    float dR  = min(R.w  / refD, 200.0);
+    float dBL = min(BL.w / refD, 200.0);
+    float dB  = min(B.w  / refD, 200.0);
+    float dBR = min(BR.w / refD, 200.0);
 
-      // Skip edge detection against sentinel neighbour pixels so no outline
-      // appears at the boundary between regular geometry and sentinel objects.
-      if (sampleHasGeometry && texture2D(tNormal, sampleUv).a < 0.5) {
-        continue;
-      }
+    // Sobel X: [-1 0 1; -2 0 2; -1 0 1]
+    // Sobel Y: [ 1 2 1;  0 0 0; -1 -2 -1]
+    float dGx = -dTL + dTR - 2.0*dL + 2.0*dR - dBL + dBR;
+    float dGy =  dTL + 2.0*dT + dTR - dBL - 2.0*dB - dBR;
+    float depthGrad = sqrt(dGx * dGx + dGy * dGy);
 
-      if (centerHasGeometry != sampleHasGeometry) {
-        depthEdge = 1.0;
-        continue;
-      }
+    // ---- Normal edge: Sobel per xyz component ----
+    float nxGx = -TL.x + TR.x - 2.0*L.x + 2.0*R.x - BL.x + BR.x;
+    float nxGy =  TL.x + 2.0*T.x + TR.x - BL.x - 2.0*B.x - BR.x;
+    float nyGx = -TL.y + TR.y - 2.0*L.y + 2.0*R.y - BL.y + BR.y;
+    float nyGy =  TL.y + 2.0*T.y + TR.y - BL.y - 2.0*B.y - BR.y;
+    float nzGx = -TL.z + TR.z - 2.0*L.z + 2.0*R.z - BL.z + BR.z;
+    float nzGy =  TL.z + 2.0*T.z + TR.z - BL.z - 2.0*B.z - BR.z;
+    float normalGrad = sqrt(
+      nxGx*nxGx + nxGy*nxGy +
+      nyGx*nyGx + nyGy*nyGy +
+      nzGx*nzGx + nzGy*nzGy
+    );
 
-      if (!centerHasGeometry || !sampleHasGeometry) {
-        continue;
-      }
+    // ---- Smooth thresholds → anti-aliased edges ----
+    // Depth: Sobel amplifies underlying step by ~2×; use a band around that.
+    float depthEdge = smoothstep(depthThreshold * 0.5, depthThreshold * 2.5, depthGrad);
 
-      vec3 sampleNormal = decodeNormal(texture2D(tNormal, sampleUv).xyz);
-      float normalDot = dot(centerNormal, sampleNormal);
-      normalEdge = max(normalEdge, 1.0 - step(normalDotThreshold, normalDot));
-
-      float sampleDepth = readLinearDepth(sampleUv);
-      float relativeDepthDelta = abs(sampleDepth - centerDepth) / max(centerDepth, 1.0);
-      depthEdge = max(depthEdge, step(depthThreshold, relativeDepthDelta));
-    }
+    // Normal: convert cosine dot-threshold to Sobel gradient magnitude.
+    // |n1−n2| = sqrt(2 − 2·cos θ), Sobel ≈ 2× at edge centre.
+    float normalGradThr = 2.0 * sqrt(2.0 * (1.0 - normalDotThreshold));
+    float normalEdge = smoothstep(normalGradThr * 0.5, normalGradThr * 1.2, normalGrad);
 
     float edge = max(normalEdge, depthEdge);
     gl_FragColor = mix(baseColor, vec4(outlineColor, baseColor.a), edge);
@@ -3123,7 +3148,7 @@ function CartoonOutlinePostProcess(): null {
         tDiffuse: { value: null },
         tNormal: { value: normalTarget.texture },
         tDepth: { value: normalTarget.depthTexture },
-        texelSize: { value: new THREE.Vector2(1 / renderPixelWidth, 1 / renderPixelHeight) },
+        texelSize: { value: new THREE.Vector2(1.0 / renderPixelWidth, 1.0 / renderPixelHeight) },
         outlineColor: { value: new THREE.Color('#000000') },
         normalDotThreshold: { value: Math.cos(THREE.MathUtils.degToRad(CARTOON_OUTLINE_ANGLE_DEGREES)) },
         depthThreshold: { value: CARTOON_OUTLINE_DEPTH_THRESHOLD },
@@ -3183,7 +3208,7 @@ function CartoonOutlinePostProcess(): null {
     if (outlinePassRef.current) {
       outlinePassRef.current.material.uniforms.tNormal.value = normalTargetRef.current?.texture ?? null;
       outlinePassRef.current.material.uniforms.tDepth.value = normalTargetRef.current?.depthTexture ?? null;
-      outlinePassRef.current.material.uniforms.texelSize.value.set(1 / renderPixelWidth, 1 / renderPixelHeight);
+      outlinePassRef.current.material.uniforms.texelSize.value.set(1.0 / renderPixelWidth, 1.0 / renderPixelHeight);
     }
 
   }, [gl, renderPixelHeight, renderPixelWidth, size.height, size.width]);
@@ -3987,6 +4012,7 @@ function GameScene({
   const actionQueue = useRef(new Set<string>());
   const firingPrimaryRef = useRef(false);
   const lastWeaponBlockedNoticeAtRef = useRef(0);
+  const lastWeaponBlockedReasonRef = useRef('');
   const shipGroupRef = useRef<THREE.Group>(null);
   const interiorGroupRef = useRef<THREE.Group>(null);
   const activeSystem = useMemo(
@@ -4135,6 +4161,12 @@ function GameScene({
     const movementEnabled = !tabletOpen;
     const lookRotation = new THREE.Quaternion().setFromEuler(new THREE.Euler(state.pitch, state.yaw, 0, 'YXZ'));
     const autopilotAvailable = autopilotActive && Boolean(autopilotDestination) && state.mode !== 'space' && state.mode !== 'planet-surface';
+
+    // Disengage autopilot if the ship is inside any station force-field boundary.
+    if (autopilotActive && isShipInsideStationBounds(state.shipPosition, stationForceFields)) {
+      onAutopilotToggle(false);
+      onAutopilotStatusChange('Autopilot unavailable inside station boundary.');
+    }
     const playerSceneColliders = [
       ...localEnvironmentColliders,
       ...remoteShipColliders,
@@ -4164,6 +4196,22 @@ function GameScene({
 
     if (state.mode === 'space') {
       state.rotation.copy(lookRotation);
+
+      // Slowly level the ship toward horizontal while the player is EVA
+      // (nobody is in the pilot seat).  Preserves heading but zeroes pitch/roll.
+      {
+        const SHIP_LEVEL_SPEED = 0.4; // rad/s
+        const shipForwardFlat = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
+        shipForwardFlat.y = 0;
+        if (shipForwardFlat.lengthSq() > 1e-4) {
+          shipForwardFlat.normalize();
+          const levelTarget = new THREE.Quaternion().setFromRotationMatrix(
+            new THREE.Matrix4().lookAt(new THREE.Vector3(0, 0, 0), shipForwardFlat, new THREE.Vector3(0, 1, 0)),
+          );
+          state.shipRotation.slerp(levelTarget, Math.min(1, SHIP_LEVEL_SPEED * dt));
+        }
+      }
+
       if (stationWalkCollision) {
         const localLook = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, state.yaw, 0, 'YXZ'));
         const walkForward = new THREE.Vector3(0, 0, -1).applyQuaternion(localLook);
@@ -4318,6 +4366,20 @@ function GameScene({
         }
       } else {
         settleShipVelocity(state, dt, shipSceneColliders);
+
+        // Slowly level the ship toward horizontal while the pilot seat is
+        // unoccupied.  We project the ship's current forward onto the XZ plane
+        // to preserve heading (yaw) while gradually zeroing out pitch and roll.
+        const SHIP_LEVEL_SPEED = 0.4; // rad/s
+        const shipForwardFlat = new THREE.Vector3(0, 0, -1).applyQuaternion(state.shipRotation);
+        shipForwardFlat.y = 0;
+        if (shipForwardFlat.lengthSq() > 1e-4) {
+          shipForwardFlat.normalize();
+          const levelTarget = new THREE.Quaternion().setFromRotationMatrix(
+            new THREE.Matrix4().lookAt(new THREE.Vector3(0, 0, 0), shipForwardFlat, new THREE.Vector3(0, 1, 0)),
+          );
+          state.shipRotation.slerp(levelTarget, Math.min(1, SHIP_LEVEL_SPEED * dt));
+        }
       }
 
       const localLook = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, state.yaw, 0, 'YXZ'));
@@ -4863,8 +4925,12 @@ function GameScene({
       }
 
       const weaponBlockedByField = firingPrimaryRef.current && state.mode === 'pilot' && insideSafezone;
-      if (weaponBlockedByField) {
+      const weaponBlockedBySpeedOrAP = firingPrimaryRef.current && state.mode === 'pilot' && !insideSafezone && (autopilotActive || state.shipVelocity.length() > 2000);
+      if (weaponBlockedByField || weaponBlockedBySpeedOrAP) {
         lastWeaponBlockedNoticeAtRef.current = now;
+        lastWeaponBlockedReasonRef.current = weaponBlockedBySpeedOrAP
+          ? (autopilotActive ? 'WEAPONS INHIBITED · AUTOPILOT ACTIVE' : 'WEAPONS INHIBITED · VELOCITY TOO HIGH')
+          : 'WEAPONS INHIBITED · STATION ARMISTICE ZONE';
       }
 
       const showWeaponBlockedNotice = now - lastWeaponBlockedNoticeAtRef.current < 3000;
@@ -4873,7 +4939,7 @@ function GameScene({
       let speedLimitNoticeColor = '#38bdf8';
 
       if (showWeaponBlockedNotice) {
-        speedLimitNotice = 'WEAPONS INHIBITED · STATION ARMISTICE ZONE';
+        speedLimitNotice = lastWeaponBlockedReasonRef.current;
         speedLimitNoticeColor = '#ef4444';
       } else if (stationSpeedLimitInfo.active) {
         speedLimitNotice = 'STATION TRAFFIC FIELD · VELOCITY LIMITED';
@@ -4948,7 +5014,7 @@ function GameScene({
     <>
       <GalaxyBackdrop activeFrameOrigin={activeFrameOrigin} activeSystemId={activeSystemId} galaxy={galaxy} autopilotTarget={activeAutopilotTarget} highlightedTarget={highlightedTarget} localStateRef={localStateRef} />
       <WarpSpeedEffect localStateRef={localStateRef} />
-      <ShipWeaponEffects firingPrimaryRef={firingPrimaryRef} localShipRef={shipGroupRef} localStateRef={localStateRef} stationForceFields={stationForceFields} shipConfig={shipConfig} />
+      <ShipWeaponEffects autopilotActive={autopilotActive} firingPrimaryRef={firingPrimaryRef} localShipRef={shipGroupRef} localStateRef={localStateRef} stationForceFields={stationForceFields} shipConfig={shipConfig} />
       <group ref={shipGroupRef} userData={{ ignoreCameraCollision: true }}>
         <ShipThrusterEffects localStateRef={localStateRef} shipConfig={shipConfig} />
         <ShipExteriorModel config={shipConfig} highlight showDebugAnchors={showDebugAnchors} />
@@ -6912,12 +6978,14 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
 }
 
 function ShipWeaponEffects({
+  autopilotActive,
   firingPrimaryRef,
   localShipRef,
   localStateRef,
   stationForceFields,
   shipConfig,
 }: {
+  autopilotActive: boolean;
   firingPrimaryRef: MutableRefObject<boolean>;
   localShipRef: MutableRefObject<THREE.Group | null>;
   localStateRef: MutableRefObject<LocalGameState>;
@@ -7001,7 +7069,8 @@ function ShipWeaponEffects({
   useFrame((frameState, delta) => {
     const state = localStateRef.current;
     const insideStationForceField = stationForceFields.some((field) => state.shipPosition.distanceToSquared(vectorFromTuple(field.position)) < field.radius ** 2);
-    const isPilotFiring = state.mode === 'pilot' && firingPrimaryRef.current && !insideStationForceField;
+    const shipSpeed = state.shipVelocity.length();
+    const isPilotFiring = state.mode === 'pilot' && firingPrimaryRef.current && !insideStationForceField && !autopilotActive && shipSpeed <= 2000;
 
     if (state.mode !== 'pilot') {
       firingPrimaryRef.current = false;

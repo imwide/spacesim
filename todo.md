@@ -18,22 +18,15 @@ Ship collisions with stations and asteroids need to work
 
 The outline shader doesnt show outlines if the face "behind" it has the same or similar direction normals. This doesnt look good. If the angle is enough at an edge, the outline should be shown regardless of the direction of the normals of the face behind it.
 
-A player should not be able to turn on autopilot while inside the "outermost boundry" of a station (basically meaning while inside a station)#
-
-While travelling over 2km/s and/or while autopilto is enabled, shooting should not eb posisble/do nothing
-
-When the player leaves the ship/pilot seat, the ship should slowly turn horizontal.
-
-Add anti-aliasing to the outline shader and reduce the line thickness by 40%
-
 Ship landing in stations needs to work
 
 Add light sequences to the station configs. This will allow every station to have a array of relative coordinates (that will also be shown with the debug crosshairs)
 
+Add a "arrival point" to the station configs
 
 Remove space tablet in favor of a new UI
 
 
 
 
-BLENDER TODO: decrease glow intensity, 
+BLENDER TODO: decrease glow intensity, apply array, screw stickers dont work/have no outline.
