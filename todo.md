@@ -40,3 +40,4 @@ Add light sequences to the station configs. This will allow every station to hav
 The force field sphere should not have any effect on third person camera clipping
 
 
+Remove space tablet in favor of a new UI

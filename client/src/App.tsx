@@ -6658,8 +6658,20 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
     }
   });
 
+  useEffect(() => {
+    const group = shieldGroupRef.current;
+    if (group) {
+      outlineExcludedObjects.add(group);
+    }
+    return () => {
+      if (group) {
+        outlineExcludedObjects.delete(group);
+      }
+    };
+  }, []);
+
   return (
-    <group ref={shieldGroupRef} userData={{ stationForceFieldId: fieldId, ignoreOutline: true }}>
+    <group ref={shieldGroupRef} userData={{ stationForceFieldId: fieldId }}>
       {/* Invisible raycast-only sphere — always present, never visually rendered */}
       <mesh ref={raycastMeshRef} userData={{ stationForceFieldId: fieldId }}>
         <sphereGeometry args={[radius, 32, 24]} />
@@ -6675,6 +6687,9 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
           side={THREE.DoubleSide}
           toneMapped={false}
           vertexShader={`
+            #include <common>
+            #include <logdepthbuf_pars_vertex>
+
             varying vec2 vUv;
             varying vec3 vWorldPosition;
             varying vec3 vWorldNormal;
@@ -6687,9 +6702,12 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
               vWorldPosition = worldPosition.xyz;
               vWorldNormal = normalize(mat3(modelMatrix) * normal);
               gl_Position = projectionMatrix * viewMatrix * worldPosition;
+              #include <logdepthbuf_vertex>
             }
           `}
           fragmentShader={`
+            #include <logdepthbuf_pars_fragment>
+
             uniform sampler2D shieldTexture;
             uniform vec3 shieldColor;
             uniform vec2 textureRepeat;
@@ -6719,6 +6737,8 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
             }
 
             void main() {
+              #include <logdepthbuf_fragment>
+
               vec3 localNormal = normalize(vLocalNormal);
               float reveal = getRevealMask(localNormal);
               if (reveal <= 0.001) {
@@ -8090,7 +8110,7 @@ function AsteroidMesh({
       linearDistance={ASTEROID_PROXY_LINEAR_DISTANCE}
       logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}
     >
-      <group rotation={asteroid.rotation} scale={visualScale} visible={show} userData={{ ignoreOutline: true }}>
+      <group rotation={asteroid.rotation} scale={visualScale} visible={show}>
         {asteroid.shape === 'abstract' ? (
           <mesh>
             <icosahedronGeometry args={[1, 1]} />
