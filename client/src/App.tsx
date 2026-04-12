@@ -1,4 +1,5 @@
 import { Html, useGLTF } from '@react-three/drei';
+import { setupStationLODs } from './stationLOD';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { type ShipConfig, getShipConfig, DEFAULT_SHIP_ID } from './shipConfig';
 import {
@@ -481,6 +482,8 @@ interface LocalGameState {
   shipOnGround: boolean;
   /** Whether the player (EVA) is on the planet surface */
   playerOnGround: boolean;
+  /** Whether pilot braking input is currently active */
+  shipBraking: boolean;
 }
 
 const AUTH_STORAGE_KEY = 'spacesim.auth';
@@ -525,11 +528,13 @@ const SHIP_WEAPON_IMPACT_PARTICLE_COUNT = 8;
 const SHIP_WEAPON_MAX_IMPACTS = 12;
 const SHIP_WEAPON_IMPACT_SCALE_MULTIPLIER = 3;
 const SHIP_THRUSTER_PARTICLE_COUNT = 6;
+const SHIP_THRUSTER_FLAME_BLOB_COUNT = 4;
 const SHIP_THRUSTER_PLUME_LENGTH = 5.5;
+const SHIP_THRUSTER_IDLE_PLUME_LENGTH = 0.5;
 const SHIP_THRUSTER_PLUME_RADIUS = 0.18;
 const SHIP_THRUSTER_GLOW_RADIUS = 0.5;
 const SHIP_THRUSTER_PARTICLE_DRIFT = 0.22;
-const SHIP_THRUSTER_RESPONSE = 10;
+const SHIP_THRUSTER_SMOOTH_TIME_SECONDS = 2.1;
 const DUST_ASTEROID_HITS_TO_DESTROY = 4;
 const DUST_ASTEROID_EXPLOSION_LIFETIME_SECONDS = 1.05;
 const DUST_ASTEROID_EXPLOSION_FRAGMENT_COUNT = 12;
@@ -2979,6 +2984,7 @@ function createLocalState(frameSystemId: string): LocalGameState {
     nearPlanetRadius: 0,
     shipOnGround: false,
     playerOnGround: false,
+    shipBraking: false,
   };
 }
 
@@ -4108,6 +4114,7 @@ function GameScene({
     const dt = Math.min(delta, 0.05);
     const now = performance.now();
     const state = localStateRef.current;
+    state.shipBraking = false;
     const pointerLocked = document.pointerLockElement === gl.domElement;
     const consumeAction = (code: string) => {
       const exists = actionQueue.current.has(code);
@@ -4539,6 +4546,7 @@ function GameScene({
       const manualHandlingMultiplier = insideStationBounds ? SHIP_STATION_MANUAL_HANDLING_MULTIPLIER : 1;
         const forwardInput = movementEnabled && keys.has('KeyW') ? 1 : 0;
         const brakingInput = movementEnabled && keys.has('KeyS');
+        state.shipBraking = brakingInput;
         const lateralInput =
           (movementEnabled && keys.has('KeyD') ? 1 : 0) -
           (movementEnabled && keys.has('KeyA') ? 1 : 0);
@@ -7366,7 +7374,7 @@ function ShipThrusterEffects({
   localStateRef: MutableRefObject<LocalGameState>;
   shipConfig: ShipConfig;
 }): ReactElement {
-  const thrusterCoreRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const thrusterFlameRefs = useRef<Array<THREE.Mesh | null>>([]);
   const thrusterGlowRefs = useRef<Array<THREE.Mesh | null>>([]);
   const thrusterParticleRefs = useRef<Array<THREE.Mesh | null>>([]);
   const previousVelocityRef = useRef(new THREE.Vector3());
@@ -7384,10 +7392,10 @@ function ShipThrusterEffects({
   const localVelocity = useMemo(() => new THREE.Vector3(), []);
   const localAcceleration = useMemo(() => new THREE.Vector3(), []);
   const baseOffset = useMemo(() => new THREE.Vector3(0, 0, 0.15), []);
-  const corePosition = useMemo(() => new THREE.Vector3(), []);
+  const flamePosition = useMemo(() => new THREE.Vector3(), []);
   const glowPosition = useMemo(() => new THREE.Vector3(), []);
   const particlePosition = useMemo(() => new THREE.Vector3(), []);
-  const plumeScale = useMemo(() => new THREE.Vector3(), []);
+  const flameScale = useMemo(() => new THREE.Vector3(), []);
   const glowScale = useMemo(() => new THREE.Vector3(), []);
 
   useFrame((frameState, delta) => {
@@ -7427,39 +7435,63 @@ function ShipThrusterEffects({
       0,
       1,
     );
+    const idleFactor = state.mode === 'pilot' ? 0.2 : 0;
+    const boostedIntensity = clamp(
+      Math.max(
+        idleFactor + speedFactor * 0.55 + accelFactor * 0.42,
+        idleFactor + maneuverFactor * 0.4,
+      ),
+      0,
+      1,
+    );
     const targetIntensity = state.mode === 'interior'
       ? 0
-      : clamp(Math.max(speedFactor * 0.22 + accelFactor, maneuverFactor * 0.5), 0, 1);
+      : (state.shipBraking ? idleFactor : boostedIntensity);
 
-    intensityRef.current = THREE.MathUtils.lerp(
-      intensityRef.current,
-      targetIntensity,
-      1 - Math.exp(-SHIP_THRUSTER_RESPONSE * delta),
-    );
+    intensityRef.current = THREE.MathUtils.lerp(intensityRef.current, targetIntensity, clamp(delta / SHIP_THRUSTER_SMOOTH_TIME_SECONDS, 0, 1));
 
     const intensity = intensityRef.current;
-    const plumeLength = SHIP_THRUSTER_PLUME_LENGTH * (0.35 + intensity * 1.25 + speedFactor * 0.45);
-    const plumeRadius = SHIP_THRUSTER_PLUME_RADIUS * (0.65 + intensity * 1.1);
+    const activeFlameFactor = clamp((intensity - idleFactor) / Math.max(1e-5, 1 - idleFactor), 0, 1);
+    const activePlumeLength = SHIP_THRUSTER_PLUME_LENGTH * (0.22 + activeFlameFactor * 1.03 + speedFactor * 0.68);
+    const plumeLength = THREE.MathUtils.lerp(SHIP_THRUSTER_IDLE_PLUME_LENGTH, activePlumeLength, activeFlameFactor);
+    const plumeRadius = SHIP_THRUSTER_PLUME_RADIUS * (0.85 + intensity * 0.8);
     const elapsed = frameState.clock.elapsedTime;
 
     for (let thrusterIndex = 0; thrusterIndex < thrusterAnchors.length; thrusterIndex += 1) {
       const anchor = thrusterAnchors[thrusterIndex];
-      const coreMesh = thrusterCoreRefs.current[thrusterIndex];
       const glowMesh = thrusterGlowRefs.current[thrusterIndex];
-      const visible = intensity > 0.03;
+      const visible = intensity > 0.015;
+      const flameVisible = visible && plumeLength > 0.08;
 
-      if (coreMesh) {
-        coreMesh.visible = visible;
-        if (visible) {
-          corePosition.copy(anchor).add(baseOffset);
-          corePosition.z += plumeLength * 0.38;
-          coreMesh.position.copy(corePosition);
-          plumeScale.set(plumeRadius, plumeLength, plumeRadius);
-          coreMesh.scale.copy(plumeScale);
-          const coreMaterial = coreMesh.material;
-          if (coreMaterial instanceof THREE.MeshBasicMaterial) {
-            coreMaterial.opacity = 0.18 + intensity * 0.62;
-          }
+      for (let blobIndex = 0; blobIndex < SHIP_THRUSTER_FLAME_BLOB_COUNT; blobIndex += 1) {
+        const flameMesh = thrusterFlameRefs.current[thrusterIndex * SHIP_THRUSTER_FLAME_BLOB_COUNT + blobIndex];
+        if (!flameMesh) {
+          continue;
+        }
+
+        flameMesh.visible = flameVisible;
+        if (!flameVisible) {
+          continue;
+        }
+
+        const blobPhase = blobIndex / Math.max(1, SHIP_THRUSTER_FLAME_BLOB_COUNT - 1);
+        const turbulence = elapsed * (1.5 + intensity * 2.6) + thrusterIndex * 0.91 + blobIndex * 1.37;
+        const widthJitter = 0.82 + 0.2 * Math.sin(turbulence * 1.8);
+        const sideJitter = 0.04 + intensity * 0.06;
+        flamePosition.copy(anchor).add(baseOffset);
+        flamePosition.x += Math.sin(turbulence * 1.9) * sideJitter * (0.2 + blobPhase);
+        flamePosition.y += Math.cos(turbulence * 1.6) * sideJitter * (0.18 + blobPhase * 0.8);
+        flamePosition.z += plumeLength * (0.12 + blobPhase * 0.72);
+        flameMesh.position.copy(flamePosition);
+
+        const blobRadius = plumeRadius * (1.1 - blobPhase * 0.45) * widthJitter;
+        const blobLength = plumeLength * (0.38 - blobPhase * 0.05) * (0.92 + 0.16 * Math.sin(turbulence));
+        flameScale.set(blobRadius, blobRadius, blobLength);
+        flameMesh.scale.copy(flameScale);
+
+        const flameMaterial = flameMesh.material;
+        if (flameMaterial instanceof THREE.MeshBasicMaterial) {
+          flameMaterial.opacity = (0.26 + intensity * 0.22) * (1 - blobPhase * 0.14);
         }
       }
 
@@ -7473,7 +7505,7 @@ function ShipThrusterEffects({
           glowMesh.scale.copy(glowScale);
           const glowMaterial = glowMesh.material;
           if (glowMaterial instanceof THREE.MeshBasicMaterial) {
-            glowMaterial.opacity = 0.12 + intensity * 0.32;
+            glowMaterial.opacity = 0.18 + intensity * 0.16;
           }
         }
       }
@@ -7484,8 +7516,8 @@ function ShipThrusterEffects({
           continue;
         }
 
-        mesh.visible = visible;
-        if (!visible) {
+        mesh.visible = visible && activeFlameFactor > 0.08;
+        if (!mesh.visible) {
           continue;
         }
 
@@ -7509,17 +7541,19 @@ function ShipThrusterEffects({
     <group userData={{ ignoreOutline: true, ignoreWeaponCollision: true }}>
       {thrusterAnchors.map((_, thrusterIndex) => (
         <group key={`thruster-${thrusterIndex}`}>
-          <mesh
-            ref={(mesh) => {
-              thrusterCoreRefs.current[thrusterIndex] = mesh;
-            }}
-            visible={false}
-            rotation={[Math.PI / 2, 0, 0]}
-            renderOrder={58}
-          >
-            <cylinderGeometry args={[1, 0.2, 1, 10, 1, true]} />
-            <meshBasicMaterial color="#c9fbff" transparent opacity={0.6} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
-          </mesh>
+          {Array.from({ length: SHIP_THRUSTER_FLAME_BLOB_COUNT }, (_, blobIndex) => (
+            <mesh
+              key={`thruster-${thrusterIndex}-flame-${blobIndex}`}
+              ref={(mesh) => {
+                thrusterFlameRefs.current[thrusterIndex * SHIP_THRUSTER_FLAME_BLOB_COUNT + blobIndex] = mesh;
+              }}
+              visible={false}
+              renderOrder={58}
+            >
+              <sphereGeometry args={[1, 10, 10]} />
+              <meshBasicMaterial color="#c9fbff" transparent opacity={0.42} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+            </mesh>
+          ))}
           <mesh
             ref={(mesh) => {
               thrusterGlowRefs.current[thrusterIndex] = mesh;
@@ -8048,7 +8082,28 @@ function AsteroidCluster({
 
 function StationModel({ modelPath }: { modelPath: string }): ReactElement {
   const { scene } = useGLTF(modelPath);
-  const clonedScene = useMemo(() => scene.clone(true), [scene]);
+  const lodRefs = useRef<THREE.LOD[]>([]);
+  const clonedScene = useMemo(() => {
+    const cloned = scene.clone(true);
+    lodRefs.current = setupStationLODs(cloned);
+    return cloned;
+  }, [scene]);
+
+  const tmpV = useMemo(() => new THREE.Vector3(), []);
+
+  useFrame(({ camera }) => {
+    for (const lod of lodRefs.current) {
+      tmpV.setFromMatrixPosition(lod.matrixWorld);
+      const dist = camera.position.distanceTo(tmpV);
+      const cullDist = lod.userData.cullDistance as number;
+      if (dist > cullDist) {
+        lod.visible = false;
+      } else {
+        lod.visible = true;
+        lod.update(camera);
+      }
+    }
+  });
 
   return <primitive object={clonedScene} />;
 }
