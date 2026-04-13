@@ -6,10 +6,22 @@ export interface ShipConfigRaw {
   /** Human-readable ship name */
   name: string;
 
-  /** Path to the exterior GLB model (relative to public/) */
-  exteriorModel: string;
-  /** Path to the interior GLB model (relative to public/) */
-  interiorModel: string;
+  /** Short abbreviation used to identify collections inside the GLB
+   *  (e.g. "asc" → collections "exterior_asc" / "interior_asc"). */
+  abbreviation: string;
+
+  /**
+   * Path to the GLB model (relative to public/).
+   * The file should contain two top-level collections:
+   *   - `exterior_<abbreviation>` — the exterior hull
+   *   - `interior_<abbreviation>` — the interior / walkable space
+   */
+  model: string;
+
+  /** @deprecated Use `model` instead. Path to the exterior GLB model. */
+  exteriorModel?: string;
+  /** @deprecated Use `model` instead. Path to the interior GLB model. */
+  interiorModel?: string;
 
   // ── Spatial anchors (coordinates relative to ship origin) ──────────────
 
@@ -27,9 +39,6 @@ export interface ShipConfigRaw {
   /** Where the player spawns (in ship-local coords) after exiting, offset
    *  is applied in world-space relative to the ship. */
   outsideSpawnPoint: [number, number, number];
-
-  /** Position of the pilot seat inside the interior model. */
-  pilotSeatPosition: [number, number, number];
 
   /** Relative ship-local positions of engine / thruster exhaust points. */
   thrusterPositions: [number, number, number][];
@@ -82,7 +91,6 @@ export interface ShipConfig extends ShipConfigRaw {
   exitPointVec: THREE.Vector3;
   insideSpawnVec: THREE.Vector3;
   outsideSpawnVec: THREE.Vector3;
-  pilotSeatVec: THREE.Vector3;
   thrusterVecs: THREE.Vector3[];
   gunVecs: THREE.Vector3[];
 }
@@ -99,7 +107,6 @@ export function registerShip(id: string, raw: ShipConfigRaw): ShipConfig {
     exitPointVec: new THREE.Vector3(...raw.exitPoint),
     insideSpawnVec: new THREE.Vector3(...raw.insideSpawnPoint),
     outsideSpawnVec: new THREE.Vector3(...raw.outsideSpawnPoint),
-    pilotSeatVec: new THREE.Vector3(...raw.pilotSeatPosition),
     thrusterVecs: raw.thrusterPositions.map((position) => new THREE.Vector3(...position)),
     gunVecs: raw.gunPositions.map((position) => new THREE.Vector3(...position)),
   };
@@ -120,4 +127,4 @@ export function getAllShipConfigs(): Map<string, ShipConfig> {
 }
 
 /** The default / starter ship id. */
-export const DEFAULT_SHIP_ID = 'aether';
+export const DEFAULT_SHIP_ID = 'ascendancy';

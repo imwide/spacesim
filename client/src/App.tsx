@@ -1,5 +1,5 @@
 import { Html, useGLTF } from '@react-three/drei';
-import { setupStationLODs } from './stationLOD';
+import { setupLODs } from './lod';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { type ShipConfig, getShipConfig, DEFAULT_SHIP_ID } from './shipConfig';
 import {
@@ -1855,6 +1855,8 @@ function findStationWalkCollision(position: THREE.Vector3): ShipInteriorCollisio
       colliderMeshes: [root],
       bounds: _walkBounds.setFromObject(root),
       standingHeight: PLANET_SURFACE_EYE_HEIGHT,
+      pilotSeatPosition: null,
+      pilotSeatMeshes: [],
     };
   }
 
@@ -1988,9 +1990,9 @@ function shouldResetInteriorPosition(
   collision: ShipInteriorCollisionData,
 ): boolean {
   if (
-    position.y < shipConfig.interiorFloorHeight - 8
-    || Math.abs(position.x) > shipConfig.interiorClampX + 8
-    || Math.abs(position.z) > shipConfig.interiorClampZ + 8
+    position.y < shipConfig.interiorFloorHeight - 20
+    || Math.abs(position.x) > shipConfig.interiorClampX + 25
+    || Math.abs(position.z) > shipConfig.interiorClampZ + 25
   ) {
     return true;
   }
@@ -1998,7 +2000,7 @@ function shouldResetInteriorPosition(
   const safeBounds = collision.bounds.clone();
   safeBounds.min.y -= Math.max(4, collision.standingHeight * 2);
   safeBounds.max.y += 2;
-  safeBounds.expandByScalar(1.5);
+  safeBounds.expandByScalar(6);
 
   if (!safeBounds.containsPoint(position)) {
     return true;
@@ -2014,7 +2016,7 @@ function shouldResetInteriorPosition(
     (_candidate, normal) => normal.y > 0.25,
   );
 
-  return !supportHit && position.distanceToSquared(shipConfig.insideSpawnVec) > 36;
+  return !supportHit && position.distanceToSquared(shipConfig.insideSpawnVec) > 225;
 }
 
 // ─── Planet proximity & terrain collision helpers ─────────────────────────────
@@ -4391,6 +4393,7 @@ function GameScene({
   const lastWeaponBlockedReasonRef = useRef('');
   const shipGroupRef = useRef<THREE.Group>(null);
   const interiorGroupRef = useRef<THREE.Group>(null);
+  const seatOutlineVisibleRef = useRef(false);
   const activeSystem = useMemo(
     () => galaxy.systems.find((system) => system.id === activeSystemId) ?? null,
     [activeSystemId, galaxy.systems],
@@ -4537,6 +4540,9 @@ function GameScene({
     const movementEnabled = !tabletOpen;
     const lookRotation = new THREE.Quaternion().setFromEuler(new THREE.Euler(state.pitch, state.yaw, 0, 'YXZ'));
     const autopilotAvailable = autopilotActive && Boolean(autopilotDestination) && state.mode !== 'space' && state.mode !== 'planet-surface';
+
+    // Reset pilot seat outline — the interior branch will enable it when appropriate
+    seatOutlineVisibleRef.current = false;
 
     // Disengage autopilot if the ship is inside any station force-field boundary.
     if (autopilotActive && isShipInsideStationBounds(state.shipPosition, stationForceFields)) {
@@ -4839,7 +4845,23 @@ function GameScene({
       camera.position.copy(state.shipPosition).add(cameraOffset);
       camera.quaternion.copy(worldLook);
 
-      if (consumeAction('KeyF') && state.interiorPosition.distanceTo(shipConfig.pilotSeatVec) < SEAT_INTERACTION_DISTANCE_METERS) {
+      // Pilot seat outline: show when within range and looking toward the seat
+      if (interiorCollision.pilotSeatPosition) {
+        const seatDist = state.interiorPosition.distanceTo(interiorCollision.pilotSeatPosition);
+        if (seatDist < SEAT_INTERACTION_DISTANCE_METERS) {
+          const toSeat = interiorCollision.pilotSeatPosition.clone().sub(state.interiorPosition).normalize();
+          const lookDir = new THREE.Vector3(0, 0, -1).applyQuaternion(lookRotation);
+          const facingDot = lookDir.dot(toSeat);
+          // Show outline when roughly facing the seat (within ~90°)
+          seatOutlineVisibleRef.current = facingDot > 0;
+        } else {
+          seatOutlineVisibleRef.current = false;
+        }
+      } else {
+        seatOutlineVisibleRef.current = false;
+      }
+
+      if (consumeAction('KeyF') && interiorCollision.pilotSeatPosition && state.interiorPosition.distanceTo(interiorCollision.pilotSeatPosition) < SEAT_INTERACTION_DISTANCE_METERS) {
         state.mode = 'pilot';
         state.insideShip = true;
         state.shipAngularVelocity.set(0, 0, 0);
@@ -5004,7 +5026,7 @@ function GameScene({
 
         if (exitPilotSeat) {
           state.mode = 'interior';
-          state.interiorPosition.copy(shipConfig.pilotSeatVec).add(new THREE.Vector3(0, 0, 0.8));
+          state.interiorPosition.copy(interiorCollision.pilotSeatPosition ?? shipConfig.insideSpawnVec).add(new THREE.Vector3(0, 0, 0.8));
           state.interiorVelocity.set(0, 0, 0);
           state.shipAngularVelocity.set(0, 0, 0);
         } else if (hasManualPilotInput) {
@@ -5252,7 +5274,7 @@ function GameScene({
       const entryWorldHud = shipConfig.entryPointVec.clone().applyQuaternion(state.shipRotation).add(state.shipPosition);
       const entryDist = state.position.distanceTo(entryWorldHud);
       const canEnter = (state.mode === 'space' || state.mode === 'planet-surface') && entryDist < BOARDING_RADIUS_METERS;
-      const canPilot = state.mode === 'interior' && state.interiorPosition.distanceTo(shipConfig.pilotSeatVec) < SEAT_INTERACTION_DISTANCE_METERS;
+      const canPilot = state.mode === 'interior' && interiorCollision.pilotSeatPosition != null && state.interiorPosition.distanceTo(interiorCollision.pilotSeatPosition) < SEAT_INTERACTION_DISTANCE_METERS;
       const shipSpeed = state.shipVelocity.length();
       const speed = state.mode === 'pilot' ? shipSpeed : state.mode === 'space' || state.mode === 'planet-surface' ? state.velocity.length() : walkSpeed(state);
       const stationSpeedLimitInfo = state.mode === 'pilot'
@@ -5399,7 +5421,7 @@ function GameScene({
         <ShipHighlightTag target={highlightedTarget} localStateRef={localStateRef} />
       ) : null}
       <group ref={interiorGroupRef} visible={false} userData={{ ignoreCameraCollision: true }}>
-        <ShipInteriorModel config={shipConfig} showDebugAnchors={showDebugAnchors} />
+        <ShipInteriorModel config={shipConfig} showDebugAnchors={showDebugAnchors} seatOutlineVisibleRef={seatOutlineVisibleRef} />
       </group>
       {remotePlayers.map((player) => (
         <RemotePlayer key={player.socketId} player={player} viewerFrameOrigin={activeFrameOrigin} showDebugAnchors={showDebugAnchors} />
@@ -7262,13 +7284,22 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
   }, []);
 
   return (
-    <group ref={shieldGroupRef} userData={{ stationForceFieldId: fieldId, ignoreCameraCollision: true }}>
+    <group ref={shieldGroupRef} userData={{ stationForceFieldId: fieldId, ignoreCameraCollision: true, ignoreOutline: true }}>
       {/* Invisible raycast-only sphere — always present, never visually rendered */}
       <mesh ref={raycastMeshRef} userData={{ stationForceFieldId: fieldId }}>
         <sphereGeometry args={[radius, 32, 24]} />
         <meshBasicMaterial transparent opacity={0} depthWrite={false} side={THREE.DoubleSide} colorWrite={false} />
       </mesh>
-      <mesh ref={shieldMeshRef} renderOrder={69} userData={{ ignoreWeaponCollision: true, stationForceFieldId: fieldId, customOutlineMaterial: forceFieldSentinelMaterial }}>
+      <mesh
+        ref={shieldMeshRef}
+        renderOrder={69}
+        userData={{
+          ignoreWeaponCollision: true,
+          ignoreOutline: true,
+          stationForceFieldId: fieldId,
+          customOutlineMaterial: forceFieldSentinelMaterial,
+        }}
+      >
         <sphereGeometry args={[radius + 1.5, 64, 48]} />
         <shaderMaterial
           ref={shieldMaterialRef}
@@ -8537,7 +8568,7 @@ function StationModel({ modelPath }: { modelPath: string }): ReactElement {
   const lodRefs = useRef<THREE.LOD[]>([]);
   const clonedScene = useMemo(() => {
     const cloned = scene.clone(true);
-    lodRefs.current = setupStationLODs(cloned);
+    lodRefs.current = setupLODs(cloned);
     return cloned;
   }, [scene]);
 

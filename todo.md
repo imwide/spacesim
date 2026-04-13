@@ -12,11 +12,7 @@ The turning can happen really fast right now. The intensity that the turn and ro
 
 While flying the ship (in the pilot seat) allow for switching perspectives. Currently its only third person perspective where the camera orbits around the ship. When pressing a hotkey for swithcing perspectives, it toggles between third person and first person perspective. In first person perspective, the camera should be fixed in place but not rotation, 1m above the ships "pilot seat" position. The ship inside should be rendered again isntead of the outside. The controls should be identical.
 
-
 Ship collisions with stations and asteroids need to work
-
-
-The outline shader doesnt show outlines if the face "behind" it has the same or similar direction normals. This doesnt look good. If the angle is enough at an edge, the outline should be shown regardless of the direction of the normals of the face behind it.
 
 Ship landing in stations needs to work
 
@@ -28,3 +24,10 @@ Remove space tablet in favor of a new UI
 
 
 BLENDER TODO: decrease glow intensity, apply array, screw stickers dont work/have no outline.
+
+The ship model has a very weird blue tint but only the exterior model.
+
+Make transparent shaders work. I have some glass materials that are a blender "transparent" node mixed with a color node to be transparent while retaining some color. currently they are opaque in game
+
+
+Line/Edge shader currently collapses more than just triangles. It also collapses quads on flat surfaces but it shouldnt because if i made quads on flat surfaces, its on purpose to display edge lines as details.

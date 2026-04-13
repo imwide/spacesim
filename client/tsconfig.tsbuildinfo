@@ -1,1 +1,1 @@
-{"root":["./src/App.tsx","./src/PlanetTerrain.tsx","./src/ShipModel.tsx","./src/galaxy.ts","./src/galaxyConfig.ts","./src/main.tsx","./src/noise.ts","./src/shipConfig.ts","./src/stationLOD.ts","./src/ships/aether.ts","./src/ships/index.ts"],"version":"5.9.3"}
+{"root":["./src/App.tsx","./src/PlanetTerrain.tsx","./src/ShipModel.tsx","./src/galaxy.ts","./src/galaxyConfig.ts","./src/lod.ts","./src/main.tsx","./src/noise.ts","./src/shipConfig.ts","./src/stationLOD.ts","./src/ships/aether.ts","./src/ships/ascendancy.ts","./src/ships/index.ts"],"version":"5.9.3"}
