@@ -2,7 +2,7 @@ import { Html, useGLTF } from '@react-three/drei';
 import { useFrame } from '@react-three/fiber';
 import { type MutableRefObject, type ReactElement, useEffect, useMemo, useRef } from 'react';
 import * as THREE from 'three';
-import type { ShipConfig } from './shipConfig';
+import { extractShipAnchors, type ShipConfig } from './shipConfig';
 import { fixGLBTransparency, setupLODs } from './lod';
 
 // ─── Pilot seat outline (inverted-hull method) ─────────────────────────────
@@ -168,6 +168,11 @@ function useShipCollectionScene(
 
   const clonedScene = useMemo(() => {
     const fullClone = scene.clone(true);
+
+    // Extract spatial anchors (thrusters, guns, doors) from named GLB nodes.
+    // This mutates the config's Vec3 fields in-place.  It's idempotent, so
+    // running for both exterior and interior layers is safe.
+    extractShipAnchors(fullClone, config);
 
     let root: THREE.Object3D;
 

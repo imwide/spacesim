@@ -8,29 +8,8 @@ const ascendancyConfig: ShipConfigRaw = {
 
   model: '/models/ascendancy.glb',
 
-  // The entry point is just behind the ship (where a ramp/door would be).
-  entryPoint: [0, -1, 5],
-
-  // The exit point (inside the hull) — press X near here to leave.
-  exitPoint: [0, 0, 4],
-
-  // Where the player appears (ship-local) after boarding.
-  insideSpawnPoint: [0, 2.0, -4.0],
-
-  // Where the player appears (ship-local offset, applied in world-space) after exiting.
-  outsideSpawnPoint: [0, 1.5, 1],
-
-  // Engine exhaust anchors.
-  thrusterPositions: [
-    [0.5, -0.2, 2.1],
-    [-0.5, -0.2, 2.1],
-  ],
-
-  // Weapon muzzle anchors.
-  gunPositions: [
-    [1.82, -0.2, -1.8],
-    [-1.82, -0.2, -1.8],
-  ],
+  // Spatial anchors (entry/exit doors, thrusters, guns) are extracted at
+  // runtime from named empty nodes in the GLB — no need to hardcode them.
 
   // ── Flight multipliers (1.0 = baseline) ───────────────────────────────
   accelerationMultiplier: 0.5,

@@ -26,13 +26,9 @@ Remove space tablet in favor of a new UI
 BLENDER TODO: decrease glow intensity, apply array, screw stickers dont work/have no outline.
 
 
-Line/Edge shader currently collapses more than just triangles. It also collapses quads on flat surfaces but it shouldnt because if i made quads on flat surfaces, its on purpose to display edge lines as details.
-It should work like an optimized version of this:
-if two triangles share a hypotenuse and face the exact same direction (normals are the same) and their other two edges are the same length respectivley, do not render the shared hypotenuse as an edge and exclude the remaining 4 edges from future consideration of being eliminated as well, so they are rendered as edges for sure.
 
 
-The lighting in the "shadow" areas / the direction of faces where light doesnt hit, is really flat right now. Can you make the faces that do not face the light source/star even darker with more  contrast so they are not all one color. Do not change the brightness of the light source and the brightness of the faces that do face the light source.
+The lighting in the "shadow" areas / the direction of faces where light doesnt hit is really flat right now. Faces that are 90° in difference have the exact same sahde even as long as they face away from the sun/star. Can you make the faces that do not face the light source/star even darker with more contrast so they are not all one color. Do not change the brightness of the light source and the brightness of the faces that do face the light source.
 
 
-
-replace the manual locations in ship configs with nodes in the glb models
+Player height is too tall inside the ship. I used a reference in blender that was the same apparent height of 1.7m and its eyelevel was lower than the one in the game.

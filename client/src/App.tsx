@@ -327,7 +327,8 @@ const BLENDER_EDGE_WIDTH = 1;
 const BLENDER_EDGE_COLOR = '#000000';
 const BLENDER_EDGE_SURFACE_SCALE = 1.00018;
 const BLENDER_EDGE_COPLANAR_DOT_THRESHOLD = 0.9999;
-const BLENDER_EDGE_QUAD_DOT_THRESHOLD = 0.985;
+/** Relative tolerance for matching non-shared leg lengths when detecting quad diagonals. */
+const BLENDER_EDGE_QUAD_LEG_TOLERANCE = 0.02;
 const BLENDER_EDGE_WELD_EPSILON = 1e-5;
 
 /** Objects registered here are hidden during the outline normal/depth pass
@@ -507,86 +508,6 @@ const CARTOON_OUTLINE_FRAGMENT_SHADER = /* glsl */ `
 
 const wireframeGeometryCache = new WeakMap<THREE.BufferGeometry, THREE.BufferGeometry>();
 
-function orderQuadVerticesOnPlane(
-  vertices: THREE.Vector3[],
-  planeNormal: THREE.Vector3,
-): number[] {
-  const centroid = new THREE.Vector3();
-  vertices.forEach((vertex) => centroid.add(vertex));
-  centroid.multiplyScalar(1 / vertices.length);
-
-  const axisX = vertices[0].clone().sub(centroid).normalize();
-  let axisY = planeNormal.clone().cross(axisX).normalize();
-  if (axisY.lengthSq() <= 1e-12) {
-    axisY = new THREE.Vector3(0, 1, 0).cross(axisX).normalize();
-  }
-
-  return vertices
-    .map((vertex, index) => {
-      const local = vertex.clone().sub(centroid);
-      return {
-        index,
-        angle: Math.atan2(local.dot(axisY), local.dot(axisX)),
-      };
-    })
-    .sort((left, right) => left.angle - right.angle)
-    .map((entry) => entry.index);
-}
-
-function isLikelyQuadDiagonal(
-  edgeA: number,
-  edgeB: number,
-  oppositeA: number,
-  oppositeB: number,
-  normalA: THREE.Vector3,
-  normalB: THREE.Vector3,
-  positions: THREE.Vector3[],
-): boolean {
-  if (oppositeA === oppositeB) {
-    return false;
-  }
-
-  const normalDot = normalA.dot(normalB);
-  if (normalDot < BLENDER_EDGE_QUAD_DOT_THRESHOLD) {
-    return false;
-  }
-
-  const averageNormal = normalA.clone().add(normalB);
-  if (averageNormal.lengthSq() <= 1e-12) {
-    return false;
-  }
-  averageNormal.normalize();
-
-  const ids = [edgeA, edgeB, oppositeA, oppositeB];
-  const orderedLocal = orderQuadVerticesOnPlane(ids.map((id) => positions[id]), averageNormal);
-  const orderedIds = orderedLocal.map((localIndex) => ids[localIndex]);
-  const edgeAIndex = orderedIds.indexOf(edgeA);
-  const edgeBIndex = orderedIds.indexOf(edgeB);
-  if (edgeAIndex < 0 || edgeBIndex < 0) {
-    return false;
-  }
-
-  const cyclicDistance = Math.abs(edgeAIndex - edgeBIndex);
-  const wrappedDistance = Math.min(cyclicDistance, 4 - cyclicDistance);
-  if (wrappedDistance !== 2) {
-    return false;
-  }
-
-  const pa = positions[edgeA];
-  const pb = positions[edgeB];
-  const pc = positions[oppositeA];
-  const pd = positions[oppositeB];
-  const sharedLength = pa.distanceTo(pb);
-  const outerAverage = (
-    pa.distanceTo(pc)
-    + pb.distanceTo(pc)
-    + pa.distanceTo(pd)
-    + pb.distanceTo(pd)
-  ) / 4;
-
-  return sharedLength >= outerAverage * 0.92;
-}
-
 function getWireframeGeometry(source: THREE.BufferGeometry): THREE.BufferGeometry {
   const cached = wireframeGeometryCache.get(source);
   if (cached) {
@@ -671,39 +592,81 @@ function getWireframeGeometry(source: THREE.BufferGeometry): THREE.BufferGeometr
     addEdge(v2, v0, normal, v1);
   }
 
-  const segments: number[] = [];
+  // ── Pass 1: identify quad diagonals ──────────────────────────────────
+  // Two coplanar triangles sharing an edge whose non-shared legs match in
+  // length form a quad.  The shared edge is the tessellation diagonal and
+  // should be hidden.  The 4 outer edges are protected from any further
+  // elimination so intentional detail lines always render.
+  const diagonalEdges = new Set<string>();
+  const protectedEdges = new Set<string>();
+
+  const makeEdgeKey = (x: number, y: number): string => {
+    const mn = Math.min(x, y);
+    const mx = Math.max(x, y);
+    return `${mn}:${mx}`;
+  };
+
   edgeMap.forEach((faces, key) => {
+    if (faces.length !== 2) return;
+
+    const normalDot = faces[0].normal.dot(faces[1].normal);
+    if (normalDot < BLENDER_EDGE_COPLANAR_DOT_THRESHOLD) return;
+
     const [aText, bText] = key.split(':');
     const a = Number(aText);
     const b = Number(bText);
-    let keepEdge = false;
-
-    if (faces.length !== 2) {
-      keepEdge = true;
-    } else {
-      const dot = faces[0].normal.dot(faces[1].normal);
-      keepEdge = dot < BLENDER_EDGE_COPLANAR_DOT_THRESHOLD;
-
-      if (keepEdge && isLikelyQuadDiagonal(
-        a,
-        b,
-        faces[0].opposite,
-        faces[1].opposite,
-        faces[0].normal,
-        faces[1].normal,
-        weldedPositions,
-      )) {
-        keepEdge = false;
-      }
-    }
-
-    if (!keepEdge) {
-      return;
-    }
+    const c = faces[0].opposite;
+    const d = faces[1].opposite;
+    if (c === d) return;
 
     const pa = weldedPositions[a];
     const pb = weldedPositions[b];
+    const pc = weldedPositions[c];
+    const pd = weldedPositions[d];
 
+    // Non-shared legs of each triangle
+    const ac = pa.distanceTo(pc);
+    const bc = pb.distanceTo(pc);
+    const ad = pa.distanceTo(pd);
+    const bd = pb.distanceTo(pd);
+
+    // Check both possible leg pairings
+    const avgLeg = (ac + bc + ad + bd) / 4;
+    if (avgLeg < 1e-10) return;
+    const tol = avgLeg * BLENDER_EDGE_QUAD_LEG_TOLERANCE;
+    const match1 = Math.abs(ac - ad) <= tol && Math.abs(bc - bd) <= tol;
+    const match2 = Math.abs(ac - bd) <= tol && Math.abs(bc - ad) <= tol;
+    if (!match1 && !match2) return;
+
+    // Shared edge is a quad diagonal → suppress it
+    diagonalEdges.add(key);
+
+    // Protect the 4 outer edges from coplanar elimination
+    protectedEdges.add(makeEdgeKey(a, c));
+    protectedEdges.add(makeEdgeKey(b, c));
+    protectedEdges.add(makeEdgeKey(a, d));
+    protectedEdges.add(makeEdgeKey(b, d));
+  });
+
+  // ── Pass 2: decide which edges to render ────────────────────────────────
+  const segments: number[] = [];
+  edgeMap.forEach((faces, key) => {
+    // Quad diagonal → always suppress
+    if (diagonalEdges.has(key)) return;
+
+    // Protected quad outer edge → always render
+    if (!protectedEdges.has(key) && faces.length === 2) {
+      // Interior edge on smooth (coplanar) surface → suppress
+      const dot = faces[0].normal.dot(faces[1].normal);
+      if (dot >= BLENDER_EDGE_COPLANAR_DOT_THRESHOLD) return;
+    }
+
+    // Boundary edges (faces.length !== 2) and crease edges always render
+    const [aText, bText] = key.split(':');
+    const a = Number(aText);
+    const b = Number(bText);
+    const pa = weldedPositions[a];
+    const pb = weldedPositions[b];
     segments.push(pa.x, pa.y, pa.z, pb.x, pb.y, pb.z);
   });
 
