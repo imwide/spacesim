@@ -20,12 +20,25 @@ Add light nodes to the station models. This will allow every station to have a a
 
 Add a "arrival point" to the station configs
 
-Remove space tablet in favor of a new UI
+The new UI should also show ships that are close to you (within 10km) in the same way as the stations and planets.
+For not only ships but any item less than 10km away, the following options should also exist next to autopilot and highlight:
+- Orbit (should only appear if less than 10km away) should orbit the object at a radius of 2km with a slight 300m vertical offset
+- Follow (should only appear if less than 10km away, only available for ships) should follow the object while never getting closer than 250m
+
+Additionally at the top, not item specific but under the search option:
+- Disengage (Should only appear if autopilot, orbit or follow is active) should disengage the current autopilot, orbit or follow and tooltip of this option should show either "Stop autopilot", "Stop orbiting" or "Stop following" depending on which one is active
+
+
+
+Transparent materials are currently detected and made transparent by certain keywords in their names such as "glass", "window" etc. They should ONLY be made transparent if the name doesnt also contain "opaque" since i use this as a keyword for non transparent "glass" materials
+
 
 
 BLENDER TODO: decrease glow intensity, apply array, screw stickers dont work/have no outline.
 
 
-
+Edge triangle collapse: prefer straight edges/aligned with axes edges
 
 Player height is too tall inside the ship. I used a reference in blender that was the same apparent height of 1.7m and its eyelevel was lower than the one in the game.
+
+
