@@ -367,7 +367,7 @@ export function fixGLBTransparency(scene: THREE.Object3D): void {
       if (material.transparent && material.opacity < 1.0) continue;
 
       const nameLower = (material.name ?? '').toLowerCase();
-      const isGlass = TRANSPARENT_NAME_PATTERNS.some((p) => nameLower.includes(p));
+      const isGlass = TRANSPARENT_NAME_PATTERNS.some((p) => nameLower.includes(p)) && !nameLower.includes('opaque');
       if (!isGlass) continue;
 
       material.transparent = true;

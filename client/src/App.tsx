@@ -226,7 +226,9 @@ interface StationNode {
   linkedStationIds: string[];
 }
 
-type AutopilotDestinationKind = StationKind | 'asteroid-object' | 'moon';
+type AutopilotDestinationKind = StationKind | 'asteroid-object' | 'moon' | 'ship';
+
+type AutopilotMode = 'goto' | 'orbit' | 'follow';
 
 interface AutopilotDestination {
   id: string;
@@ -241,6 +243,8 @@ interface AutopilotDestination {
   bodyRadius: number;
   /** Actual center position of the celestial body (planet/moon center). Matches localPosition for non-body targets. */
   bodyCenter: Vec3Tuple;
+  /** How the autopilot should behave: goto (default), orbit, or follow. */
+  mode?: AutopilotMode;
   // For inter-system travel only: a waypoint far away in the destination's direction.
   // The ship flies to this point for visuals; fast-travel fires when interstellarArrivalAt elapses.
   interstellarWaypoint?: Vec3Tuple;
@@ -309,7 +313,7 @@ interface StationForceFieldHitResult {
   point: THREE.Vector3;
 }
 
-const stationForceFieldImpactHandlers = new Map<string, (worldHitPoint: THREE.Vector3) => void>();
+const stationForceFieldImpactHandlers = new Map<string, (worldHitPoint: THREE.Vector3, fieldCenter: THREE.Vector3) => void>();
 const stationWalkableRoots = new Map<string, THREE.Object3D>();
 // Reusable instances for findStationWalkCollision — avoids per-frame GC pressure.
 const _walkRaycaster = new THREE.Raycaster();
@@ -741,6 +745,17 @@ const LONG_DISTANCE_PHASE2_DURATION = 20; // seconds — fast accel to cruise
 const LONG_DISTANCE_DECEL_DURATION = 20; // seconds — deceleration phase
 // Decel trigger distance: 0.5 × cruiseSpeed × decelDuration ≈ 240 million km (1.6 AU)
 const LONG_DISTANCE_DECEL_TRIGGER = 0.5 * LONG_DISTANCE_CRUISE_SPEED * LONG_DISTANCE_DECEL_DURATION;
+
+// ─── Orbit / Follow autopilot constants ─────────────────────────────────────
+const AUTOPILOT_ORBIT_RADIUS = 2_000;          // 2 km orbit radius
+const AUTOPILOT_ORBIT_VERTICAL_OFFSET = 300;   // 300 m above target center
+const AUTOPILOT_ORBIT_ANGULAR_SPEED = 0.06;    // rad/s — ~105 s per revolution
+const AUTOPILOT_ORBIT_APPROACH_SPEED = 80;     // m/s approach to orbit ring
+const AUTOPILOT_FOLLOW_MIN_DISTANCE = 250;     // never closer than 250 m
+const AUTOPILOT_FOLLOW_DESIRED_DISTANCE = 400; // aim for ~400 m behind
+const AUTOPILOT_FOLLOW_MAX_SPEED_MULT = 1.3;   // up to 130% of target's speed
+const NAVIGATOR_SHIP_DISTANCE_THRESHOLD = 10_000; // 10 km
+
 const SHIP_WEAPON_FIRE_INTERVAL_SECONDS = 0.09;
 const SHIP_WEAPON_PROJECTILE_SPEED = 3_600;
 const SHIP_WEAPON_PROJECTILE_LIFETIME_SECONDS = 0.95;
@@ -3029,6 +3044,121 @@ function findAutopilotCollisionOnSegment(
   return nearestHit;
 }
 
+/**
+ * Orbit autopilot: fly to a 2 km circular orbit around the target with a 300 m
+ * vertical offset, then maintain the orbit continuously.
+ */
+function updateOrbitAutopilot(
+  state: LocalGameState,
+  dt: number,
+  destination: AutopilotDestination,
+  frameOrigin: Vec3Tuple,
+  _sceneColliders: SceneCollider[],
+): { arrived: boolean; distance: number } {
+  const targetPos = vectorFromTuple(toFrameLocalPosition(destination.localPosition, frameOrigin));
+  const toTarget = targetPos.clone().sub(state.shipPosition);
+  const distance = toTarget.length();
+
+  // Desired orbit point: rotate around the Y-axis at constant angular speed
+  const angle = (performance.now() / 1000) * AUTOPILOT_ORBIT_ANGULAR_SPEED;
+  const orbitPoint = targetPos.clone().add(
+    new THREE.Vector3(
+      Math.cos(angle) * AUTOPILOT_ORBIT_RADIUS,
+      AUTOPILOT_ORBIT_VERTICAL_OFFSET,
+      Math.sin(angle) * AUTOPILOT_ORBIT_RADIUS,
+    ),
+  );
+
+  const toOrbit = orbitPoint.clone().sub(state.shipPosition);
+  const orbitDist = toOrbit.length();
+
+  // Smoothly approach the orbit point
+  const desiredSpeed = Math.min(
+    AUTOPILOT_ORBIT_APPROACH_SPEED * Math.max(1, orbitDist / AUTOPILOT_ORBIT_RADIUS),
+    orbitDist / dt, // don't overshoot
+  );
+
+  const desiredDirection = orbitDist > 0.1 ? toOrbit.normalize() : new THREE.Vector3(0, 0, -1);
+  const desiredVelocity = desiredDirection.multiplyScalar(desiredSpeed);
+
+  // Blend velocity smoothly
+  const blend = 1 - Math.exp(-3.0 * dt);
+  state.shipVelocity.lerp(desiredVelocity, blend);
+
+  // Rotate ship to face the direction of movement
+  if (state.shipVelocity.lengthSq() > 0.01) {
+    const lookDir = state.shipVelocity.clone().normalize();
+    const targetQuat = new THREE.Quaternion().setFromRotationMatrix(
+      new THREE.Matrix4().lookAt(new THREE.Vector3(0, 0, 0), lookDir, new THREE.Vector3(0, 1, 0)),
+    );
+    state.shipRotation.slerp(targetQuat, Math.min(1, 2.0 * dt));
+  }
+
+  state.shipPosition.addScaledVector(state.shipVelocity, dt);
+  state.position.copy(state.shipPosition);
+  state.velocity.copy(state.shipVelocity);
+  state.rotation.copy(state.shipRotation);
+
+  return { arrived: false, distance };
+}
+
+/**
+ * Follow autopilot: trail behind a moving target, maintaining at least 250 m
+ * distance, aiming for ~400 m behind it.
+ */
+function updateFollowAutopilot(
+  state: LocalGameState,
+  dt: number,
+  destination: AutopilotDestination,
+  frameOrigin: Vec3Tuple,
+  _sceneColliders: SceneCollider[],
+): { arrived: boolean; distance: number } {
+  const targetPos = vectorFromTuple(toFrameLocalPosition(destination.localPosition, frameOrigin));
+  const toTarget = targetPos.clone().sub(state.shipPosition);
+  const distance = toTarget.length();
+
+  if (distance < 0.1) {
+    return { arrived: false, distance };
+  }
+
+  const targetDirection = toTarget.clone().normalize();
+
+  // Try to stay at FOLLOW_DESIRED_DISTANCE behind
+  let desiredSpeed: number;
+  if (distance < AUTOPILOT_FOLLOW_MIN_DISTANCE) {
+    // Too close — reverse slightly
+    desiredSpeed = -20;
+  } else if (distance < AUTOPILOT_FOLLOW_DESIRED_DISTANCE) {
+    // In sweet spot, match target speed
+    desiredSpeed = state.shipVelocity.length() * 0.5;
+  } else {
+    // Too far — catch up
+    const excess = distance - AUTOPILOT_FOLLOW_DESIRED_DISTANCE;
+    desiredSpeed = Math.min(excess * 0.8, AUTOPILOT_ORBIT_APPROACH_SPEED * 10);
+  }
+
+  const desiredVelocity = targetDirection.multiplyScalar(desiredSpeed);
+
+  const blend = 1 - Math.exp(-2.5 * dt);
+  state.shipVelocity.lerp(desiredVelocity, blend);
+
+  // Rotate ship to face the target
+  if (distance > 1) {
+    const lookDir = toTarget.clone().normalize();
+    const targetQuat = new THREE.Quaternion().setFromRotationMatrix(
+      new THREE.Matrix4().lookAt(new THREE.Vector3(0, 0, 0), lookDir, new THREE.Vector3(0, 1, 0)),
+    );
+    state.shipRotation.slerp(targetQuat, Math.min(1, 2.0 * dt));
+  }
+
+  state.shipPosition.addScaledVector(state.shipVelocity, dt);
+  state.position.copy(state.shipPosition);
+  state.velocity.copy(state.shipVelocity);
+  state.rotation.copy(state.shipRotation);
+
+  return { arrived: false, distance };
+}
+
 function updateAutopilotShip(
   state: LocalGameState,
   dt: number,
@@ -4249,6 +4379,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           activeSystemId={activeSystemId}
           autopilotDestinationId={autopilotDestination?.id || ''}
           autopilotEngaged={autopilotEngaged}
+          autopilotMode={autopilotDestination?.mode ?? 'goto'}
           frameOrigin={activeFrameOrigin}
           galaxy={galaxy}
           highlightedTargetId={highlightedTarget?.id ?? ''}
@@ -4276,6 +4407,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
             setAutopilotEngaged(false);
             setAutopilotStatus('Autopilot disengaged.');
           }}
+          remotePlayers={remotePlayers}
           shipPosition={localStateRef.current ? [localStateRef.current.shipPosition.x, localStateRef.current.shipPosition.y, localStateRef.current.shipPosition.z] as [number, number, number] : undefined}
           shipSpeed={localStateRef.current?.shipVelocity.length() ?? 0}
         />
@@ -4495,10 +4627,42 @@ function GameScene({
     // Reset pilot seat outline — the interior branch will enable it when appropriate
     seatOutlineVisibleRef.current = false;
 
-    // Disengage autopilot if the ship is inside any station force-field boundary.
+    // Disengage autopilot only when a warp-distance trip (≥1 000 km) starts AND
+    // ends inside the same force-field boundary — that would mean the ship tries
+    // to warp to full light-speed inside the slow zone and then return, which the
+    // force field should prevent.  Short-range trips (<1 000 km) and long-range
+    // departures whose destination is outside the field are always allowed; the
+    // station speed limit is enforced on the autopilot velocity further below.
     if (autopilotActive && isShipInsideStationBounds(state.shipPosition, stationForceFields)) {
-      onAutopilotToggle(false);
-      onAutopilotStatusChange('Autopilot unavailable inside station boundary.');
+      if (autopilotDestination) {
+        const destLocalPos = vectorFromTuple(toFrameLocalPosition(autopilotDestination.localPosition, activeFrameOrigin));
+        const distToDest = destLocalPos.distanceTo(state.shipPosition);
+          const currentFieldIds = stationForceFields
+            .filter((field) => {
+              const fx = state.shipPosition.x - field.position[0];
+              const fy = state.shipPosition.y - field.position[1];
+              const fz = state.shipPosition.z - field.position[2];
+              return fx * fx + fy * fy + fz * fz <= field.radius * field.radius;
+            })
+            .map((field) => field.id);
+          const destInsideSameField = stationForceFields.some((field) => {
+            if (!currentFieldIds.includes(field.id)) {
+              return false;
+            }
+            const fx = destLocalPos.x - field.position[0];
+            const fy = destLocalPos.y - field.position[1];
+            const fz = destLocalPos.z - field.position[2];
+            return fx * fx + fy * fy + fz * fz <= field.radius * field.radius;
+          });
+          // Only block if it's warp-range AND the destination stays inside the
+          // same force field the ship is currently inside.
+          if (distToDest > LONG_DISTANCE_THRESHOLD_METERS && destInsideSameField) {
+          onAutopilotToggle(false);
+          onAutopilotStatusChange('Autopilot unavailable inside station boundary.');
+        }
+      } else {
+        // No destination set — nothing to disengage.
+      }
     }
     const playerSceneColliders = [
       ...localEnvironmentColliders,
@@ -4677,6 +4841,15 @@ function GameScene({
       }
     } else if (state.mode === 'interior') {
       if (autopilotAvailable && autopilotDestination) {
+        // Live-update position when tracking a moving ship.
+        if (autopilotDestination.kind === 'ship') {
+          const targetSocketId = autopilotDestination.id.replace('ship-', '');
+          const target = remotePlayers.find((p) => p.socketId === targetSocketId);
+          if (target) {
+            autopilotDestination.localPosition = tupleAdd(target.frameOrigin, target.position);
+            autopilotDestination.bodyCenter = autopilotDestination.localPosition;
+          }
+        }
         // Time-based interstellar arrival: fire fast-travel when the pre-computed
         // arrival timestamp is reached, regardless of physics convergence.
         if (
@@ -4686,7 +4859,12 @@ function GameScene({
         ) {
           onInterstellarArrival(autopilotDestination);
         } else {
-          const autopilotStep = updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles, shipSceneColliders);
+          const apMode = autopilotDestination.mode ?? 'goto';
+          const autopilotStep = apMode === 'orbit'
+            ? updateOrbitAutopilot(state, dt, autopilotDestination, activeFrameOrigin, shipSceneColliders)
+            : apMode === 'follow'
+              ? updateFollowAutopilot(state, dt, autopilotDestination, activeFrameOrigin, shipSceneColliders)
+              : updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles, shipSceneColliders);
           if (autopilotStep.arrived) {
             if (autopilotDestination.interstellarWaypoint) {
               onInterstellarArrival(autopilotDestination);
@@ -5086,6 +5264,15 @@ function GameScene({
         state.position.copy(state.shipPosition);
         state.velocity.copy(state.shipVelocity);
       } else if (autopilotAvailable && autopilotDestination) {
+        // Live-update position when tracking a moving ship.
+        if (autopilotDestination.kind === 'ship') {
+          const targetSocketId = autopilotDestination.id.replace('ship-', '');
+          const target = remotePlayers.find((p) => p.socketId === targetSocketId);
+          if (target) {
+            autopilotDestination.localPosition = tupleAdd(target.frameOrigin, target.position);
+            autopilotDestination.bodyCenter = autopilotDestination.localPosition;
+          }
+        }
         // Time-based interstellar arrival (pilot mode)
         if (
           autopilotDestination.interstellarWaypoint &&
@@ -5094,7 +5281,12 @@ function GameScene({
         ) {
           onInterstellarArrival(autopilotDestination);
         } else {
-          const autopilotStep = updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles, shipSceneColliders);
+          const apMode = autopilotDestination.mode ?? 'goto';
+          const autopilotStep = apMode === 'orbit'
+            ? updateOrbitAutopilot(state, dt, autopilotDestination, activeFrameOrigin, shipSceneColliders)
+            : apMode === 'follow'
+              ? updateFollowAutopilot(state, dt, autopilotDestination, activeFrameOrigin, shipSceneColliders)
+              : updateAutopilotShip(state, dt, autopilotDestination, activeFrameOrigin, autopilotObstacles, shipSceneColliders);
           if (autopilotStep.arrived) {
             if (autopilotDestination.interstellarWaypoint) {
               onInterstellarArrival(autopilotDestination);
@@ -5102,6 +5294,19 @@ function GameScene({
               onAutopilotArrival(autopilotDestination.id);
               onAutopilotToggle(false);
               onAutopilotStatusChange(`Destination reached: ${autopilotDestination.name}.`);
+            }
+          }
+
+          // Apply station force-field speed cap to autopilot velocity so the
+          // ship respects the slow zone without being forcibly disengaged.
+          if (insideStationBounds && !longDistanceState.active) {
+            const apSpeedLimit = getStationBorderLimitedManualSpeed(
+              state.shipPosition, state.shipVelocity, shipConfig.collisionRadius,
+              stationForceFields, SHIP_MAX_SPEED_METERS_PER_SECOND * shipConfig.speedMultiplier,
+            );
+            if (state.shipVelocity.length() > apSpeedLimit.maxSpeed) {
+              state.shipVelocity.setLength(apSpeedLimit.maxSpeed);
+              state.velocity.copy(state.shipVelocity);
             }
           }
         }
@@ -5164,12 +5369,20 @@ function GameScene({
       shipGroupRef.current.visible = state.mode !== 'interior';
       shipGroupRef.current.position.copy(state.shipPosition);
       shipGroupRef.current.quaternion.copy(state.shipRotation);
+      // Force-propagate the new world matrix so that LOD cullDistance checks
+      // in ShipExteriorModel (which run at a later useFrame priority) see the
+      // current position instead of the stale matrixWorld from the previous
+      // frame.  Without this, high-speed flight moves the camera far from the
+      // old matrixWorld position and the LOD distance exceeds cullDistance,
+      // making the ship invisible.
+      shipGroupRef.current.updateMatrixWorld(true);
     }
 
     if (interiorGroupRef.current) {
       interiorGroupRef.current.visible = state.mode === 'interior';
       interiorGroupRef.current.position.copy(state.shipPosition);
       interiorGroupRef.current.quaternion.copy(state.shipRotation);
+      interiorGroupRef.current.updateMatrixWorld(true);
     }
 
     if (state.mode === 'pilot') {
@@ -5452,21 +5665,28 @@ function AutopilotPanel({
 }
 
 function WarpSpeedEffect({ localStateRef }: { localStateRef: MutableRefObject<LocalGameState> }): ReactElement {
-  const { camera } = useThree();
   const groupRef = useRef<THREE.Group>(null);
   const materialRef = useRef<THREE.LineBasicMaterial>(null);
   const geometryRef = useRef<THREE.BufferGeometry>(null);
-  const streakCount = 72;
+  const streakCount = 168;
+  const tunnelRadiusMin = 340;
+  const tunnelRadiusMax = 560;
+  const tunnelHalfLength = 1800;
   const streakStateRef = useRef(
     Array.from({ length: streakCount }, () => ({
       angle: Math.random() * Math.PI * 2,
-      radius: 0.35 + Math.random() * 1.9,
-      speed: 90 + Math.random() * 180,
-      z: -20 - Math.random() * 260,
-      length: 8 + Math.random() * 34,
+      radius: tunnelRadiusMin + Math.random() * (tunnelRadiusMax - tunnelRadiusMin),
+      speed: 320 + Math.random() * 580,
+      z: -tunnelHalfLength - Math.random() * tunnelHalfLength,
+      length: 80 + Math.random() * 280,
     })),
   );
   const positions = useMemo(() => new Float32Array(streakCount * 2 * 3), [streakCount]);
+  const velocityDirection = useMemo(() => new THREE.Vector3(), []);
+  const shipForward = useMemo(() => new THREE.Vector3(), []);
+  const shipUp = useMemo(() => new THREE.Vector3(), []);
+  const travelQuaternionMatrix = useMemo(() => new THREE.Matrix4(), []);
+  const travelQuaternion = useMemo(() => new THREE.Quaternion(), []);
 
   useFrame((_state, delta) => {
     if (!groupRef.current || !materialRef.current || !geometryRef.current) {
@@ -5482,39 +5702,50 @@ function WarpSpeedEffect({ localStateRef }: { localStateRef: MutableRefObject<Lo
       return;
     }
 
-    groupRef.current.position.copy(camera.position);
-    groupRef.current.quaternion.copy(camera.quaternion);
+    groupRef.current.position.copy(localStateRef.current.shipPosition);
+
+    velocityDirection.copy(localStateRef.current.shipVelocity);
+    shipUp.set(0, 1, 0).applyQuaternion(localStateRef.current.shipRotation).normalize();
+    if (velocityDirection.lengthSq() > 1) {
+      velocityDirection.normalize();
+      travelQuaternionMatrix.lookAt(new THREE.Vector3(0, 0, 0), velocityDirection, shipUp);
+      travelQuaternion.setFromRotationMatrix(travelQuaternionMatrix);
+      groupRef.current.quaternion.copy(travelQuaternion);
+    } else {
+      shipForward.set(0, 0, -1).applyQuaternion(localStateRef.current.shipRotation).normalize();
+      travelQuaternionMatrix.lookAt(new THREE.Vector3(0, 0, 0), shipForward, shipUp);
+      travelQuaternion.setFromRotationMatrix(travelQuaternionMatrix);
+      groupRef.current.quaternion.copy(travelQuaternion);
+    }
 
     streakStateRef.current.forEach((streak, index) => {
-      streak.z += streak.speed * delta * (0.4 + intensity * 3.4);
-      if (streak.z > -4) {
+      streak.z += streak.speed * delta * (0.55 + intensity * 5.5);
+      if (streak.z > tunnelHalfLength) {
         streak.angle = Math.random() * Math.PI * 2;
-        streak.radius = 0.35 + Math.random() * 2.2;
-        streak.speed = 90 + Math.random() * 220;
-        streak.z = -160 - Math.random() * 220;
-        streak.length = 12 + Math.random() * 42;
+        streak.radius = tunnelRadiusMin + Math.random() * (tunnelRadiusMax - tunnelRadiusMin);
+        streak.speed = 320 + Math.random() * 680;
+        streak.z = -tunnelHalfLength - Math.random() * tunnelHalfLength;
+        streak.length = 100 + Math.random() * 340;
       }
 
       const x = Math.cos(streak.angle) * streak.radius;
       const y = Math.sin(streak.angle) * streak.radius;
-      const headX = x * 0.1;
-      const headY = y * 0.1;
       const startIndex = index * 6;
 
       positions[startIndex] = x;
       positions[startIndex + 1] = y;
       positions[startIndex + 2] = streak.z;
-      positions[startIndex + 3] = headX;
-      positions[startIndex + 4] = headY;
+      positions[startIndex + 3] = x;
+      positions[startIndex + 4] = y;
       positions[startIndex + 5] = streak.z + streak.length;
     });
 
     geometryRef.current.attributes.position.needsUpdate = true;
-    materialRef.current.opacity = 0.08 + intensity * 0.72;
+    materialRef.current.opacity = 0.14 + intensity * 0.56;
   });
 
   return (
-    <group ref={groupRef} visible={false} renderOrder={1000}>
+    <group ref={groupRef} visible={false} userData={{ ignoreOutline: true, ignoreCameraCollision: true }}>
       <lineSegments frustumCulled={false}>
         <bufferGeometry ref={geometryRef}>
           <bufferAttribute attach="attributes-position" args={[positions, 3]} usage={THREE.DynamicDrawUsage} />
@@ -5525,7 +5756,7 @@ function WarpSpeedEffect({ localStateRef }: { localStateRef: MutableRefObject<Lo
           transparent
           opacity={0}
           depthWrite={false}
-          depthTest={false}
+          depthTest
           blending={THREE.AdditiveBlending}
         />
       </lineSegments>
@@ -5643,6 +5874,7 @@ function navigatorFormatKind(kind: string): string {
     case 'station': return 'Station';
     case 'asteroid-belt': return 'Asteroid Belt';
     case 'asteroid-object': return 'Asteroid';
+    case 'ship': return 'Ship';
     default: return kind.charAt(0).toUpperCase() + kind.slice(1);
   }
 }
@@ -5651,6 +5883,7 @@ function Navigator({
   activeSystemId,
   autopilotDestinationId,
   autopilotEngaged,
+  autopilotMode,
   frameOrigin,
   galaxy,
   highlightedTargetId,
@@ -5659,12 +5892,14 @@ function Navigator({
   onEngageAutopilot,
   onHighlightTarget,
   onStopAutopilot,
+  remotePlayers,
   shipPosition,
   shipSpeed,
 }: {
   activeSystemId: string;
   autopilotDestinationId: string;
   autopilotEngaged: boolean;
+  autopilotMode: AutopilotMode;
   frameOrigin?: Vec3Tuple;
   galaxy: GalaxyData;
   highlightedTargetId: string;
@@ -5673,6 +5908,7 @@ function Navigator({
   onEngageAutopilot: (dest: AutopilotDestination) => void;
   onHighlightTarget: Dispatch<SetStateAction<HighlightTarget | null>>;
   onStopAutopilot: () => void;
+  remotePlayers: PlayerSnapshot[];
   shipPosition?: Vec3Tuple;
   shipSpeed: number;
 }): ReactElement {
@@ -5888,10 +6124,33 @@ function Navigator({
       nodes.push(beltNode);
     });
 
+    // Nearby ships (other players)
+    remotePlayers.forEach((player) => {
+      const playerAbs: Vec3Tuple = tupleAdd(player.frameOrigin, player.position);
+      const d = distTo(playerAbs);
+      if (d < NAVIGATOR_SHIP_DISTANCE_THRESHOLD) {
+        const shipNode: NavigatorNode = {
+          id: `ship-${player.socketId}`,
+          name: player.username,
+          kind: 'ship',
+          distance: d,
+          localPosition: playerAbs,
+          systemId: system.id,
+          systemName: system.name,
+          approachRadius: 60,
+          bodyRadius: 0,
+          bodyCenter: playerAbs,
+          children: [],
+        };
+        nodes.push(shipNode);
+        checkBest(shipNode.id, d, []);
+      }
+    });
+
     nodes.sort((a, b) => a.distance - b.distance);
     return { tree: nodes, closestId: bestId, closestAncestorIds: new Set(bestAncestors) };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSystemId, galaxy, network, tick]);
+  }, [activeSystemId, galaxy, network, remotePlayers, tick]);
 
   const toggleExpand = useCallback((nodeId: string) => {
     setExpandedNodes((prev) => {
@@ -5948,7 +6207,9 @@ function Navigator({
             ? 'asteroid-object'
             : node.kind === 'moon'
               ? 'moon'
-              : 'planet';
+              : node.kind === 'ship'
+                ? 'ship'
+                : 'planet';
 
       return {
         id: node.id,
@@ -6000,9 +6261,17 @@ function Navigator({
     const isAutopilotTarget = autopilotEngaged && autopilotDestinationId === node.id;
     const isHighlighted = highlightedTargetId === node.id;
     const canAutopilot =
-      (node.kind === 'station' || node.kind === 'planet' || node.kind === 'moon' ||
-       node.kind === 'asteroid-belt' || node.kind === 'asteroid-object') &&
-      hudMode !== 'space' && hudMode !== 'planet-surface';
+      (node.kind === 'station' ||
+       node.kind === 'asteroid-belt' || node.kind === 'asteroid-object' || node.kind === 'ship') &&
+      hudMode === 'pilot';
+    const canOrbit =
+      hudMode === 'pilot' &&
+      (node.kind === 'planet' || node.kind === 'moon' || node.kind === 'station' ||
+       node.kind === 'asteroid-object' || node.kind === 'ship') &&
+      node.distance < NAVIGATOR_SHIP_DISTANCE_THRESHOLD;
+    const canFollow = hudMode === 'pilot' && node.kind === 'ship' && node.distance < NAVIGATOR_SHIP_DISTANCE_THRESHOLD;
+    const isOrbitingThis = autopilotEngaged && autopilotDestinationId === node.id && autopilotMode === 'orbit';
+    const isFollowingThis = autopilotEngaged && autopilotDestinationId === node.id && autopilotMode === 'follow';
 
     return (
       <div key={node.id} className="nav-tree-item">
@@ -6054,6 +6323,8 @@ function Navigator({
                 <svg viewBox="0 0 12 12" width="12" height="12"><circle cx="3.5" cy="6" r="1.8" fill="#6b7280" /><circle cx="8" cy="4.5" r="1.3" fill="#9ca3af" /><circle cx="7" cy="8.5" r="1" fill="#6b7280" /></svg>
               ) : node.kind === 'asteroid-object' ? (
                 <svg viewBox="0 0 10 10" width="10" height="10"><polygon points="5,1 8,3.5 9,7 6,9 2,8 1,4" fill="#6b7280" stroke="#9ca3af" strokeWidth="0.7" /></svg>
+              ) : node.kind === 'ship' ? (
+                <svg viewBox="0 0 12 12" width="12" height="12"><polygon points="6,1 10,10 6,8 2,10" fill="none" stroke="#c8a86e" strokeWidth="1" /></svg>
               ) : null}
             </span>
             <span className="nav-tree-name">{node.name}</span>
@@ -6083,6 +6354,51 @@ function Navigator({
               >
                 <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
                   <polygon points="8,1 14,15 8,11 2,15" />
+                </svg>
+              </span>
+            ) : null}
+            {canOrbit ? (
+              <span
+                className={`nav-action-btn${isOrbitingThis ? ' nav-action-active' : ''}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (isOrbitingThis) {
+                    onStopAutopilot();
+                  } else {
+                    const dest = buildNavDestination(node);
+                    if (dest) onEngageAutopilot({ ...dest, mode: 'orbit' });
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+                title={isOrbitingThis ? 'Stop Orbit' : 'Orbit'}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); e.preventDefault(); if (isOrbitingThis) { onStopAutopilot(); } else { const dest = buildNavDestination(node); if (dest) onEngageAutopilot({ ...dest, mode: 'orbit' }); } } }}
+              >
+                <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.2" aria-hidden="true">
+                  <ellipse cx="8" cy="8" rx="6" ry="3" />
+                  <circle cx="8" cy="8" r="1.5" fill="currentColor" />
+                </svg>
+              </span>
+            ) : null}
+            {canFollow ? (
+              <span
+                className={`nav-action-btn${isFollowingThis ? ' nav-action-active' : ''}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (isFollowingThis) {
+                    onStopAutopilot();
+                  } else {
+                    const dest = buildNavDestination(node);
+                    if (dest) onEngageAutopilot({ ...dest, mode: 'follow' });
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+                title={isFollowingThis ? 'Stop Following' : 'Follow'}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); e.preventDefault(); if (isFollowingThis) { onStopAutopilot(); } else { const dest = buildNavDestination(node); if (dest) onEngageAutopilot({ ...dest, mode: 'follow' }); } } }}
+              >
+                <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
+                  <path d="M3,8 L10,8 M7,5 L10,8 L7,11" />
                 </svg>
               </span>
             ) : null}
@@ -6155,6 +6471,20 @@ function Navigator({
               onChange={(e) => setSearchQuery(e.currentTarget.value)}
             />
           </div>
+          {autopilotEngaged ? (
+            <div className="navigator-disengage">
+              <span
+                className="navigator-disengage-btn"
+                onClick={() => onStopAutopilot()}
+                role="button"
+                tabIndex={0}
+                title={autopilotMode === 'orbit' ? 'Stop orbiting' : autopilotMode === 'follow' ? 'Stop following' : 'Stop autopilot'}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onStopAutopilot(); } }}
+              >
+                {autopilotMode === 'orbit' ? 'DISENGAGE ORBIT' : autopilotMode === 'follow' ? 'DISENGAGE FOLLOW' : 'DISENGAGE AUTOPILOT'}
+              </span>
+            </div>
+          ) : null}
           <div className="navigator-col-headers">
             <span>Label</span>
             <span>Type</span>
@@ -6330,13 +6660,18 @@ function AutopilotTargetTag({ target, renderPosition, localStateRef }: { target:
   return (
     <PhysicalProxyGroup physicalPosition={tupleAdd(renderPosition, pos)} visibleRange={1_200_000_000}>
       <Html center zIndexRange={[1, 0]}>
-        <div className="cyber-target-tag">
-          <div className="cyber-line-top"></div>
-          <div className="cyber-content">
-            <div className="cyber-id">{distanceLabel}</div>
-            <div className="cyber-name">{target.name.toUpperCase()}</div>
+        <div className="cyber-tag-anchor">
+          {/* SVG: (0,52)=world anchor → (62,0)=label top-left corner */}
+          <svg className="cyber-tag-svg" width="64" height="54">
+            <line x1="0" y1="52" x2="62" y2="0" stroke="#38bdf8" strokeWidth="1" strokeOpacity="0.65" />
+            <circle cx="0" cy="52" r="2.5" fill="#38bdf8" fillOpacity="0.85" />
+          </svg>
+          <div className="cyber-target-tag">
+            <div className="cyber-content">
+              <div className="cyber-id">{distanceLabel}</div>
+              <div className="cyber-name">{target.name.toUpperCase()}</div>
+            </div>
           </div>
-          <div className="cyber-line-bottom"></div>
         </div>
       </Html>
     </PhysicalProxyGroup>
@@ -6366,13 +6701,18 @@ function ShipHighlightTag({ target, localStateRef }: { target: HighlightTarget; 
   return (
     <group ref={groupRef} position={[targetPosition.x, targetPosition.y + 4, targetPosition.z]}>
       <Html center zIndexRange={[1, 0]}>
-        <div className="cyber-target-tag">
-          <div className="cyber-line-top"></div>
-          <div className="cyber-content">
-            <div className="cyber-id">{distanceLabel}</div>
-            <div className="cyber-name">{target.name.toUpperCase()}</div>
+        <div className="cyber-tag-anchor">
+          {/* SVG: (0,52)=world anchor → (62,0)=label top-left corner */}
+          <svg className="cyber-tag-svg" width="64" height="54">
+            <line x1="0" y1="52" x2="62" y2="0" stroke="#38bdf8" strokeWidth="1" strokeOpacity="0.65" />
+            <circle cx="0" cy="52" r="2.5" fill="#38bdf8" fillOpacity="0.85" />
+          </svg>
+          <div className="cyber-target-tag">
+            <div className="cyber-content">
+              <div className="cyber-id">{distanceLabel}</div>
+              <div className="cyber-name">{target.name.toUpperCase()}</div>
+            </div>
           </div>
-          <div className="cyber-line-bottom"></div>
         </div>
       </Html>
     </group>
@@ -6505,7 +6845,25 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
   const nextImpactRef = useRef(0);
 
   useEffect(() => {
-    if (!raycastMeshRef.current) {
+    stationForceFieldImpactHandlers.set(fieldId, (worldHitPoint, fieldCenter) => {
+      const idx = nextImpactRef.current % STATION_FORCE_FIELD_MAX_SPOTS;
+      nextImpactRef.current += 1;
+      const spot = spots[idx];
+      localNormal.copy(worldHitPoint).sub(fieldCenter).normalize();
+      spot.active = true;
+      spot.age = 0;
+      spot.life = STATION_FORCE_FIELD_SPOT_LIFETIME_SECONDS;
+      spot.normal.copy(localNormal);
+    });
+
+    return () => {
+      stationForceFieldImpactHandlers.delete(fieldId);
+    };
+  }, [fieldId, localNormal, spots]);
+
+  useEffect(() => {
+    const mesh = raycastMeshRef.current;
+    if (!mesh) {
       return;
     }
 
@@ -6523,29 +6881,14 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
       return { suppressDefaultImpact: true };
     };
 
-    raycastMeshRef.current.userData.onWeaponImpact = handleShieldImpact;
-    raycastMeshRef.current.userData.suppressWeaponImpactEffect = true;
-    stationForceFieldImpactHandlers.set(fieldId, (worldHitPoint) => {
-      const idx = nextImpactRef.current % STATION_FORCE_FIELD_MAX_SPOTS;
-      nextImpactRef.current += 1;
-      const spot = spots[idx];
-      localHitPoint.copy(worldHitPoint);
-      shieldGroupRef.current?.worldToLocal(localHitPoint);
-      localNormal.copy(localHitPoint).normalize();
-      spot.active = true;
-      spot.age = 0;
-      spot.life = STATION_FORCE_FIELD_SPOT_LIFETIME_SECONDS;
-      spot.normal.copy(localNormal);
-    });
+    mesh.userData.onWeaponImpact = handleShieldImpact;
+    mesh.userData.suppressWeaponImpactEffect = true;
 
     return () => {
-      if (raycastMeshRef.current) {
-        delete raycastMeshRef.current.userData.onWeaponImpact;
-        delete raycastMeshRef.current.userData.suppressWeaponImpactEffect;
-      }
-      stationForceFieldImpactHandlers.delete(fieldId);
+      delete mesh.userData.onWeaponImpact;
+      delete mesh.userData.suppressWeaponImpactEffect;
     };
-  }, [fieldId, localHitPoint, localNormal, radius, spots]);
+  }, [localHitPoint, localNormal, spots]);
 
   useEffect(() => () => {
     shieldTexture.dispose();
@@ -6651,13 +6994,14 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
   return (
     <group ref={shieldGroupRef} userData={{ stationForceFieldId: fieldId, ignoreCameraCollision: true, ignoreOutline: true }}>
       {/* Invisible raycast-only sphere — always present, never visually rendered */}
-      <mesh ref={raycastMeshRef} userData={{ stationForceFieldId: fieldId }}>
+      <mesh ref={raycastMeshRef} userData={{ stationForceFieldId: fieldId }} frustumCulled={false}>
         <sphereGeometry args={[radius, 32, 24]} />
         <meshBasicMaterial transparent opacity={0} depthWrite={false} side={THREE.DoubleSide} colorWrite={false} />
       </mesh>
       <mesh
         ref={shieldMeshRef}
         renderOrder={69}
+        frustumCulled={false}
         userData={{
           ignoreWeaponCollision: true,
           ignoreOutline: true,
@@ -6678,17 +7022,17 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
             #include <logdepthbuf_pars_vertex>
 
             varying vec2 vUv;
-            varying vec3 vWorldPosition;
-            varying vec3 vWorldNormal;
+            varying vec3 vViewPosition;
+            varying vec3 vViewNormal;
             varying vec3 vLocalNormal;
 
             void main() {
               vUv = uv;
               vLocalNormal = normalize(position);
-              vec4 worldPosition = modelMatrix * vec4(position, 1.0);
-              vWorldPosition = worldPosition.xyz;
-              vWorldNormal = normalize(mat3(modelMatrix) * normal);
-              gl_Position = projectionMatrix * viewMatrix * worldPosition;
+              vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+              vViewPosition = mvPosition.xyz;
+              vViewNormal = normalize(normalMatrix * normal);
+              gl_Position = projectionMatrix * mvPosition;
               #include <logdepthbuf_vertex>
             }
           `}
@@ -6704,8 +7048,8 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
             uniform float impactSoftness;
 
             varying vec2 vUv;
-            varying vec3 vWorldPosition;
-            varying vec3 vWorldNormal;
+            varying vec3 vViewPosition;
+            varying vec3 vViewNormal;
             varying vec3 vLocalNormal;
 
             float getRevealMask(vec3 localNormal) {
@@ -6735,8 +7079,8 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
               vec2 tiledUv = vUv * textureRepeat;
               vec4 tex = texture2D(shieldTexture, tiledUv);
               float pattern = clamp(tex.a + dot(tex.rgb, vec3(0.2126, 0.7152, 0.0722)) * 0.35, 0.0, 1.0);
-              vec3 viewDir = normalize(cameraPosition - vWorldPosition);
-              float fresnel = pow(1.0 - max(dot(normalize(vWorldNormal), viewDir), 0.0), 2.4);
+              vec3 viewDir = normalize(-vViewPosition);
+              float fresnel = pow(1.0 - max(dot(normalize(vViewNormal), viewDir), 0.0), 2.4);
               float alpha = reveal * pattern * (0.85 + fresnel * 0.45);
               vec3 color = shieldColor * (0.48 + pattern * 1.15 + fresnel * 0.55);
 
@@ -6837,10 +7181,38 @@ function ShipWeaponEffects({
     () => new THREE.Vector3(SHIP_WEAPON_PROJECTILE_RADIUS, SHIP_WEAPON_PROJECTILE_LENGTH, SHIP_WEAPON_PROJECTILE_RADIUS),
     [],
   );
+  const proxyDir = useMemo(() => new THREE.Vector3(), []);
+  const compressedFieldsRef = useRef<StationForceFieldData[]>([]);
 
   useFrame((frameState, delta) => {
     const state = localStateRef.current;
-    const insideStationForceField = stationForceFields.some((field) => state.shipPosition.distanceToSquared(vectorFromTuple(field.position)) < field.radius ** 2);
+    const cam = frameState.camera;
+
+    // Build proxy-compressed version of stationForceFields each frame so the math
+    // positions match the visual positions produced by PhysicalProxyGroup.
+    const compressedFields = compressedFieldsRef.current;
+    compressedFields.length = stationForceFields.length;
+    for (let fi = 0; fi < stationForceFields.length; fi += 1) {
+      const src = stationForceFields[fi];
+      const fp = vectorFromTuple(src.position);
+      proxyDir.copy(fp).sub(cam.position);
+      const physDist = proxyDir.length();
+      if (physDist <= CELESTIAL_PROXY_LINEAR_DISTANCE || physDist <= 1e-6) {
+        compressedFields[fi] = src;
+      } else {
+        const compDist = compressProxyDistance(physDist, CELESTIAL_PROXY_LINEAR_DISTANCE, CELESTIAL_PROXY_LOG_FACTOR);
+        const proxyScale = clamp(compDist / physDist, MIN_PROXY_SCALE, 1);
+        proxyDir.normalize().multiplyScalar(compDist).add(cam.position);
+        compressedFields[fi] = {
+          id: src.id,
+          position: [proxyDir.x, proxyDir.y, proxyDir.z],
+          radius: src.radius * proxyScale,
+          scale: src.scale * proxyScale,
+        };
+      }
+    }
+
+    const insideStationForceField = compressedFields.some((field) => state.shipPosition.distanceToSquared(vectorFromTuple(field.position)) < field.radius ** 2);
     const shipSpeed = state.shipVelocity.length();
     const isPilotFiring = state.mode === 'pilot' && firingPrimaryRef.current && !insideStationForceField && !autopilotActive && shipSpeed <= 2000;
 
@@ -6926,7 +7298,7 @@ function ShipWeaponEffects({
         projectileDirection.divideScalar(stepDistance);
         raycaster.set(projectile.position, projectileDirection);
         raycaster.far = stepDistance;
-        const forceFieldHit = findStationForceFieldHitOnSegment(projectile.position, nextProjectilePosition, stationForceFields);
+        const forceFieldHit = findStationForceFieldHitOnSegment(projectile.position, nextProjectilePosition, compressedFields);
         raycastTargets.length = 0;
         scene.traverseVisible((object) => {
           if (object instanceof THREE.Mesh && object.parent && !shouldIgnoreWeaponCollision(object, localShipRef, weaponEffectsRef)) {
@@ -6948,8 +7320,9 @@ function ShipWeaponEffects({
           tracerCoreMesh.visible = false;
           tracerGlowMesh.visible = false;
 
+          const forceFieldCenter = vectorFromTuple(forceFieldHit.field.position);
           const handleForceFieldImpact = stationForceFieldImpactHandlers.get(forceFieldHit.field.id);
-          handleForceFieldImpact?.(forceFieldHit.point);
+          handleForceFieldImpact?.(forceFieldHit.point, forceFieldCenter);
 
           const impact = impacts[nextImpactIndexRef.current % impacts.length];
           nextImpactIndexRef.current += 1;
@@ -6957,7 +7330,7 @@ function ShipWeaponEffects({
           impact.age = 0;
           impact.life = SHIP_WEAPON_IMPACT_LIFETIME_SECONDS;
           impact.position.copy(forceFieldHit.point);
-          impactNormal.copy(forceFieldHit.point).sub(vectorFromTuple(forceFieldHit.field.position)).normalize();
+          impactNormal.copy(forceFieldHit.point).sub(forceFieldCenter).normalize();
           impact.normal.copy(impactNormal);
 
           for (let particleIndex = 0; particleIndex < SHIP_WEAPON_IMPACT_PARTICLE_COUNT; particleIndex += 1) {
@@ -7768,23 +8141,28 @@ function PlanetBody({ physicalPosition, planet }: { physicalPosition: Vec3Tuple;
   return (
     <>
       <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={PLANET_VISIBILITY_RANGE}>
-        <AdaptiveBodySurface
-          color={planet.color}
-          lowSegments={20}
-          metalness={0.04}
-          physicalPosition={physicalPosition}
-          radius={planet.radius}
-          roughness={0.96}
-          surfaceTexture={surfaceTexture}
-        />
+        {/* Exclude planet meshes from edge-line shader overlays */}
+        <group userData={{ ignoreOutline: true }}>
+          <AdaptiveBodySurface
+            color={planet.color}
+            lowSegments={20}
+            metalness={0.04}
+            physicalPosition={physicalPosition}
+            radius={planet.radius}
+            roughness={0.96}
+            surfaceTexture={surfaceTexture}
+          />
+        </group>
       </PhysicalProxyGroup>
 
-      <PlanetTerrain
-        planetPosition={physicalPosition}
-        planetRadius={planet.radius}
-        planetId={planet.id}
-        planetColor={planet.color}
-      />
+      <group userData={{ ignoreOutline: true }}>
+        <PlanetTerrain
+          planetPosition={physicalPosition}
+          planetRadius={planet.radius}
+          planetId={planet.id}
+          planetColor={planet.color}
+        />
+      </group>
 
       {planet.stations.map((station) => (
         <SpaceStation key={station.id} station={station} physicalPosition={tupleAdd(physicalPosition, station.position)} scale={PLANET_STATION_SCALE} />
@@ -7804,23 +8182,28 @@ function MoonBody({ moon, physicalPosition }: { moon: MoonData; physicalPosition
   return (
     <>
       <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={PLANET_VISIBILITY_RANGE}>
-        <AdaptiveBodySurface
-          color={moon.color}
-          lowSegments={16}
-          metalness={0.03}
-          physicalPosition={physicalPosition}
-          radius={moon.radius}
-          roughness={0.98}
-          surfaceTexture={surfaceTexture}
-        />
+        {/* Exclude moon meshes from edge-line shader overlays */}
+        <group userData={{ ignoreOutline: true }}>
+          <AdaptiveBodySurface
+            color={moon.color}
+            lowSegments={16}
+            metalness={0.03}
+            physicalPosition={physicalPosition}
+            radius={moon.radius}
+            roughness={0.98}
+            surfaceTexture={surfaceTexture}
+          />
+        </group>
       </PhysicalProxyGroup>
 
-      <PlanetTerrain
-        planetPosition={physicalPosition}
-        planetRadius={moon.radius}
-        planetId={moon.id}
-        planetColor={moon.color}
-      />
+      <group userData={{ ignoreOutline: true }}>
+        <PlanetTerrain
+          planetPosition={physicalPosition}
+          planetRadius={moon.radius}
+          planetId={moon.id}
+          planetColor={moon.color}
+        />
+      </group>
 
       {moon.stations.map((station) => (
         <SpaceStation key={station.id} station={station} physicalPosition={tupleAdd(physicalPosition, station.position)} scale={PLANET_STATION_SCALE} />
@@ -8066,6 +8449,7 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
       instancedMeshRef.current?.setMatrixAt(index, baseMatrices[index]);
     });
     instancedMeshRef.current.instanceMatrix.needsUpdate = true;
+    instancedMeshRef.current.computeBoundingSphere();
 
     const handleDustImpact = (hit: THREE.Intersection<THREE.Object3D>) => {
       const instanceId = hit.instanceId;
@@ -8269,7 +8653,7 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
       logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}
     >
       <group ref={dustGroupRef} visible={show} userData={{ ignoreOutline: true }}>
-        <instancedMesh ref={instancedMeshRef} args={[null as any, null as any, dust.length]}>
+        <instancedMesh ref={instancedMeshRef} args={[null as any, null as any, dust.length]} frustumCulled={false}>
           <dodecahedronGeometry args={[1, 0]} />
           <meshStandardMaterial color="#64748b" roughness={0.96} metalness={0.06} />
         </instancedMesh>

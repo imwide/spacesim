@@ -6,7 +6,7 @@ Make asteroid groups also spawn around planets just like moons.
 Make it possible for planets to have a saturn like asteroid belt around it. Add this to the config of 2 planets already for testing. Add parameters like the starting radius and end radius and the rotation of the ring. The ring/belt should at least from a distance simply be a semi-transparent texture. When getting close enough to a part of the belt, this part should radally around the distance from the camera fade out smoothly. This should happen at 500km. The faded out part should be replaced by 2d billboard sprites that are also semi transparent and have the same color as the ring texture in that position. Eventhough they are semi transparent, them overlapping should not add the color. Getting closer than 50km should spawn actual 3d asteroids just like in the current asteroid groups. The other levels of detail of the belt such as the texture and the billboards should still be visible. To not run into performance issues, introduce frustum culling and introduce your own performance optimizations.
 These single asteroids should obviously not exist as destinations for autopilot.
 
-Improve the "hyperspeed effect" to not be a 2d visual effect ontop of the camera, but to be a "real" 3d effect thats physically around the ship (around 500m distance) and oriented the right way.
+Improve the "hyperspeed effect" to not be a 2d visual effect ontop of the camera, but to be a "real" 3d effect with applied postprocessing thats physically around the ship (around 500m distance) and oriented the right way.
 
 The turning can happen really fast right now. The intensity that the turn and rotation of the ship is started at is really high. it should "fade in" and slowly start turning as it is has a lot of weight
 
@@ -18,27 +18,45 @@ Ship landing in stations needs to work
 
 Add light nodes to the station models. This will allow every station to have a array of relative coordinates (that will also be shown with the debug crosshairs)
 
-Add a "arrival point" to the station configs
+Modify velocity limiters around stations to be less strict, smaller and not apply when outside of the "outermost boundry" sphere of the station and when facing more than 120° away from the station.
 
-The new UI should also show ships that are close to you (within 10km) in the same way as the stations and planets.
-For not only ships but any item less than 10km away, the following options should also exist next to autopilot and highlight:
-- Orbit (should only appear if less than 10km away) should orbit the object at a radius of 2km with a slight 300m vertical offset
-- Follow (should only appear if less than 10km away, only available for ships) should follow the object while never getting closer than 250m
+Fix station safe zone shooting glitch: when the ship's center is still outside of the station's safe zone but one of the ships guns is already inside, the projectiles will fly inside the safe zone and be able to hit targets. Fix this by not firing any guns inside of safe zones aswell as not allowing projectiles to fly inside of safe zones.
 
-Additionally at the top, not item specific but under the search option:
-- Disengage (Should only appear if autopilot, orbit or follow is active) should disengage the current autopilot, orbit or follow and tooltip of this option should show either "Stop autopilot", "Stop orbiting" or "Stop following" depending on which one is active
+Turning collision detector
 
+The highlight tag highlighting an autopilot target currently doesnt clear when the autopilot is disengaged. This is fine, but there should always only be one highlighted tag at a time and no matter what is currently highlighted, under the "disengage autopilot" button in the navigator UI, also add the option to clear the highlighted tag, if there is one, and if its not there because of the autopilot
 
-
-Transparent materials are currently detected and made transparent by certain keywords in their names such as "glass", "window" etc. They should ONLY be made transparent if the name doesnt also contain "opaque" since i use this as a keyword for non transparent "glass" materials
+Ship backwards flying
 
 
+remake styles of inventory and hud-panel UI to match the navigator's UI
 
 BLENDER TODO: decrease glow intensity, apply array, screw stickers dont work/have no outline.
 
 
-Edge triangle collapse: prefer straight edges/aligned with axes edges
+Edge shader triangle collapse: prefer straight edges/aligned with axes edges
 
 Player height is too tall inside the ship. I used a reference in blender that was the same apparent height of 1.7m and its eyelevel was lower than the one in the game.
 
 
+Increase the total length of the hyperspeed lines flyby effect. not the lines themselves but the entire start and end of the effect. make it around 5x longer. Also make the lines themselves fade in and out at the start and end of the effect instead of just appearing and disappearing statically. Additionally the speeds of the lines passing by should be multiplied by 20x
+
+settings
+- keybind settings
+- graphics settings
+- audio settings
+
+
+debug menu (showing fps, triangle count being rendered, memory usage, etc.)
+
+
+When disengaging autopilot at any speed, keep momentum, but as long as the ship is faster than its normal max speed, apply deceleration so that it would be stationary within 20 seconds multiplied by the ships braking multiplier
+
+Add targeting option in the navigator UI which will always make the ship point to the target.
+
+
+New skybox
+
+
+
+if any mesh inside a glb file has the word "organic" in its name, the "blender" like edge shader should not be applied but instead the old outline shader should be applied. Also rename this old outline shader to the "organic outline shader" and the blender like edge shader to the "geometric edge shader".

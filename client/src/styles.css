@@ -712,6 +712,36 @@ button {
   color: #555;
 }
 
+/* ── Disengage Button ─────── */
+
+.navigator-disengage {
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid rgba(80, 80, 90, 0.4);
+}
+
+.navigator-disengage-btn {
+  display: block;
+  width: 100%;
+  padding: 0.35rem 0;
+  text-align: center;
+  font-family: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #e8c87a;
+  background: rgba(200, 168, 110, 0.12);
+  border: 1px solid rgba(200, 168, 110, 0.3);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s, color 0.15s;
+}
+
+.navigator-disengage-btn:hover {
+  background: rgba(200, 168, 110, 0.25);
+  color: #fff;
+}
+
 /* ── Column Headers ─────── */
 
 .navigator-col-headers {
@@ -841,7 +871,8 @@ button {
 .nav-tree-icon-moon svg,
 .nav-tree-icon-station svg,
 .nav-tree-icon-asteroid-belt svg,
-.nav-tree-icon-asteroid-object svg {
+.nav-tree-icon-asteroid-object svg,
+.nav-tree-icon-ship svg {
   display: block;
 }
 
@@ -1014,44 +1045,45 @@ button {
 }
 
 
+/* anchor div sits centered at the 3D world position */
+.cyber-tag-anchor {
+  position: relative;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  user-select: none;
+  overflow: visible;
+}
+
+/* SVG draws the connector line from anchor (0,52) to label corner (62,0) */
+.cyber-tag-svg {
+  position: absolute;
+  left: 0;
+  top: -52px;
+  overflow: visible;
+  pointer-events: none;
+}
+
+/* label box — top-left corner sits at SVG coordinate (62,0) = anchor+(62,-52) */
 .cyber-target-tag {
   pointer-events: none;
   user-select: none;
   color: #38bdf8;
   font-family: monospace;
   font-size: 11px;
-  position: relative;
+  position: absolute;
+  left: 62px;
+  top: -52px;
   text-transform: uppercase;
   white-space: nowrap;
-  transform: translate(20px, -20px);
-}
-
-.cyber-line-top {
-  position: absolute;
-  top: -8px;
-  left: -20px;
-  width: 40px;
-  height: 20px;
-  border-top: 1px solid #0ea5e9;
-  border-left: 1px solid #0ea5e9;
-  transform: skewX(-45deg);
-}
-
-.cyber-line-bottom {
-  position: absolute;
-  bottom: -4px;
-  right: -10px;
-  width: 40px;
-  height: 10px;
-  border-bottom: 1px solid #0ea5e9;
-  border-right: 1px solid #0ea5e9;
 }
 
 .cyber-content {
-  background: rgba(4, 20, 36, 0.7);
-  border: 1px solid rgba(14, 165, 233, 0.4);
+  background: rgba(4, 20, 36, 0.75);
+  border: 1px solid rgba(14, 165, 233, 0.45);
   padding: 4px 8px;
   backdrop-filter: blur(4px);
+  box-shadow: 0 0 14px rgba(14, 165, 233, 0.18);
 }
 
 .cyber-id {
