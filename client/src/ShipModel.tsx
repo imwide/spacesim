@@ -3,7 +3,7 @@ import { useFrame } from '@react-three/fiber';
 import { type MutableRefObject, type ReactElement, useEffect, useMemo, useRef } from 'react';
 import * as THREE from 'three';
 import type { ShipConfig } from './shipConfig';
-import { setupLODs } from './lod';
+import { fixGLBTransparency, setupLODs } from './lod';
 
 // ─── Pilot seat outline (inverted-hull method) ─────────────────────────────
 
@@ -191,6 +191,8 @@ function useShipCollectionScene(
 
     // Apply LODs on whatever root we ended up with
     lodRefs.current = setupLODs(root);
+    // Fix glass/window materials that were exported as OPAQUE in Blender
+    fixGLBTransparency(root);
 
     return root;
   }, [scene, config, layer]);

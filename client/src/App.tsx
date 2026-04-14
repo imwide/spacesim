@@ -1,5 +1,5 @@
 import { Html, useGLTF } from '@react-three/drei';
-import { setupLODs } from './lod';
+import { fixGLBTransparency, setupLODs } from './lod';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { type ShipConfig, getShipConfig, DEFAULT_SHIP_ID } from './shipConfig';
 import {
@@ -8576,6 +8576,7 @@ function StationModel({ modelPath }: { modelPath: string }): ReactElement {
   const clonedScene = useMemo(() => {
     const cloned = scene.clone(true);
     lodRefs.current = setupLODs(cloned);
+    fixGLBTransparency(cloned);
     return cloned;
   }, [scene]);
 

@@ -324,3 +324,61 @@ function finalizeLOD(lod: THREE.LOD): void {
     lod.userData.cullDistance = sphere.radius * 150;
   }
 }
+
+// ── GLB transparency fix ──────────────────────────────────────────────────────
+
+/**
+ * Material name substrings (case-insensitive) that indicate a glass / transparent
+ * surface.  Blender's GLTF exporter exports these as alphaMode:OPAQUE when the
+ * material's "Blend Mode" is not set to "Alpha Blend" in the shader properties
+ * panel, causing Three.js to render them fully opaque.  This helper detects those
+ * materials by name and patches in the correct transparency settings.
+ */
+const TRANSPARENT_NAME_PATTERNS: readonly string[] = [
+  'window',
+  'transparent',
+  'glass',
+  'crystal',
+];
+
+/**
+ * Opacity applied to glass-like materials that were exported without
+ * alphaMode:BLEND (i.e. the exporter discarded the alpha channel).
+ */
+const GLASS_DEFAULT_OPACITY = 0.25;
+
+/**
+ * Traverses a (cloned) GLB scene and enables proper WebGL transparency on any
+ * material whose name matches {@link TRANSPARENT_NAME_PATTERNS}.
+ *
+ * Call this once per cloned scene, before or after {@link setupLODs}.  The fix
+ * is inherited by subsequent `material.clone()` calls because `THREE.Material`
+ * cloning preserves all properties.
+ */
+export function fixGLBTransparency(scene: THREE.Object3D): void {
+  scene.traverse((node) => {
+    if (!(node as THREE.Mesh).isMesh) return;
+    const mesh = node as THREE.Mesh;
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+
+    for (const material of materials) {
+      if (!material) continue;
+      // Already correctly transparent (e.g. alphaMode:BLEND was set in Blender)
+      if (material.transparent && material.opacity < 1.0) continue;
+
+      const nameLower = (material.name ?? '').toLowerCase();
+      const isGlass = TRANSPARENT_NAME_PATTERNS.some((p) => nameLower.includes(p));
+      if (!isGlass) continue;
+
+      material.transparent = true;
+      material.depthWrite = false;
+      material.side = THREE.DoubleSide;
+      // Only override opacity when the exporter baked it as fully opaque (1.0),
+      // which happens when Blend Mode was left at "Opaque" in Blender.
+      if (material.opacity >= 1.0) {
+        material.opacity = GLASS_DEFAULT_OPACITY;
+      }
+      material.needsUpdate = true;
+    }
+  });
+}

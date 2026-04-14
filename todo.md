@@ -16,7 +16,7 @@ Ship collisions with stations and asteroids need to work
 
 Ship landing in stations needs to work
 
-Add light sequences to the station configs. This will allow every station to have a array of relative coordinates (that will also be shown with the debug crosshairs)
+Add light nodes to the station models. This will allow every station to have a array of relative coordinates (that will also be shown with the debug crosshairs)
 
 Add a "arrival point" to the station configs
 
@@ -25,7 +25,14 @@ Remove space tablet in favor of a new UI
 
 BLENDER TODO: decrease glow intensity, apply array, screw stickers dont work/have no outline.
 
-Make transparent shaders work. I have some glass materials that are a blender "transparent" node mixed with a color node to be transparent while retaining some color. currently they are opaque in game
-
 
 Line/Edge shader currently collapses more than just triangles. It also collapses quads on flat surfaces but it shouldnt because if i made quads on flat surfaces, its on purpose to display edge lines as details.
+It should work like an optimized version of this:
+if two triangles share a hypotenuse and face the exact same direction (normals are the same) and their other two edges are the same length respectivley, do not render the shared hypotenuse as an edge and exclude the remaining 4 edges from future consideration of being eliminated as well, so they are rendered as edges for sure.
+
+
+The lighting in the "shadow" areas / the direction of faces where light doesnt hit, is really flat right now. Can you make the faces that do not face the light source/star even darker with more  contrast so they are not all one color. Do not change the brightness of the light source and the brightness of the faces that do face the light source.
+
+
+
+replace the manual locations in ship configs with nodes in the glb models
