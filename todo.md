@@ -25,8 +25,6 @@ Remove space tablet in favor of a new UI
 
 BLENDER TODO: decrease glow intensity, apply array, screw stickers dont work/have no outline.
 
-The ship model has a very weird blue tint but only the exterior model.
-
 Make transparent shaders work. I have some glass materials that are a blender "transparent" node mixed with a color node to be transparent while retaining some color. currently they are opaque in game
 
 

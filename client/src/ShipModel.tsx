@@ -33,7 +33,7 @@ export interface ShipInteriorCollisionData {
   bounds: THREE.Box3;
   standingHeight: number;
   /** World-space position of the pilot seat (extracted from the GLB interior).
-   *  null if no object with "pilot_seat" in its name was found. */
+   *  null if no object with "pilot_chair" in its name was found. */
   pilotSeatPosition: THREE.Vector3 | null;
   /** The mesh objects that make up the pilot seat (for outline rendering). */
   pilotSeatMeshes: THREE.Mesh[];
@@ -223,35 +223,30 @@ export function useShipInteriorCollisionData(config: ShipConfig): ShipInteriorCo
     const pilotSeatMeshes: THREE.Mesh[] = [];
     let pilotSeatPosition: THREE.Vector3 | null = null;
 
+    // First pass: identify pilot_chair nodes and collect their meshes (deduplicated)
+    const seatNodeSet = new Set<THREE.Object3D>();
     interiorRoot.traverse((child) => {
-      // Detect pilot seat objects by name (any node whose name contains "pilot_seat")
-      if (child.name.toLowerCase().includes('pilot_seat')) {
-        // Use the world position of the first match as seat position
-        if (!pilotSeatPosition) {
-          pilotSeatPosition = new THREE.Vector3();
-          child.getWorldPosition(pilotSeatPosition);
-          // Transform into interior-collision space (180° Y rotation)
-          pilotSeatPosition.applyMatrix4(INTERIOR_COLLIDER_ROTATION);
-        }
-        // Collect all meshes in the pilot seat subtree for outline rendering
+      if (child.name.toLowerCase().includes('pilot_chair') && !seatNodeSet.has(child)) {
+        seatNodeSet.add(child);
         if ((child as THREE.Mesh).isMesh) {
           pilotSeatMeshes.push(child as THREE.Mesh);
         }
         child.traverse((sub) => {
-          if (sub !== child && (sub as THREE.Mesh).isMesh) {
-            pilotSeatMeshes.push(sub as THREE.Mesh);
+          if (sub !== child && !seatNodeSet.has(sub)) {
+            seatNodeSet.add(sub);
+            if ((sub as THREE.Mesh).isMesh) {
+              pilotSeatMeshes.push(sub as THREE.Mesh);
+            }
           }
         });
       }
+    });
 
-      if (!(child as THREE.Mesh).isMesh) {
-        return;
-      }
-
+    // Second pass: bake all interior meshes for collision + compute pilot seat position
+    interiorRoot.traverse((child) => {
+      if (!(child as THREE.Mesh).isMesh) return;
       const mesh = child as THREE.Mesh;
-      if (!mesh.geometry) {
-        return;
-      }
+      if (!mesh.geometry) return;
 
       const bakedGeometry = mesh.geometry.clone();
       const bakedMatrix = INTERIOR_COLLIDER_ROTATION.clone().multiply(mesh.matrixWorld);
@@ -266,6 +261,13 @@ export function useShipInteriorCollisionData(config: ShipConfig): ShipInteriorCo
 
       if (bakedGeometry.boundingBox) {
         bounds.union(bakedGeometry.boundingBox);
+      }
+
+      // Derive pilot seat position from the baked geometry center of the first seat mesh.
+      // This puts the position in the exact same coordinate space as the player movement.
+      if (seatNodeSet.has(child) && bakedGeometry.boundingBox && !pilotSeatPosition) {
+        pilotSeatPosition = new THREE.Vector3();
+        bakedGeometry.boundingBox.getCenter(pilotSeatPosition);
       }
     });
 
@@ -292,11 +294,10 @@ export function useShipInteriorCollisionData(config: ShipConfig): ShipInteriorCo
 
 interface ShipExteriorModelProps {
   config: ShipConfig;
-  highlight?: boolean;
   showDebugAnchors?: boolean;
 }
 
-export function ShipExteriorModel({ config, highlight = false, showDebugAnchors = true }: ShipExteriorModelProps): ReactElement {
+export function ShipExteriorModel({ config, showDebugAnchors = true }: ShipExteriorModelProps): ReactElement {
   const { clonedScene, lodRefs } = useShipCollectionScene(config, 'exterior');
 
   // Mark as non-collidable and clone materials for per-instance tinting
@@ -314,22 +315,6 @@ export function ShipExteriorModel({ config, highlight = false, showDebugAnchors 
       }
     });
   }, [clonedScene]);
-
-  // Apply highlight tint when requested (e.g. player's own ship)
-  useEffect(() => {
-    clonedScene.traverse((child) => {
-      if ((child as THREE.Mesh).isMesh) {
-        const mesh = child as THREE.Mesh;
-        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-        for (const mat of mats) {
-          if (mat instanceof THREE.MeshStandardMaterial) {
-            mat.emissive.set(highlight ? 0x2563eb : 0x000000);
-            mat.emissiveIntensity = highlight ? 0.12 : 0;
-          }
-        }
-      }
-    });
-  }, [clonedScene, highlight]);
 
   // Per-frame LOD updates
   const tmpV = useMemo(() => new THREE.Vector3(), []);
@@ -390,13 +375,14 @@ export function ShipInteriorModel({ config, showDebugAnchors = true, seatOutline
     if (!group) return;
 
     clonedScene.traverse((child) => {
-      if (!child.name.toLowerCase().includes('pilot_seat')) return;
+      if (!child.name.toLowerCase().includes('pilot_chair')) return;
       const addOutline = (obj: THREE.Object3D) => {
         if (!(obj as THREE.Mesh).isMesh) return;
         const mesh = obj as THREE.Mesh;
         if (!mesh.geometry) return;
         const outlineMesh = new THREE.Mesh(mesh.geometry, SEAT_OUTLINE_MATERIAL);
         outlineMesh.matrixAutoUpdate = false;
+        outlineMesh.matrixWorldAutoUpdate = false;
         outlineMesh.userData.ignoreCameraCollision = true;
         outlineMesh.userData.ignoreOutline = true;
         outlineMesh.userData.isBlenderEdgeOverlay = true;

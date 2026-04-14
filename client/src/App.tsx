@@ -108,8 +108,15 @@ const THIRD_PERSON_CAMERA_COLLISION_BUFFER = 0.45;
 const THIRD_PERSON_CAMERA_TERRAIN_SAMPLES = 10;
 const PLAYER_COLLISION_RADIUS = 0.46;
 const BOARDING_RADIUS_METERS = 10 * METERS_PER_WORLD_UNIT;
-const SEAT_INTERACTION_DISTANCE_METERS = 1.15 * METERS_PER_WORLD_UNIT;
+const SEAT_INTERACTION_DISTANCE_METERS = 2.0 * METERS_PER_WORLD_UNIT;
 const INTERIOR_COLLISION_RADIUS = 0.28;
+
+/** Horizontal (XZ-plane) distance — ignores Y so floor-vs-seat height doesn't matter. */
+function xzDistance(a: THREE.Vector3, b: THREE.Vector3): number {
+  const dx = a.x - b.x;
+  const dz = a.z - b.z;
+  return Math.sqrt(dx * dx + dz * dz);
+}
 const INTERIOR_STEP_HEIGHT = 0.3;
 const INTERIOR_GROUND_SNAP_DISTANCE = 0.22;
 const INTERIOR_CEILING_PADDING = 0.12;
@@ -4847,7 +4854,7 @@ function GameScene({
 
       // Pilot seat outline: show when within range and looking toward the seat
       if (interiorCollision.pilotSeatPosition) {
-        const seatDist = state.interiorPosition.distanceTo(interiorCollision.pilotSeatPosition);
+        const seatDist = xzDistance(state.interiorPosition, interiorCollision.pilotSeatPosition);
         if (seatDist < SEAT_INTERACTION_DISTANCE_METERS) {
           const toSeat = interiorCollision.pilotSeatPosition.clone().sub(state.interiorPosition).normalize();
           const lookDir = new THREE.Vector3(0, 0, -1).applyQuaternion(lookRotation);
@@ -4861,7 +4868,7 @@ function GameScene({
         seatOutlineVisibleRef.current = false;
       }
 
-      if (consumeAction('KeyF') && interiorCollision.pilotSeatPosition && state.interiorPosition.distanceTo(interiorCollision.pilotSeatPosition) < SEAT_INTERACTION_DISTANCE_METERS) {
+      if (consumeAction('KeyF') && interiorCollision.pilotSeatPosition && xzDistance(state.interiorPosition, interiorCollision.pilotSeatPosition) < SEAT_INTERACTION_DISTANCE_METERS) {
         state.mode = 'pilot';
         state.insideShip = true;
         state.shipAngularVelocity.set(0, 0, 0);
@@ -5274,7 +5281,7 @@ function GameScene({
       const entryWorldHud = shipConfig.entryPointVec.clone().applyQuaternion(state.shipRotation).add(state.shipPosition);
       const entryDist = state.position.distanceTo(entryWorldHud);
       const canEnter = (state.mode === 'space' || state.mode === 'planet-surface') && entryDist < BOARDING_RADIUS_METERS;
-      const canPilot = state.mode === 'interior' && interiorCollision.pilotSeatPosition != null && state.interiorPosition.distanceTo(interiorCollision.pilotSeatPosition) < SEAT_INTERACTION_DISTANCE_METERS;
+      const canPilot = state.mode === 'interior' && interiorCollision.pilotSeatPosition != null && xzDistance(state.interiorPosition, interiorCollision.pilotSeatPosition) < SEAT_INTERACTION_DISTANCE_METERS;
       const shipSpeed = state.shipVelocity.length();
       const speed = state.mode === 'pilot' ? shipSpeed : state.mode === 'space' || state.mode === 'planet-surface' ? state.velocity.length() : walkSpeed(state);
       const stationSpeedLimitInfo = state.mode === 'pilot'
@@ -5415,7 +5422,7 @@ function GameScene({
       <ShipWeaponEffects autopilotActive={autopilotActive} firingPrimaryRef={firingPrimaryRef} localShipRef={shipGroupRef} localStateRef={localStateRef} stationForceFields={stationForceFields} shipConfig={shipConfig} />
       <group ref={shipGroupRef} userData={{ ignoreCameraCollision: true }}>
         <ShipThrusterEffects localStateRef={localStateRef} shipConfig={shipConfig} />
-        <ShipExteriorModel config={shipConfig} highlight showDebugAnchors={showDebugAnchors} />
+        <ShipExteriorModel config={shipConfig} showDebugAnchors={showDebugAnchors} />
       </group>
       {highlightedTarget?.kind === 'ship' && (mode === 'space' || mode === 'planet-surface') ? (
         <ShipHighlightTag target={highlightedTarget} localStateRef={localStateRef} />
