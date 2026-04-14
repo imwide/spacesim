@@ -7044,6 +7044,363 @@ function createLensFlareTexture(): THREE.CanvasTexture {
   return texture;
 }
 
+function createNebulaSkyTexture(seedKey: string): THREE.CanvasTexture {
+  const width = 2048;
+  const height = 1024;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d');
+  const texture = new THREE.CanvasTexture(canvas);
+
+  if (!context) {
+    finalizeSurfaceTexture(texture);
+    return texture;
+  }
+
+  const random = createSeededRandom(hashString(seedKey));
+
+  const background = context.createLinearGradient(0, 0, 0, height);
+  background.addColorStop(0, '#040715');
+  background.addColorStop(0.42, '#070d18');
+  background.addColorStop(0.75, '#0a1018');
+  background.addColorStop(1, '#060911');
+  context.fillStyle = background;
+  context.fillRect(0, 0, width, height);
+
+  context.save();
+  for (let dust = 0; dust < 2500; dust += 1) {
+    const x = random() * width;
+    const y = random() * height;
+    const alpha = 0.01 + random() * 0.05;
+    const size = 0.4 + random() * 1.6;
+    context.fillStyle = `rgba(${170 + Math.floor(random() * 70)}, ${185 + Math.floor(random() * 45)}, ${190 + Math.floor(random() * 55)}, ${alpha})`;
+    context.beginPath();
+    context.arc(x, y, size, 0, Math.PI * 2);
+    context.fill();
+  }
+  context.restore();
+
+  const vignette = context.createRadialGradient(width * 0.5, height * 0.5, width * 0.15, width * 0.5, height * 0.5, width * 0.78);
+  vignette.addColorStop(0, 'rgba(0, 0, 0, 0)');
+  vignette.addColorStop(0.8, 'rgba(0, 0, 0, 0.12)');
+  vignette.addColorStop(1, 'rgba(0, 0, 0, 0.34)');
+  context.fillStyle = vignette;
+  context.fillRect(0, 0, width, height);
+
+  finalizeSurfaceTexture(texture);
+  return texture;
+}
+
+function createSkyGlowTexture(): THREE.CanvasTexture {
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const context = canvas.getContext('2d');
+  const texture = new THREE.CanvasTexture(canvas);
+
+  if (!context) {
+    finalizeSurfaceTexture(texture);
+    return texture;
+  }
+
+  const center = size / 2;
+  const halo = context.createRadialGradient(center, center, 0, center, center, center * 0.92);
+  halo.addColorStop(0, 'rgba(255,255,255,1)');
+  halo.addColorStop(0.08, 'rgba(255,250,244,0.98)');
+  halo.addColorStop(0.22, 'rgba(195,228,255,0.48)');
+  halo.addColorStop(0.55, 'rgba(138,188,255,0.14)');
+  halo.addColorStop(1, 'rgba(138,188,255,0)');
+  context.fillStyle = halo;
+  context.fillRect(0, 0, size, size);
+
+  context.save();
+  context.translate(center, center);
+  const spikePalette = ['rgba(255,255,255,0.82)', 'rgba(188,223,255,0.45)', 'rgba(160,214,255,0.25)'];
+  [0, Math.PI / 4].forEach((rotation, index) => {
+    context.save();
+    context.rotate(rotation);
+    const spikeGradient = context.createLinearGradient(-center * 0.9, 0, center * 0.9, 0);
+    spikeGradient.addColorStop(0, 'rgba(255,255,255,0)');
+    spikeGradient.addColorStop(0.5, spikePalette[index] ?? spikePalette[0]);
+    spikeGradient.addColorStop(1, 'rgba(255,255,255,0)');
+    context.fillStyle = spikeGradient;
+    context.fillRect(-center * 0.92, -3 - index * 1.2, center * 1.84, 6 + index * 2.4);
+    context.restore();
+  });
+  context.restore();
+
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function createGalaxySpriteTexture(seedKey: string): THREE.CanvasTexture {
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const context = canvas.getContext('2d');
+  const texture = new THREE.CanvasTexture(canvas);
+
+  if (!context) {
+    finalizeSurfaceTexture(texture);
+    return texture;
+  }
+
+  const random = createSeededRandom(hashString(seedKey));
+  const center = size / 2;
+  const rotation = random() * Math.PI;
+
+  context.save();
+  context.translate(center, center);
+  context.rotate(rotation);
+  context.scale(1.5, 0.55);
+
+  const outerHalo = context.createRadialGradient(0, 0, 0, 0, 0, center * 0.94);
+  outerHalo.addColorStop(0, 'rgba(255,240,220,0.12)');
+  outerHalo.addColorStop(0.35, 'rgba(182,212,255,0.08)');
+  outerHalo.addColorStop(1, 'rgba(0,0,0,0)');
+  context.fillStyle = outerHalo;
+  context.beginPath();
+  context.arc(0, 0, center * 0.94, 0, Math.PI * 2);
+  context.fill();
+
+  for (let arm = 0; arm < 2; arm += 1) {
+    context.save();
+    context.rotate((Math.PI * arm) / 1.02);
+    for (let step = 0; step < 170; step += 1) {
+      const t = step / 170;
+      const angle = t * Math.PI * 2.2;
+      const radius = 6 + t * center * 0.72;
+      const spread = (1 - t) * 7;
+      const x = Math.cos(angle) * radius + (random() - 0.5) * spread;
+      const y = Math.sin(angle) * radius * 0.36 + (random() - 0.5) * spread * 0.26;
+      const sizePx = 0.8 + random() * 2.1;
+      context.fillStyle = `rgba(${210 + Math.floor(random() * 35)}, ${220 + Math.floor(random() * 20)}, ${235 + Math.floor(random() * 20)}, ${0.04 + (1 - t) * 0.1})`;
+      context.beginPath();
+      context.arc(x, y, sizePx, 0, Math.PI * 2);
+      context.fill();
+    }
+    context.restore();
+  }
+
+  const core = context.createRadialGradient(0, 0, 0, 0, 0, center * 0.28);
+  core.addColorStop(0, 'rgba(255,255,255,1)');
+  core.addColorStop(0.38, 'rgba(255,239,220,0.86)');
+  core.addColorStop(0.8, 'rgba(215,235,255,0.16)');
+  core.addColorStop(1, 'rgba(215,235,255,0)');
+  context.fillStyle = core;
+  context.beginPath();
+  context.arc(0, 0, center * 0.3, 0, Math.PI * 2);
+  context.fill();
+  context.restore();
+
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+type SkyFeatureSprite = {
+  color: string;
+  opacity: number;
+  position: Vec3Tuple;
+  rotation?: number;
+  scale: [number, number, number];
+  texture: 'glow' | 'galaxy';
+};
+
+function GalaxySkybox(): ReactElement {
+  const { camera } = useThree();
+  const groupRef = useRef<THREE.Group>(null);
+  const skyRadius = 9_000_000;
+  const starRadius = skyRadius * 0.965;
+  const featureRadius = skyRadius * 0.94;
+  const nebulaTexture = useMemo(() => createNebulaSkyTexture('spacesim-skybox-v2'), []);
+  const glowTexture = useMemo(() => createSkyGlowTexture(), []);
+  const galaxyTextureA = useMemo(() => createGalaxySpriteTexture('spacesim-galaxy-a'), []);
+  const galaxyTextureB = useMemo(() => createGalaxySpriteTexture('spacesim-galaxy-b'), []);
+
+  const makeSpherePoint = useCallback((radius: number, u: number, v: number): Vec3Tuple => {
+    const y = 2 * v - 1;
+    const ring = Math.sqrt(Math.max(0, 1 - y * y));
+    const theta = u * Math.PI * 2;
+    return [
+      Math.cos(theta) * ring * radius,
+      y * radius,
+      Math.sin(theta) * ring * radius,
+    ];
+  }, []);
+
+  const starLayers = useMemo(() => {
+    const random = createSeededRandom(hashString('spacesim-sky-stars-vx-82'));
+    const configs = [
+      { count: 1800, size: 0.8, opacity: 0.8 },
+      { count: 950, size: 1.15, opacity: 0.88 },
+      { count: 420, size: 1.6, opacity: 0.95 },
+    ];
+
+    return configs.map((config, layerIndex) => {
+      const positions = new Float32Array(config.count * 3);
+      const colors = new Float32Array(config.count * 3);
+
+      for (let index = 0; index < config.count; index += 1) {
+        const [x, y, z] = makeSpherePoint(starRadius - layerIndex * 45_000, random(), random());
+        const offset = index * 3;
+        positions[offset] = x;
+        positions[offset + 1] = y;
+        positions[offset + 2] = z;
+
+        const brightness = 0.74 + random() * 0.26;
+        const coolBias = random();
+        colors[offset] = brightness;
+        colors[offset + 1] = THREE.MathUtils.lerp(0.9, 1, coolBias);
+        colors[offset + 2] = THREE.MathUtils.lerp(0.92, 1, 1 - coolBias * 0.7);
+      }
+
+      return {
+        colors,
+        opacity: config.opacity,
+        positions,
+        size: config.size,
+      };
+    });
+  }, [makeSpherePoint, starRadius]);
+
+  const featureSprites = useMemo<SkyFeatureSprite[]>(() => {
+    const random = createSeededRandom(hashString('spacesim-sky-features-v2'));
+    const sprites: SkyFeatureSprite[] = [];
+
+    const glowColors = ['#ffffff', '#d6f0ff', '#9fe7ff', '#d8fbff', '#b7d7ff'];
+    for (let index = 0; index < 8; index += 1) {
+      const position = makeSpherePoint(featureRadius, random(), 0.2 + random() * 0.6);
+      const scale = 280_000 + random() * 210_000;
+      sprites.push({
+        color: glowColors[index % glowColors.length] ?? '#ffffff',
+        opacity: 0.58 + random() * 0.2,
+        position,
+        rotation: random() * Math.PI,
+        scale: [scale, scale, 1],
+        texture: 'glow',
+      });
+    }
+
+    for (let index = 0; index < 5; index += 1) {
+      const position = makeSpherePoint(featureRadius * 0.988, random(), 0.18 + random() * 0.64);
+      const width = 620_000 + random() * 460_000;
+      const height = width * (0.34 + random() * 0.18);
+      sprites.push({
+        color: index % 2 === 0 ? '#eef7ff' : '#dcecff',
+        opacity: 0.28 + random() * 0.12,
+        position,
+        rotation: random() * Math.PI,
+        scale: [width, height, 1],
+        texture: 'galaxy',
+      });
+    }
+
+    return sprites;
+  }, [featureRadius, makeSpherePoint]);
+
+  useEffect(() => {
+    return () => {
+      nebulaTexture.dispose();
+      glowTexture.dispose();
+      galaxyTextureA.dispose();
+      galaxyTextureB.dispose();
+    };
+  }, [galaxyTextureA, galaxyTextureB, glowTexture, nebulaTexture]);
+
+  useFrame(() => {
+    if (!groupRef.current) {
+      return;
+    }
+    groupRef.current.position.copy(camera.position);
+  });
+
+  return (
+    <group
+      ref={groupRef}
+      renderOrder={-1000}
+      userData={{
+        ignoreCameraCollision: true,
+        ignoreMarkerOcclusion: true,
+        ignoreOutline: true,
+        ignoreStarOcclusion: true,
+      }}
+    >
+      <mesh frustumCulled={false} renderOrder={-1000} userData={{ ignoreMarkerOcclusion: true, ignoreOutline: true, ignoreStarOcclusion: true }}>
+        <sphereGeometry args={[skyRadius, 64, 32]} />
+        <meshBasicMaterial
+          map={nebulaTexture}
+          side={THREE.BackSide}
+          toneMapped={false}
+          depthWrite={false}
+          depthTest={false}
+          fog={false}
+        />
+      </mesh>
+
+      {starLayers.map((layer, index) => (
+        <points
+          key={`sky-stars-${index}`}
+          frustumCulled={false}
+          renderOrder={-999 + index}
+          userData={{ ignoreMarkerOcclusion: true, ignoreOutline: true, ignoreStarOcclusion: true }}
+        >
+          <bufferGeometry>
+            <bufferAttribute attach="attributes-position" args={[layer.positions, 3]} />
+            <bufferAttribute attach="attributes-color" args={[layer.colors, 3]} />
+          </bufferGeometry>
+          <pointsMaterial
+            vertexColors
+            size={layer.size}
+            sizeAttenuation={false}
+            transparent
+            opacity={layer.opacity}
+            depthWrite={false}
+            depthTest
+            blending={THREE.AdditiveBlending}
+            toneMapped={false}
+            fog={false}
+          />
+        </points>
+      ))}
+
+      {featureSprites.map((sprite, index) => {
+        const texture = sprite.texture === 'galaxy' ? (index % 2 === 0 ? galaxyTextureA : galaxyTextureB) : glowTexture;
+        return (
+          <sprite
+            key={`sky-feature-${index}`}
+            position={sprite.position}
+            scale={sprite.scale}
+            renderOrder={-990 + index}
+            userData={{ ignoreMarkerOcclusion: true, ignoreOutline: true, ignoreStarOcclusion: true }}
+          >
+            <spriteMaterial
+              attach="material"
+              map={texture}
+              color={sprite.color}
+              rotation={sprite.rotation ?? 0}
+              transparent
+              opacity={sprite.opacity}
+              depthWrite={false}
+              depthTest
+              toneMapped={false}
+              blending={THREE.AdditiveBlending}
+            />
+          </sprite>
+        );
+      })}
+    </group>
+  );
+}
+
 function GalaxyBackdrop({
   activeFrameOrigin,
   activeSystemId,
@@ -7064,6 +7421,7 @@ function GalaxyBackdrop({
 
   return (
     <group>
+      <GalaxySkybox />
       <GalaxyStarMarkers activeSystemId={activeSystemId} activeSystemPosition={activeSystemPosition} galaxy={galaxy} />
       {activeSystem ? <StarSystem autopilotTarget={autopilotTarget} highlightedTarget={highlightedTarget} renderPosition={toFrameLocalPosition([0, 0, 0], activeFrameOrigin)} system={activeSystem} localStateRef={localStateRef} /> : null}
     </group>

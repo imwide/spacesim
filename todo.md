@@ -45,6 +45,8 @@ Add targeting option in the navigator UI which will always make the ship point t
 
 Make ship slowly turn horizontal while no user input
 
+-2.79638
 
+-7.28286
 
 if any mesh inside a glb file has the word "organic" in its name, the "blender" like edge shader should not be applied but instead the old outline shader should be applied. Also rename this old outline shader to the "organic outline shader" and the blender like edge shader to the "geometric edge shader".
