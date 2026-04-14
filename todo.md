@@ -28,7 +28,6 @@ BLENDER TODO: decrease glow intensity, apply array, screw stickers dont work/hav
 
 
 
-The lighting in the "shadow" areas / the direction of faces where light doesnt hit is really flat right now. Faces that are 90° in difference have the exact same sahde even as long as they face away from the sun/star. Can you make the faces that do not face the light source/star even darker with more contrast so they are not all one color. Do not change the brightness of the light source and the brightness of the faces that do face the light source.
 
 
 Player height is too tall inside the ship. I used a reference in blender that was the same apparent height of 1.7m and its eyelevel was lower than the one in the game.
