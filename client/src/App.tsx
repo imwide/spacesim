@@ -3785,6 +3785,7 @@ function SunDirectionalLight({
   localStateRef: MutableRefObject<LocalGameState>;
 }): ReactElement {
   const lightRef = useRef<THREE.DirectionalLight>(null);
+  const hemiRef = useRef<THREE.HemisphereLight>(null);
   const systemSpaceShipPosition = useMemo(() => new THREE.Vector3(), []);
   const frameOriginVector = useMemo(() => new THREE.Vector3(), []);
 
@@ -3807,6 +3808,12 @@ function SunDirectionalLight({
     // DirectionalLight shines from `position` toward its target (origin by default).
     // Invert the direction so the incoming light matches the star position visually.
     light.position.copy(systemSpaceShipPosition).multiplyScalar(-1e6);
+
+    // Hemisphere light "sky" direction tracks the sun so shadow-side faces
+    // receive normal-dependent ambient variation instead of a flat colour.
+    if (hemiRef.current) {
+      hemiRef.current.position.copy(light.position);
+    }
   }, [activeFrameOrigin, frameOriginVector, localStateRef, systemSpaceShipPosition]);
 
   useEffect(() => {
@@ -3819,7 +3826,12 @@ function SunDirectionalLight({
     }
   });
 
-  return <directionalLight ref={lightRef} intensity={1.25} color="#dbeafe" />;
+  return (
+    <>
+      <directionalLight ref={lightRef} intensity={1.25} color="#dbeafe" />
+      <hemisphereLight ref={hemiRef} args={['#dbeafe', '#080c14', 0.73]} />
+    </>
+  );
 }
 
 function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () => void }): ReactElement {
@@ -4122,7 +4134,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     <main className="sim-shell">
       <Canvas camera={{ fov: 75, near: 0.05, far: GALAXY_CAMERA_FAR }} gl={{ logarithmicDepthBuffer: true }}>
         <color attach="background" args={['#02030b']} />
-        <ambientLight intensity={0.85} />
+        <ambientLight intensity={0.30} />
         <SunDirectionalLight activeFrameOrigin={activeFrameOrigin} localStateRef={localStateRef} />
         <pointLight intensity={10} distance={120} position={[0, 0, 0]} color="#60a5fa" />
         <GameScene

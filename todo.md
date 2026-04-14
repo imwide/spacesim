@@ -28,6 +28,4 @@ BLENDER TODO: decrease glow intensity, apply array, screw stickers dont work/hav
 
 
 
-
-
 Player height is too tall inside the ship. I used a reference in blender that was the same apparent height of 1.7m and its eyelevel was lower than the one in the game.
