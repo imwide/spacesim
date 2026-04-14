@@ -197,6 +197,7 @@ interface InventorySlotData {
 interface HudState {
   connected: boolean;
   mode: Mode;
+  potentialFps: number;
   speed: number;
   shipSpeed: number;
   prompt: string;
@@ -205,6 +206,142 @@ interface HudState {
   speedLimitNoticeColor: string;
   safezoneNotice: string;
   interactionPills: Array<{ key: string; label: string }>;
+}
+
+interface DebugStatsState {
+  fps: number;
+  calls: number;
+  triangles: number;
+  lines: number;
+  points: number;
+  geometries: number;
+  textures: number;
+  heapUsedMb: number | null;
+  heapLimitMb: number | null;
+}
+
+type SettingsTab = 'keybinds' | 'graphics' | 'audio';
+
+interface KeybindSettings {
+  moveForward: string;
+  moveBackward: string;
+  moveLeft: string;
+  moveRight: string;
+  moveUp: string;
+  moveDown: string;
+  interact: string;
+  pilotSeat: string;
+  exit: string;
+  toggleDebug: string;
+}
+
+interface GraphicsSettings {
+  postProcessingEnabled: boolean;
+  outlineStyle: 'geometric' | 'organic';
+  showDebugOverlay: boolean;
+}
+
+interface AudioSettings {
+  masterVolume: number;
+  musicVolume: number;
+  sfxVolume: number;
+}
+
+interface AppSettings {
+  keybinds: KeybindSettings;
+  graphics: GraphicsSettings;
+  audio: AudioSettings;
+}
+
+const APP_SETTINGS_STORAGE_KEY = 'spacesim-settings-v1';
+
+const DEFAULT_APP_SETTINGS: AppSettings = {
+  keybinds: {
+    moveForward: 'KeyW',
+    moveBackward: 'KeyS',
+    moveLeft: 'KeyA',
+    moveRight: 'KeyD',
+    moveUp: 'Space',
+    moveDown: 'ShiftLeft',
+    interact: 'KeyE',
+    pilotSeat: 'KeyF',
+    exit: 'KeyX',
+    toggleDebug: 'Numpad0',
+  },
+  graphics: {
+    postProcessingEnabled: true,
+    outlineStyle: 'geometric',
+    showDebugOverlay: true,
+  },
+  audio: {
+    masterVolume: 100,
+    musicVolume: 80,
+    sfxVolume: 90,
+  },
+};
+
+function clampPercent(value: number): number {
+  return clamp(Number.isFinite(value) ? value : 0, 0, 100);
+}
+
+function loadAppSettings(): AppSettings {
+  if (typeof window === 'undefined') {
+    return DEFAULT_APP_SETTINGS;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(APP_SETTINGS_STORAGE_KEY);
+    if (!raw) {
+      return DEFAULT_APP_SETTINGS;
+    }
+
+    const parsed = JSON.parse(raw) as Partial<AppSettings>;
+    return {
+      keybinds: {
+        ...DEFAULT_APP_SETTINGS.keybinds,
+        ...(parsed.keybinds ?? {}),
+      },
+      graphics: {
+        ...DEFAULT_APP_SETTINGS.graphics,
+        ...(parsed.graphics ?? {}),
+      },
+      audio: {
+        masterVolume: clampPercent(parsed.audio?.masterVolume ?? DEFAULT_APP_SETTINGS.audio.masterVolume),
+        musicVolume: clampPercent(parsed.audio?.musicVolume ?? DEFAULT_APP_SETTINGS.audio.musicVolume),
+        sfxVolume: clampPercent(parsed.audio?.sfxVolume ?? DEFAULT_APP_SETTINGS.audio.sfxVolume),
+      },
+    };
+  } catch {
+    return DEFAULT_APP_SETTINGS;
+  }
+}
+
+function formatKeyCode(code: string): string {
+  const specialLabels: Record<string, string> = {
+    Space: 'Space',
+    ShiftLeft: 'Left Shift',
+    ShiftRight: 'Right Shift',
+    ControlLeft: 'Left Ctrl',
+    ControlRight: 'Right Ctrl',
+    AltLeft: 'Left Alt',
+    AltRight: 'Right Alt',
+    Escape: 'Esc',
+    Numpad0: 'Numpad 0',
+  };
+
+  if (specialLabels[code]) {
+    return specialLabels[code];
+  }
+
+  if (code.startsWith('Key')) {
+    return code.slice(3).toUpperCase();
+  }
+
+  if (code.startsWith('Digit')) {
+    return code.slice(5);
+  }
+
+  return code;
 }
 
 interface PilotCrosshairState {
@@ -305,6 +442,41 @@ interface MotionCollisionResult {
 interface StationBorderSpeedLimitInfo {
   maxSpeed: number;
   active: boolean;
+}
+
+function getVisibleSceneTriangleCount(scene: THREE.Scene): number {
+  let triangleCount = 0;
+
+  scene.traverseVisible((object) => {
+    if (!(object instanceof THREE.Mesh)) {
+      return;
+    }
+
+    const geometry = object.geometry;
+    if (!(geometry instanceof THREE.BufferGeometry)) {
+      return;
+    }
+
+    const drawRangeCount = geometry.drawRange.count;
+    const hasFiniteDrawRange = Number.isFinite(drawRangeCount) && drawRangeCount >= 0;
+    const instanceMultiplier = object instanceof THREE.InstancedMesh ? Math.max(object.count, 0) : 1;
+
+    if (geometry.index) {
+      const indexCount = hasFiniteDrawRange ? Math.min(geometry.index.count, drawRangeCount) : geometry.index.count;
+      triangleCount += Math.floor(indexCount / 3) * instanceMultiplier;
+      return;
+    }
+
+    const positionAttribute = geometry.getAttribute('position');
+    if (!positionAttribute) {
+      return;
+    }
+
+    const vertexCount = hasFiniteDrawRange ? Math.min(positionAttribute.count, drawRangeCount) : positionAttribute.count;
+    triangleCount += Math.floor(vertexCount / 3) * instanceMultiplier;
+  });
+
+  return triangleCount;
 }
 
 interface StationForceFieldHitResult {
@@ -3989,6 +4161,19 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
   const [activeSystemId, setActiveSystemId] = useState(homeSystemId);
   const [activeFrameOrigin, setActiveFrameOrigin] = useState<Vec3Tuple>(homeStation?.localPosition ?? [0, 0, 0]);
   const [showDebugAnchors, setShowDebugAnchors] = useState(false);
+  const [settings, setSettings] = useState<AppSettings>(() => loadAppSettings());
+  const [capturingKeybind, setCapturingKeybind] = useState<keyof KeybindSettings | null>(null);
+  const [debugStats, setDebugStats] = useState<DebugStatsState>({
+    fps: 0,
+    calls: 0,
+    triangles: 0,
+    lines: 0,
+    points: 0,
+    geometries: 0,
+    textures: 0,
+    heapUsedMb: null,
+    heapLimitMb: null,
+  });
   const [pilotCrosshair, setPilotCrosshair] = useState<PilotCrosshairState>({
     visible: false,
     shipVisible: false,
@@ -3997,7 +4182,70 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     aligned: false,
   });
   const [teleporting, setTeleporting] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('keybinds');
   const [autopilotDestination, setAutopilotDestination] = useState<AutopilotDestination | null>(null);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    window.localStorage.setItem(APP_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  }, [settings]);
+
+  useEffect(() => {
+    if (!settingsOpen) {
+      return undefined;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.code === 'Escape') {
+        event.preventDefault();
+        if (capturingKeybind) {
+          setCapturingKeybind(null);
+          return;
+        }
+        setSettingsOpen(false);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [capturingKeybind, settingsOpen]);
+
+  useEffect(() => {
+    if (!capturingKeybind) {
+      return undefined;
+    }
+
+    const handleCapture = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (event.repeat) {
+        return;
+      }
+
+      if (event.code === 'Escape') {
+        setCapturingKeybind(null);
+        return;
+      }
+
+      setSettings((current) => ({
+        ...current,
+        keybinds: {
+          ...current.keybinds,
+          [capturingKeybind]: event.code,
+        },
+      }));
+      setCapturingKeybind(null);
+    };
+
+    window.addEventListener('keydown', handleCapture, true);
+    return () => window.removeEventListener('keydown', handleCapture, true);
+  }, [capturingKeybind]);
+
   const [autopilotEngaged, setAutopilotEngaged] = useState(false);
   const [autopilotReachedDestinationId, setAutopilotReachedDestinationId] = useState('');
   const [highlightedTarget, setHighlightedTarget] = useState<HighlightTarget | null>(null);
@@ -4005,6 +4253,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
   const [hud, setHud] = useState<HudState>({
     connected: false,
     mode: 'space',
+    potentialFps: 0,
     speed: 0,
     shipSpeed: 0,
     prompt: 'Connecting to the sector…',
@@ -4169,7 +4418,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
         return;
       }
 
-      if (event.code !== 'Numpad0') {
+      if (event.code !== settings.keybinds.toggleDebug) {
         return;
       }
 
@@ -4179,7 +4428,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
 
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, []);
+  }, [settings.keybinds.toggleDebug]);
 
   const handleFastTravel = useCallback(
     (station: StationNode) => {
@@ -4246,6 +4495,39 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     setAutopilotStatus('Autopilot disengaged.');
   }, []);
 
+  const keybindRows = useMemo<Array<{ key: keyof KeybindSettings; label: string }>>(() => [
+    { key: 'moveForward', label: 'Move forward' },
+    { key: 'moveBackward', label: 'Move backward' },
+    { key: 'moveLeft', label: 'Move left' },
+    { key: 'moveRight', label: 'Move right' },
+    { key: 'moveUp', label: 'Move up / jump' },
+    { key: 'moveDown', label: 'Move down' },
+    { key: 'interact', label: 'Interact / board' },
+    { key: 'pilotSeat', label: 'Enter pilot seat' },
+    { key: 'exit', label: 'Exit ship / seat' },
+    { key: 'toggleDebug', label: 'Toggle debug mode' },
+  ], []);
+
+  const updateGraphicsSetting = useCallback((key: keyof GraphicsSettings, value: GraphicsSettings[keyof GraphicsSettings]) => {
+    setSettings((current) => ({
+      ...current,
+      graphics: {
+        ...current.graphics,
+        [key]: value,
+      },
+    }));
+  }, []);
+
+  const updateAudioSetting = useCallback((key: keyof AudioSettings, value: number) => {
+    setSettings((current) => ({
+      ...current,
+      audio: {
+        ...current.audio,
+        [key]: clampPercent(value),
+      },
+    }));
+  }, []);
+
   return (
     <main className="sim-shell">
       <Canvas camera={{ fov: 75, near: 0.05, far: GALAXY_CAMERA_FAR }} gl={{ logarithmicDepthBuffer: true }}>
@@ -4286,12 +4568,16 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           playersOnline={remotePlayers.length + (selfId ? 1 : 0)}
           remotePlayers={remotePlayers}
           sendState={sendState}
+          setDebugStats={setDebugStats}
           setHud={setHud}
           setPilotCrosshair={setPilotCrosshair}
+          settings={settings}
           showDebugAnchors={showDebugAnchors}
           shipConfig={getShipConfig(DEFAULT_SHIP_ID)}
         />
-        {USE_BLENDER_EDGES ? <BlenderEdgePostProcess /> : <CartoonOutlinePostProcess />}
+        {settings.graphics.postProcessingEnabled ? (
+          settings.graphics.outlineStyle === 'geometric' ? <BlenderEdgePostProcess /> : <CartoonOutlinePostProcess />
+        ) : null}
       </Canvas>
 
       <div className="hud">
@@ -4307,34 +4593,163 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           </div>
         ) : null}
 
-        <div className="hud-panel">
-          <h2>{session.user.username}</h2>
-          <div className="hud-grid">
-            <div>
-              <span>Status</span>
-              {hud.connected ? 'Online' : 'Offline'}
-            </div>
-            <div>
-              <span>Mode</span>
-              {hud.mode}
-            </div>
-            <div>
-              <span>Speed</span>
-              {formatSpeed(hud.speed)}
-            </div>
-            <div>
-              <span>Ship</span>
-              {formatSpeed(hud.shipSpeed)}
-            </div>
-            <div>
-              <span>Players</span>
-              {hud.playersOnline}
-            </div>
+        <div className="hud-stats" aria-label="Session stats">
+          <div className="hud-stat-item" title={hud.connected ? 'Online' : 'Offline'}>
+            <span className={`hud-status-dot${hud.connected ? ' is-online' : ' is-offline'}`} aria-hidden="true" />
+            <span className="hud-stat-label">Status</span>
           </div>
-          <button className="logout-button" onClick={onLogout} type="button">
-            Logout
-          </button>
+          <div className="hud-stat-item" title="Potential FPS based on average frame render time over the last second">
+            <span className="hud-stat-label">FPS</span>
+            <span className="hud-stat-value">{Math.round(hud.potentialFps)}</span>
+          </div>
+          <div className="hud-stat-item">
+            <span className="hud-stat-label">Speed</span>
+            <span className="hud-stat-value">{formatSpeed(hud.speed)}</span>
+          </div>
         </div>
+
+        <section className="system-menu-panel tech-window" aria-label="System menu">
+          <div className="tech-window-header">
+            <span className="tech-window-label">System</span>
+            <span className="tech-window-title">Menu</span>
+          </div>
+          <div className="system-menu-actions system-menu-icon-actions">
+            <button
+              className={`tech-window-button system-menu-icon-button${settingsOpen ? ' is-active' : ''}`}
+              onClick={() => setSettingsOpen((current) => !current)}
+              type="button"
+              aria-label={settingsOpen ? 'Close settings' : 'Open settings'}
+              title={settingsOpen ? 'Close settings' : 'Open settings'}
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true">
+                <path d="M10.788 3.212a1 1 0 0 1 2.424 0l.178.924a1 1 0 0 0 .95.764h.978a1 1 0 0 1 .894.553l.45.9a1 1 0 0 0 1.143.535l.91-.227a1 1 0 0 1 1.212 1.212l-.227.91a1 1 0 0 0 .536 1.143l.899.45a1 1 0 0 1 .553.894v.978a1 1 0 0 0 .763.95l.925.178a1 1 0 0 1 0 2.424l-.925.178a1 1 0 0 0-.763.95v.978a1 1 0 0 1-.553.894l-.9.45a1 1 0 0 0-.535 1.143l.227.91a1 1 0 0 1-1.212 1.212l-.91-.227a1 1 0 0 0-1.143.536l-.45.899a1 1 0 0 1-.894.553h-.978a1 1 0 0 0-.95.763l-.178.925a1 1 0 0 1-2.424 0l-.178-.925a1 1 0 0 0-.95-.763h-.978a1 1 0 0 1-.894-.553l-.45-.9a1 1 0 0 0-1.143-.535l-.91.227a1 1 0 0 1-1.212-1.212l.227-.91a1 1 0 0 0-.536-1.143l-.899-.45A1 1 0 0 1 2 14.66v-.978a1 1 0 0 0-.763-.95l-.925-.178a1 1 0 0 1 0-2.424l.925-.178A1 1 0 0 0 2 8.71v-.978a1 1 0 0 1 .553-.894l.9-.45a1 1 0 0 0 .535-1.143l-.227-.91A1 1 0 0 1 4.97 2.123l.91.227a1 1 0 0 0 1.143-.536l.45-.899A1 1 0 0 1 8.367.362h.978a1 1 0 0 0 .95-.763l.178-.925ZM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" />
+              </svg>
+            </button>
+            <button
+              className="tech-window-button tech-window-button-danger system-menu-icon-button"
+              onClick={onLogout}
+              type="button"
+              aria-label="Exit game"
+              title="Exit game"
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4" />
+                <path d="M10 17l5-5-5-5" />
+                <path d="M15 12H4" />
+              </svg>
+            </button>
+          </div>
+        </section>
+
+        {settingsOpen ? (
+          <div className="settings-modal-overlay" onClick={() => setSettingsOpen(false)} role="presentation">
+            <section className="settings-modal tech-window" aria-label="Settings" onClick={(event) => event.stopPropagation()}>
+              <div className="tech-window-header settings-modal-header">
+                <div>
+                  <span className="tech-window-label">System</span>
+                  <span className="tech-window-title">Settings</span>
+                </div>
+                <button className="tech-window-button settings-close-button" onClick={() => setSettingsOpen(false)} type="button" aria-label="Close settings" title="Close settings">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true">
+                    <path d="M6 6l12 12M18 6 6 18" />
+                  </svg>
+                </button>
+              </div>
+              <div className="settings-modal-body">
+                <nav className="settings-tabs" aria-label="Settings tabs">
+                  <button className={`settings-tab${settingsTab === 'keybinds' ? ' is-active' : ''}`} onClick={() => setSettingsTab('keybinds')} type="button">Keybinds</button>
+                  <button className={`settings-tab${settingsTab === 'graphics' ? ' is-active' : ''}`} onClick={() => setSettingsTab('graphics')} type="button">Graphics</button>
+                  <button className={`settings-tab${settingsTab === 'audio' ? ' is-active' : ''}`} onClick={() => setSettingsTab('audio')} type="button">Audio</button>
+                </nav>
+                <div className="settings-panel-body settings-tab-panel">
+                  {settingsTab === 'keybinds' ? (
+                    <>
+                      <p className="settings-placeholder-title">Keybind settings</p>
+                      <div className="settings-list">
+                        {keybindRows.map((row) => (
+                          <div className="settings-list-row" key={row.key}>
+                            <span>{row.label}</span>
+                            <button
+                              className={`settings-keybind-button${capturingKeybind === row.key ? ' is-capturing' : ''}`}
+                              onClick={() => setCapturingKeybind(row.key)}
+                              type="button"
+                            >
+                              {capturingKeybind === row.key ? 'Press key…' : formatKeyCode(settings.keybinds[row.key])}
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                      <p className="settings-placeholder-copy">Click a binding, then press a key to assign it. Press Esc to cancel capture.</p>
+                    </>
+                  ) : null}
+                  {settingsTab === 'graphics' ? (
+                    <>
+                      <p className="settings-placeholder-title">Graphics settings</p>
+                      <div className="settings-form-grid">
+                        <label className="settings-field-row">
+                          <span>Post processing</span>
+                          <input
+                            checked={settings.graphics.postProcessingEnabled}
+                            onChange={(event) => updateGraphicsSetting('postProcessingEnabled', event.currentTarget.checked)}
+                            type="checkbox"
+                          />
+                        </label>
+                        <label className="settings-field-row">
+                          <span>Outline style</span>
+                          <select
+                            value={settings.graphics.outlineStyle}
+                            onChange={(event) => updateGraphicsSetting('outlineStyle', event.currentTarget.value as GraphicsSettings['outlineStyle'])}
+                          >
+                            <option value="geometric">Geometric edge shader</option>
+                            <option value="organic">Organic outline shader</option>
+                          </select>
+                        </label>
+                        <label className="settings-field-row">
+                          <span>Debug statistics in debug mode</span>
+                          <input
+                            checked={settings.graphics.showDebugOverlay}
+                            onChange={(event) => updateGraphicsSetting('showDebugOverlay', event.currentTarget.checked)}
+                            type="checkbox"
+                          />
+                        </label>
+                      </div>
+                      <p className="settings-placeholder-copy">These graphics settings apply immediately.</p>
+                    </>
+                  ) : null}
+                  {settingsTab === 'audio' ? (
+                    <>
+                      <p className="settings-placeholder-title">Audio settings</p>
+                      <div className="settings-form-grid">
+                        <label className="settings-slider-row">
+                          <span>Master volume</span>
+                          <div>
+                            <input type="range" min="0" max="100" value={settings.audio.masterVolume} onChange={(event) => updateAudioSetting('masterVolume', Number(event.currentTarget.value))} />
+                            <strong>{settings.audio.masterVolume}%</strong>
+                          </div>
+                        </label>
+                        <label className="settings-slider-row">
+                          <span>Music volume</span>
+                          <div>
+                            <input type="range" min="0" max="100" value={settings.audio.musicVolume} onChange={(event) => updateAudioSetting('musicVolume', Number(event.currentTarget.value))} />
+                            <strong>{settings.audio.musicVolume}%</strong>
+                          </div>
+                        </label>
+                        <label className="settings-slider-row">
+                          <span>SFX volume</span>
+                          <div>
+                            <input type="range" min="0" max="100" value={settings.audio.sfxVolume} onChange={(event) => updateAudioSetting('sfxVolume', Number(event.currentTarget.value))} />
+                            <strong>{settings.audio.sfxVolume}%</strong>
+                          </div>
+                        </label>
+                      </div>
+                      <p className="settings-placeholder-copy">Audio isn’t implemented yet, but these values are editable and persisted for future use.</p>
+                    </>
+                  ) : null}
+                </div>
+              </div>
+            </section>
+          </div>
+        ) : null}
 
         {hud.speedLimitNotice ? (
           <div
@@ -4363,6 +4778,19 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
                 {pill.label}
               </div>
             ))}
+          </div>
+        ) : null}
+
+        {showDebugAnchors && settings.graphics.showDebugOverlay ? (
+          <div className="debug-stats-overlay" aria-label="Debug statistics">
+            {`FPS ${Math.round(debugStats.fps)}
+CALLS ${debugStats.calls}
+TRIS ${debugStats.triangles.toLocaleString()}
+LINES ${debugStats.lines.toLocaleString()}
+POINTS ${debugStats.points.toLocaleString()}
+GEOMS ${debugStats.geometries}
+TEX ${debugStats.textures}
+HEAP ${debugStats.heapUsedMb != null ? `${debugStats.heapUsedMb.toFixed(1)} / ${debugStats.heapLimitMb?.toFixed(1) ?? '-'} MB` : 'N/A'}`}
           </div>
         ) : null}
 
@@ -4435,8 +4863,10 @@ function GameScene({
   playersOnline,
   remotePlayers,
   sendState,
+  setDebugStats,
   setHud,
   setPilotCrosshair,
+  settings,
   showDebugAnchors,
   shipConfig,
 }: {
@@ -4458,8 +4888,10 @@ function GameScene({
   playersOnline: number;
   remotePlayers: PlayerSnapshot[];
   sendState: (payload: PlayerSnapshot) => void;
+  setDebugStats: Dispatch<SetStateAction<DebugStatsState>>;
   setHud: Dispatch<SetStateAction<HudState>>;
   setPilotCrosshair: Dispatch<SetStateAction<PilotCrosshairState>>;
+  settings: AppSettings;
   showDebugAnchors: boolean;
   shipConfig: ShipConfig;
 }): ReactElement {
@@ -4479,6 +4911,10 @@ function GameScene({
   const firingPrimaryRef = useRef(false);
   const lastWeaponBlockedNoticeAtRef = useRef(0);
   const lastWeaponBlockedReasonRef = useRef('');
+  const potentialFpsAccumRef = useRef(0);
+  const potentialFpsSampleCountRef = useRef(0);
+  const potentialFpsElapsedRef = useRef(0);
+  const potentialFpsValueRef = useRef(0);
   const shipGroupRef = useRef<THREE.Group>(null);
   const interiorGroupRef = useRef<THREE.Group>(null);
   const seatOutlineVisibleRef = useRef(false);
@@ -4605,9 +5041,49 @@ function GameScene({
     };
   }, [gl, localStateRef]);
 
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      const renderInfo = gl.info.render;
+      const memoryInfo = gl.info.memory;
+      const visibleTriangles = getVisibleSceneTriangleCount(scene);
+      const perfMemory = 'memory' in performance
+        ? ((performance as Performance & {
+            memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number };
+          }).memory ?? null)
+        : null;
+
+      setDebugStats({
+        fps: potentialFpsValueRef.current,
+        calls: renderInfo.calls,
+        triangles: visibleTriangles,
+        lines: renderInfo.lines,
+        points: renderInfo.points,
+        geometries: memoryInfo.geometries,
+        textures: memoryInfo.textures,
+        heapUsedMb: perfMemory ? perfMemory.usedJSHeapSize / (1024 * 1024) : null,
+        heapLimitMb: perfMemory ? perfMemory.jsHeapSizeLimit / (1024 * 1024) : null,
+      });
+    }, 250);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [gl, scene, setDebugStats]);
+
   useFrame((_frameState, delta) => {
     const dt = Math.min(delta, 0.05);
     const now = performance.now();
+    potentialFpsAccumRef.current += 1 / Math.max(delta, 1e-6);
+    potentialFpsSampleCountRef.current += 1;
+    potentialFpsElapsedRef.current += delta;
+    if (potentialFpsElapsedRef.current >= 1) {
+      potentialFpsValueRef.current = potentialFpsSampleCountRef.current > 0
+        ? potentialFpsAccumRef.current / potentialFpsSampleCountRef.current
+        : 0;
+      potentialFpsAccumRef.current = 0;
+      potentialFpsSampleCountRef.current = 0;
+      potentialFpsElapsedRef.current = 0;
+    }
     const state = localStateRef.current;
     state.shipBraking = false;
     const pointerLocked = document.pointerLockElement === gl.domElement;
@@ -4620,7 +5096,15 @@ function GameScene({
     };
 
     const keys = pressedKeys.current;
+    const keybinds = settings.keybinds;
     const movementEnabled = true;
+    const keyHeld = (binding: string) => keys.has(binding);
+    const moveForwardHeld = movementEnabled && keyHeld(keybinds.moveForward);
+    const moveBackwardHeld = movementEnabled && keyHeld(keybinds.moveBackward);
+    const moveLeftHeld = movementEnabled && keyHeld(keybinds.moveLeft);
+    const moveRightHeld = movementEnabled && keyHeld(keybinds.moveRight);
+    const moveUpHeld = movementEnabled && keyHeld(keybinds.moveUp);
+    const moveDownHeld = movementEnabled && keyHeld(keybinds.moveDown);
     const lookRotation = new THREE.Quaternion().setFromEuler(new THREE.Euler(state.pitch, state.yaw, 0, 'YXZ'));
     const autopilotAvailable = autopilotActive && Boolean(autopilotDestination) && state.mode !== 'space' && state.mode !== 'planet-surface';
 
@@ -4715,16 +5199,16 @@ function GameScene({
         const walkRight = new THREE.Vector3(1, 0, 0).applyQuaternion(localLook);
         const walk = new THREE.Vector3();
 
-        if (movementEnabled && keys.has('KeyW')) {
+        if (moveForwardHeld) {
           walk.add(walkForward);
         }
-        if (movementEnabled && keys.has('KeyS')) {
+        if (moveBackwardHeld) {
           walk.addScaledVector(walkForward, -1);
         }
-        if (movementEnabled && keys.has('KeyA')) {
+        if (moveLeftHeld) {
           walk.addScaledVector(walkRight, -1);
         }
-        if (movementEnabled && keys.has('KeyD')) {
+        if (moveRightHeld) {
           walk.add(walkRight);
         }
 
@@ -4744,7 +5228,7 @@ function GameScene({
           state.velocity.z = 0;
         }
 
-        if (movementEnabled && consumeAction('Space') && state.playerOnGround) {
+        if (movementEnabled && consumeAction(keybinds.moveUp) && state.playerOnGround) {
           state.velocity.y = INTERIOR_JUMP_VELOCITY;
           state.playerOnGround = false;
         }
@@ -4765,30 +5249,29 @@ function GameScene({
         const moveUp = new THREE.Vector3(0, 1, 0);
         const hasDirectionalInput =
           movementEnabled &&
-          (keys.has('KeyW') ||
-            keys.has('KeyS') ||
-            keys.has('KeyA') ||
-            keys.has('KeyD') ||
-            keys.has('Space') ||
-            keys.has('ShiftLeft') ||
-            keys.has('ShiftRight'));
+          (moveForwardHeld ||
+            moveBackwardHeld ||
+            moveLeftHeld ||
+            moveRightHeld ||
+            moveUpHeld ||
+            moveDownHeld);
 
-        if (movementEnabled && keys.has('KeyW')) {
+        if (moveForwardHeld) {
           state.velocity.addScaledVector(forward, EVA_THRUST_ACCELERATION * dt);
         }
-        if (movementEnabled && keys.has('KeyS')) {
+        if (moveBackwardHeld) {
           state.velocity.addScaledVector(forward, -EVA_THRUST_ACCELERATION * dt);
         }
-        if (movementEnabled && keys.has('KeyA')) {
+        if (moveLeftHeld) {
           state.velocity.addScaledVector(right, -EVA_THRUST_ACCELERATION * dt);
         }
-        if (movementEnabled && keys.has('KeyD')) {
+        if (moveRightHeld) {
           state.velocity.addScaledVector(right, EVA_THRUST_ACCELERATION * dt);
         }
-        if (movementEnabled && keys.has('Space')) {
+        if (moveUpHeld) {
           state.velocity.addScaledVector(moveUp, EVA_THRUST_ACCELERATION * dt);
         }
-        if (movementEnabled && (keys.has('ShiftLeft') || keys.has('ShiftRight'))) {
+        if (moveDownHeld) {
           state.velocity.addScaledVector(moveUp, -EVA_THRUST_ACCELERATION * dt);
         }
 
@@ -4833,7 +5316,7 @@ function GameScene({
 
       // Check boarding: player must be within BOARDING_RADIUS_METERS of the ship's entry point (world-space)
       const entryWorld = shipConfig.entryPointVec.clone().applyQuaternion(state.shipRotation).add(state.shipPosition);
-      if (consumeAction('KeyE') && state.position.distanceTo(entryWorld) < BOARDING_RADIUS_METERS) {
+      if (consumeAction(keybinds.interact) && state.position.distanceTo(entryWorld) < BOARDING_RADIUS_METERS) {
         state.mode = 'interior';
         state.insideShip = true;
         state.interiorPosition.copy(shipConfig.insideSpawnVec);
@@ -4898,16 +5381,16 @@ function GameScene({
       const walkRight = new THREE.Vector3(1, 0, 0).applyQuaternion(localLook);
       const walk = new THREE.Vector3();
 
-      if (movementEnabled && keys.has('KeyW')) {
+      if (moveForwardHeld) {
         walk.add(walkForward);
       }
-      if (movementEnabled && keys.has('KeyS')) {
+      if (moveBackwardHeld) {
         walk.addScaledVector(walkForward, -1);
       }
-      if (movementEnabled && keys.has('KeyA')) {
+      if (moveLeftHeld) {
         walk.addScaledVector(walkRight, -1);
       }
-      if (movementEnabled && keys.has('KeyD')) {
+      if (moveRightHeld) {
         walk.add(walkRight);
       }
 
@@ -4933,7 +5416,7 @@ function GameScene({
         state.interiorVelocity.z = 0;
       }
 
-      if (movementEnabled && consumeAction('Space') && state.playerOnGround) {
+      if (movementEnabled && consumeAction(keybinds.moveUp) && state.playerOnGround) {
         state.interiorVelocity.y = INTERIOR_JUMP_VELOCITY;
         state.playerOnGround = false;
       }
@@ -4990,7 +5473,7 @@ function GameScene({
         seatOutlineVisibleRef.current = false;
       }
 
-      if (consumeAction('KeyF') && interiorCollision.pilotSeatPosition && xzDistance(state.interiorPosition, interiorCollision.pilotSeatPosition) < SEAT_INTERACTION_DISTANCE_METERS) {
+      if (consumeAction(keybinds.pilotSeat) && interiorCollision.pilotSeatPosition && xzDistance(state.interiorPosition, interiorCollision.pilotSeatPosition) < SEAT_INTERACTION_DISTANCE_METERS) {
         state.mode = 'pilot';
         state.insideShip = true;
         state.shipAngularVelocity.set(0, 0, 0);
@@ -4999,7 +5482,7 @@ function GameScene({
         state.yaw = pilotEuler.y;
       }
 
-      if (consumeAction('KeyX')) {
+      if (consumeAction(keybinds.exit)) {
         // Exit the ship at the configured outside spawn point
         const exitOffset = shipConfig.outsideSpawnVec.clone().applyQuaternion(state.shipRotation);
         state.mode = 'space';
@@ -5047,10 +5530,10 @@ function GameScene({
         const tangentRight = new THREE.Vector3(1, 0, 0).applyQuaternion(surfYaw);
 
         const walk = new THREE.Vector3();
-        if (movementEnabled && keys.has('KeyW')) walk.add(tangentForward);
-        if (movementEnabled && keys.has('KeyS')) walk.addScaledVector(tangentForward, -1);
-        if (movementEnabled && keys.has('KeyA')) walk.addScaledVector(tangentRight, -1);
-        if (movementEnabled && keys.has('KeyD')) walk.add(tangentRight);
+        if (moveForwardHeld) walk.add(tangentForward);
+        if (moveBackwardHeld) walk.addScaledVector(tangentForward, -1);
+        if (moveLeftHeld) walk.addScaledVector(tangentRight, -1);
+        if (moveRightHeld) walk.add(tangentRight);
 
         if (walk.lengthSq() > 0) {
           walk.normalize().multiplyScalar(PLANET_SURFACE_WALK_SPEED);
@@ -5066,7 +5549,7 @@ function GameScene({
         }
 
         // Jump with Space
-        if (movementEnabled && consumeAction('Space') && state.playerOnGround) {
+        if (movementEnabled && consumeAction(keybinds.moveUp) && state.playerOnGround) {
           state.velocity.addScaledVector(planetUp, PLANET_SURFACE_JUMP_VELOCITY);
           state.playerOnGround = false;
         }
@@ -5117,7 +5600,7 @@ function GameScene({
 
         // Board ship with E — must be near the ship's configured entry point
         const entryWorldPS = shipConfig.entryPointVec.clone().applyQuaternion(state.shipRotation).add(state.shipPosition);
-        if (consumeAction('KeyE') && state.position.distanceTo(entryWorldPS) < BOARDING_RADIUS_METERS) {
+        if (consumeAction(keybinds.interact) && state.position.distanceTo(entryWorldPS) < BOARDING_RADIUS_METERS) {
           state.mode = 'interior';
           state.insideShip = true;
           state.interiorPosition.copy(shipConfig.insideSpawnVec);
@@ -5125,7 +5608,7 @@ function GameScene({
         }
 
         // Leave surface (jetpack up) with Shift+Space — switch back to EVA space mode
-        if (movementEnabled && (keys.has('ShiftLeft') || keys.has('ShiftRight')) && !state.playerOnGround) {
+        if (moveDownHeld && !state.playerOnGround) {
           state.mode = 'space';
         }
       } else {
@@ -5137,18 +5620,18 @@ function GameScene({
       camera.position.copy(state.position);
       camera.quaternion.copy(state.rotation);
     } else {
-        const exitPilotSeat = consumeAction('KeyX');
+        const exitPilotSeat = consumeAction(keybinds.exit);
       const insideStationBounds = isShipInsideStationBounds(state.shipPosition, stationForceFields);
       const manualHandlingMultiplier = insideStationBounds ? SHIP_STATION_MANUAL_HANDLING_MULTIPLIER : 1;
-        const forwardInput = movementEnabled && keys.has('KeyW') ? 1 : 0;
-        const brakingInput = movementEnabled && keys.has('KeyS');
+        const forwardInput = moveForwardHeld ? 1 : 0;
+        const brakingInput = moveBackwardHeld;
         state.shipBraking = brakingInput;
         const lateralInput =
-          (movementEnabled && keys.has('KeyD') ? 1 : 0) -
-          (movementEnabled && keys.has('KeyA') ? 1 : 0);
+          (moveRightHeld ? 1 : 0) -
+          (moveLeftHeld ? 1 : 0);
         const verticalInput =
-          (movementEnabled && keys.has('Space') ? 1 : 0) -
-          (movementEnabled && (keys.has('ShiftLeft') || keys.has('ShiftRight')) ? 1 : 0);
+          (moveUpHeld ? 1 : 0) -
+          (moveDownHeld ? 1 : 0);
         
         const hasThrustInput = forwardInput !== 0 || brakingInput || lateralInput !== 0 || verticalInput !== 0;
         const hasManualPilotInput = hasThrustInput;
@@ -5165,7 +5648,7 @@ function GameScene({
             onAutopilotStatusChange('Autopilot disengaged. Manual control active.');
           }
 
-            const alignToCamera = movementEnabled && (keys.has('KeyW') || keys.has('KeyA') || keys.has('KeyS') || keys.has('KeyD'));
+            const alignToCamera = movementEnabled && (moveForwardHeld || moveLeftHeld || moveBackwardHeld || moveRightHeld);
             let angleToTarget = 0;
 
             if (alignToCamera) {
@@ -5512,40 +5995,42 @@ function GameScene({
       if (canEnter) {
         interactionPills.push({
           key: 'enter-ship',
-          label: state.mode === 'planet-surface' ? 'E · BOARD SHIP' : 'E · ENTER SHIP',
+          label: `${formatKeyCode(keybinds.interact)} · ${state.mode === 'planet-surface' ? 'BOARD SHIP' : 'ENTER SHIP'}`,
         });
       }
       if (canPilot) {
         interactionPills.push({
           key: 'pilot-seat',
-          label: 'F · ENTER PILOT SEAT',
+          label: `${formatKeyCode(keybinds.pilotSeat)} · ENTER PILOT SEAT`,
         });
       }
 
       let prompt = pointerLocked
-        ? 'WASD to move, Space/Shift for vertical thrust. Momentum is preserved.'
+        ? `${formatKeyCode(keybinds.moveForward)}/${formatKeyCode(keybinds.moveLeft)}/${formatKeyCode(keybinds.moveBackward)}/${formatKeyCode(keybinds.moveRight)} to move, ${formatKeyCode(keybinds.moveUp)}/${formatKeyCode(keybinds.moveDown)} for vertical thrust. Momentum is preserved.`
         : 'Click the viewport to capture the mouse.';
       if (state.mode === 'space' && state.playerOnGround) {
-        prompt = 'Walking on station. WASD to walk, Space to jump. Step clear to return to EVA thrusters.';
+        prompt = `Walking on station. ${formatKeyCode(keybinds.moveForward)}/${formatKeyCode(keybinds.moveLeft)}/${formatKeyCode(keybinds.moveBackward)}/${formatKeyCode(keybinds.moveRight)} to walk, ${formatKeyCode(keybinds.moveUp)} to jump. Step clear to return to EVA thrusters.`;
       }
       if (state.mode === 'space' && canEnter) {
-        prompt = 'Press E to enter your ship.';
+        prompt = `Press ${formatKeyCode(keybinds.interact)} to enter your ship.`;
       }
       if (state.mode === 'planet-surface') {
         const canBoard = canEnter;
         if (canBoard) {
-          prompt = 'Walking on planet surface. WASD to walk, Space to jump. Press E to board ship.';
+          prompt = `Walking on planet surface. ${formatKeyCode(keybinds.moveForward)}/${formatKeyCode(keybinds.moveLeft)}/${formatKeyCode(keybinds.moveBackward)}/${formatKeyCode(keybinds.moveRight)} to walk, ${formatKeyCode(keybinds.moveUp)} to jump. Press ${formatKeyCode(keybinds.interact)} to board ship.`;
         } else {
-          prompt = 'Walking on planet surface. WASD to walk, Space to jump. Use jetpack (Shift while airborne) to return to EVA.';
+          prompt = `Walking on planet surface. ${formatKeyCode(keybinds.moveForward)}/${formatKeyCode(keybinds.moveLeft)}/${formatKeyCode(keybinds.moveBackward)}/${formatKeyCode(keybinds.moveRight)} to walk, ${formatKeyCode(keybinds.moveUp)} to jump. Use jetpack (${formatKeyCode(keybinds.moveDown)} while airborne) to return to EVA.`;
         }
       }
       if (state.mode === 'interior') {
-        prompt = canPilot ? 'Press F near the seat to sit down, or use the autopilot panel to select a destination. Space jumps.' : 'Explore the ship interior with WASD, Space to jump. Use the autopilot panel or press X to exit.';
+        prompt = canPilot
+          ? `Press ${formatKeyCode(keybinds.pilotSeat)} near the seat to sit down, or use the autopilot panel to select a destination. ${formatKeyCode(keybinds.moveUp)} jumps.`
+          : `Explore the ship interior with ${formatKeyCode(keybinds.moveForward)}/${formatKeyCode(keybinds.moveLeft)}/${formatKeyCode(keybinds.moveBackward)}/${formatKeyCode(keybinds.moveRight)}, ${formatKeyCode(keybinds.moveUp)} to jump. Use the autopilot panel or press ${formatKeyCode(keybinds.exit)} to exit.`;
       }
       if (state.mode === 'pilot') {
         prompt = autopilotActive && autopilotDestination
-          ? `Autopilot en route to ${autopilotDestination.name}. ETA ${autopilotEtaLabel}. Use WASD to take over. X exits the seat.`
-          : 'Pilot seat engaged. Mouse orbits camera, WASD thrusts and aligns. Space/Shift is vertical. X exits.';
+          ? `Autopilot en route to ${autopilotDestination.name}. ETA ${autopilotEtaLabel}. Use ${formatKeyCode(keybinds.moveForward)}/${formatKeyCode(keybinds.moveLeft)}/${formatKeyCode(keybinds.moveBackward)}/${formatKeyCode(keybinds.moveRight)} to take over. ${formatKeyCode(keybinds.exit)} exits the seat.`
+          : `Pilot seat engaged. Mouse orbits camera, ${formatKeyCode(keybinds.moveForward)}/${formatKeyCode(keybinds.moveLeft)}/${formatKeyCode(keybinds.moveBackward)}/${formatKeyCode(keybinds.moveRight)} thrusts and aligns. ${formatKeyCode(keybinds.moveUp)}/${formatKeyCode(keybinds.moveDown)} is vertical. ${formatKeyCode(keybinds.exit)} exits.`;
       }
       if (state.mode !== 'space' && state.mode !== 'planet-surface' && autopilotActive && autopilotDestination) {
         prompt = `Autopilot en route to ${autopilotDestination.name}. ETA ${autopilotEtaLabel}. Arrival threshold: ${formatDistance(AUTOPILOT_REACH_DISTANCE_METERS)}.`;
@@ -5554,6 +6039,7 @@ function GameScene({
       setHud((current) => ({
         ...current,
         mode: state.mode,
+        potentialFps: potentialFpsValueRef.current,
         speed,
         shipSpeed,
         prompt,
@@ -5671,7 +6157,10 @@ function WarpSpeedEffect({ localStateRef }: { localStateRef: MutableRefObject<Lo
   const streakCount = 168;
   const tunnelRadiusMin = 340;
   const tunnelRadiusMax = 560;
-  const tunnelHalfLength = 1800;
+  const tunnelHalfLength = 9_000;
+  const tunnelFadeDistance = tunnelHalfLength * 0.22;
+  const streakSpeedMultiplier = 20;
+  const streakBaseColor = new THREE.Color('#dbeafe');
   const streakStateRef = useRef(
     Array.from({ length: streakCount }, () => ({
       angle: Math.random() * Math.PI * 2,
@@ -5682,11 +6171,20 @@ function WarpSpeedEffect({ localStateRef }: { localStateRef: MutableRefObject<Lo
     })),
   );
   const positions = useMemo(() => new Float32Array(streakCount * 2 * 3), [streakCount]);
+  const colors = useMemo(() => new Float32Array(streakCount * 2 * 3), [streakCount]);
   const velocityDirection = useMemo(() => new THREE.Vector3(), []);
   const shipForward = useMemo(() => new THREE.Vector3(), []);
   const shipUp = useMemo(() => new THREE.Vector3(), []);
   const travelQuaternionMatrix = useMemo(() => new THREE.Matrix4(), []);
   const travelQuaternion = useMemo(() => new THREE.Quaternion(), []);
+  const fadeAtZ = useCallback((z: number) => {
+    const distanceFromCenter = Math.abs(z);
+    if (distanceFromCenter <= tunnelHalfLength - tunnelFadeDistance) {
+      return 1;
+    }
+    const fadeProgress = (distanceFromCenter - (tunnelHalfLength - tunnelFadeDistance)) / tunnelFadeDistance;
+    return clamp(1 - fadeProgress, 0, 1);
+  }, [tunnelFadeDistance]);
 
   useFrame((_state, delta) => {
     if (!groupRef.current || !materialRef.current || !geometryRef.current) {
@@ -5719,7 +6217,7 @@ function WarpSpeedEffect({ localStateRef }: { localStateRef: MutableRefObject<Lo
     }
 
     streakStateRef.current.forEach((streak, index) => {
-      streak.z += streak.speed * delta * (0.55 + intensity * 5.5);
+      streak.z += streak.speed * delta * (0.55 + intensity * 5.5) * streakSpeedMultiplier;
       if (streak.z > tunnelHalfLength) {
         streak.angle = Math.random() * Math.PI * 2;
         streak.radius = tunnelRadiusMin + Math.random() * (tunnelRadiusMax - tunnelRadiusMin);
@@ -5738,9 +6236,23 @@ function WarpSpeedEffect({ localStateRef }: { localStateRef: MutableRefObject<Lo
       positions[startIndex + 3] = x;
       positions[startIndex + 4] = y;
       positions[startIndex + 5] = streak.z + streak.length;
+
+      const tailFade = fadeAtZ(streak.z);
+      const headFade = fadeAtZ(streak.z + streak.length);
+      const tailIntensity = tailFade * intensity;
+      const headIntensity = headFade * intensity;
+      const colorIndex = index * 6;
+
+      colors[colorIndex] = streakBaseColor.r * tailIntensity;
+      colors[colorIndex + 1] = streakBaseColor.g * tailIntensity;
+      colors[colorIndex + 2] = streakBaseColor.b * tailIntensity;
+      colors[colorIndex + 3] = streakBaseColor.r * headIntensity;
+      colors[colorIndex + 4] = streakBaseColor.g * headIntensity;
+      colors[colorIndex + 5] = streakBaseColor.b * headIntensity;
     });
 
     geometryRef.current.attributes.position.needsUpdate = true;
+    geometryRef.current.attributes.color.needsUpdate = true;
     materialRef.current.opacity = 0.14 + intensity * 0.56;
   });
 
@@ -5749,10 +6261,12 @@ function WarpSpeedEffect({ localStateRef }: { localStateRef: MutableRefObject<Lo
       <lineSegments frustumCulled={false}>
         <bufferGeometry ref={geometryRef}>
           <bufferAttribute attach="attributes-position" args={[positions, 3]} usage={THREE.DynamicDrawUsage} />
+          <bufferAttribute attach="attributes-color" args={[colors, 3]} usage={THREE.DynamicDrawUsage} />
         </bufferGeometry>
         <lineBasicMaterial
           ref={materialRef}
           color="#dbeafe"
+          vertexColors
           transparent
           opacity={0}
           depthWrite={false}
@@ -5766,10 +6280,10 @@ function WarpSpeedEffect({ localStateRef }: { localStateRef: MutableRefObject<Lo
 
 function InventoryHud({ slots }: { slots: InventorySlotData[] }): ReactElement {
   return (
-    <section className="inventory-hud" aria-label="Inventory">
-      <div className="inventory-header">
+    <section className="inventory-hud tech-window" aria-label="Inventory">
+      <div className="inventory-header tech-window-header">
         <span>Cargo</span>
-        <strong>Inventory</strong>
+        <span className="tech-window-title">Inventory</span>
       </div>
       <div className="inventory-slots">
         {slots.map((slot, index) => {

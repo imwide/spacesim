@@ -29,8 +29,6 @@ The highlight tag highlighting an autopilot target currently doesnt clear when t
 Ship backwards flying
 
 
-remake styles of inventory and hud-panel UI to match the navigator's UI
-
 BLENDER TODO: decrease glow intensity, apply array, screw stickers dont work/have no outline.
 
 
@@ -39,23 +37,13 @@ Edge shader triangle collapse: prefer straight edges/aligned with axes edges
 Player height is too tall inside the ship. I used a reference in blender that was the same apparent height of 1.7m and its eyelevel was lower than the one in the game.
 
 
-Increase the total length of the hyperspeed lines flyby effect. not the lines themselves but the entire start and end of the effect. make it around 5x longer. Also make the lines themselves fade in and out at the start and end of the effect instead of just appearing and disappearing statically. Additionally the speeds of the lines passing by should be multiplied by 20x
-
-settings
-- keybind settings
-- graphics settings
-- audio settings
-
-
-debug menu (showing fps, triangle count being rendered, memory usage, etc.)
 
 
 When disengaging autopilot at any speed, keep momentum, but as long as the ship is faster than its normal max speed, apply deceleration so that it would be stationary within 20 seconds multiplied by the ships braking multiplier
 
 Add targeting option in the navigator UI which will always make the ship point to the target.
 
-
-New skybox
+Make ship slowly turn horizontal while no user input
 
 
 
