@@ -9472,6 +9472,8 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
   const removedRef = useRef<boolean[]>([]);
   /** Maps compacted instance buffer indices → original dust indices for weapon-hit resolution. */
   const meshIndexMapRef = useRef<number[]>([]);
+  const billboardMidIndexMapRef = useRef<number[]>([]);
+  const billboardFarIndexMapRef = useRef<number[]>([]);
   const matrixDummy = useMemo(() => new THREE.Object3D(), []);
   const dustParticlePhysPos = useMemo(() => new THREE.Vector3(), []);
 
@@ -9530,6 +9532,8 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
     shotCountsRef.current = Array.from({ length: dust.length }, () => 0);
     removedRef.current = Array.from({ length: dust.length }, () => false);
     meshIndexMapRef.current = Array.from({ length: dust.length }, (_, i) => i);
+    billboardMidIndexMapRef.current = Array.from({ length: dust.length }, (_, i) => i);
+    billboardFarIndexMapRef.current = Array.from({ length: dust.length }, (_, i) => i);
 
     dust.forEach((_, index) => {
       instancedMeshRef.current?.setMatrixAt(index, baseMatrices[index]);
@@ -9547,12 +9551,12 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
       billboardFarRef.current.instanceMatrix.needsUpdate = true;
     }
 
-    const handleDustImpact = (hit: THREE.Intersection<THREE.Object3D>) => {
+    const handleDustImpact = (hit: THREE.Intersection<THREE.Object3D>, indexMap: number[]) => {
       const compactedId = hit.instanceId;
       if (compactedId === undefined || compactedId === null) {
         return;
       }
-      const originalId = meshIndexMapRef.current[compactedId];
+      const originalId = indexMap[compactedId];
       if (originalId === undefined || removedRef.current[originalId]) {
         return;
       }
@@ -9615,20 +9619,39 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
       }
     };
 
-    const shouldIgnoreDustImpact = (hit: THREE.Intersection<THREE.Object3D>) => {
+    const shouldIgnoreDustImpact = (hit: THREE.Intersection<THREE.Object3D>, indexMap: number[]) => {
       const compactedId = hit.instanceId;
       if (compactedId === undefined || compactedId === null) return true;
-      const originalId = meshIndexMapRef.current[compactedId];
+      const originalId = indexMap[compactedId];
       return originalId === undefined || removedRef.current[originalId];
     };
 
-    instancedMeshRef.current.userData.onWeaponImpact = handleDustImpact;
-    instancedMeshRef.current.userData.shouldIgnoreWeaponImpact = shouldIgnoreDustImpact;
+    instancedMeshRef.current.userData.triCategory = 'Asteroid Dust';
+    instancedMeshRef.current.userData.onWeaponImpact = (hit: THREE.Intersection<THREE.Object3D>) => handleDustImpact(hit, meshIndexMapRef.current);
+    instancedMeshRef.current.userData.shouldIgnoreWeaponImpact = (hit: THREE.Intersection<THREE.Object3D>) => shouldIgnoreDustImpact(hit, meshIndexMapRef.current);
+    if (billboardMidRef.current) {
+      billboardMidRef.current.userData.triCategory = 'Asteroid Dust';
+      billboardMidRef.current.userData.onWeaponImpact = (hit: THREE.Intersection<THREE.Object3D>) => handleDustImpact(hit, billboardMidIndexMapRef.current);
+      billboardMidRef.current.userData.shouldIgnoreWeaponImpact = (hit: THREE.Intersection<THREE.Object3D>) => shouldIgnoreDustImpact(hit, billboardMidIndexMapRef.current);
+    }
+    if (billboardFarRef.current) {
+      billboardFarRef.current.userData.triCategory = 'Asteroid Dust';
+      billboardFarRef.current.userData.onWeaponImpact = (hit: THREE.Intersection<THREE.Object3D>) => handleDustImpact(hit, billboardFarIndexMapRef.current);
+      billboardFarRef.current.userData.shouldIgnoreWeaponImpact = (hit: THREE.Intersection<THREE.Object3D>) => shouldIgnoreDustImpact(hit, billboardFarIndexMapRef.current);
+    }
 
     return () => {
       if (instancedMeshRef.current) {
         delete instancedMeshRef.current.userData.onWeaponImpact;
         delete instancedMeshRef.current.userData.shouldIgnoreWeaponImpact;
+      }
+      if (billboardMidRef.current) {
+        delete billboardMidRef.current.userData.onWeaponImpact;
+        delete billboardMidRef.current.userData.shouldIgnoreWeaponImpact;
+      }
+      if (billboardFarRef.current) {
+        delete billboardFarRef.current.userData.onWeaponImpact;
+        delete billboardFarRef.current.userData.shouldIgnoreWeaponImpact;
       }
     };
   }, [baseMatrices, dust, explosions, fallbackForward, localHitPoint, localStateRef, lookMatrix, lookOrigin, lookTarget, matrixDummy, nextExplosionIndexRef, projectedForward, randomDirection, shipBlastDirection, targetShipRotation, upward, worldHitPoint]);
@@ -9674,12 +9697,14 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
           // Mid: texture billboard
           if (midIM) {
             midIM.setMatrixAt(nMid, baseMatrices[i]);
+            billboardMidIndexMapRef.current[nMid] = i;
             nMid++;
           }
         } else {
           // Far: small texture billboard
           if (farIM) {
             farIM.setMatrixAt(nFar, baseMatrices[i]);
+            billboardFarIndexMapRef.current[nFar] = i;
             nFar++;
           }
         }
@@ -9847,12 +9872,12 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
           <meshStandardMaterial color="#64748b" roughness={0.96} metalness={0.06} />
         </instancedMesh>
         {/* Tier 2: Mid billboard (500m–2km) */}
-        <instancedMesh ref={billboardMidRef} args={[null as any, null as any, dust.length]} frustumCulled={false} userData={{ triCategory: 'Asteroid Dust' }}>
+        <instancedMesh ref={billboardMidRef} args={[null as any, null as any, dust.length]} frustumCulled={false}>
           <planeGeometry args={[2, 2]} />
           <primitive object={billboardMidMat} attach="material" />
         </instancedMesh>
         {/* Tier 3: Far billboard (2km–20km) */}
-        <instancedMesh ref={billboardFarRef} args={[null as any, null as any, dust.length]} frustumCulled={false} userData={{ triCategory: 'Asteroid Dust' }}>
+        <instancedMesh ref={billboardFarRef} args={[null as any, null as any, dust.length]} frustumCulled={false}>
           <planeGeometry args={[2, 2]} />
           <primitive object={billboardFarMat} attach="material" />
         </instancedMesh>

@@ -94,7 +94,7 @@ Further Optimization:
 - Thrusters (6,6k triangles) What is meant by thrusters and why do they have 4-6,6k triangles
 - Stations: Do not render stations further than 30km away.
 - Star(s): do not render the star as a conventional mesh at all, but simply as a circle billboard always pointing at the camera, with the same material as it has right now.
-
+- Weapons/projectiles: 6k while spam shooting. The projectiles do not need to be high poly meshes. two triangles in a X shape (length wise, to be visible even from the side) per billboard in the same material are enough.
 36 triangles per asteroid dust means there are 1000 asteroids in the dust field.
 
 
