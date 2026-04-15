@@ -190,9 +190,45 @@ interface AuthSession {
   };
 }
 
+type AdminItemTab = 'drone' | 'ship' | 'misc';
+
+interface ItemThumbnailData {
+  icon: AdminItemTab;
+  accent: string;
+  background: string;
+  label: string;
+}
+
+interface AdminItemDefinition {
+  id: string;
+  name: string;
+  tab: AdminItemTab;
+  description: string;
+  thumbnail: ItemThumbnailData;
+}
+
+interface InventoryItemData {
+  instanceId: string;
+  itemId: string;
+  itemName: string;
+  tab: AdminItemTab;
+  quantity: number;
+  thumbnail: ItemThumbnailData;
+}
+
 interface InventorySlotData {
   id: string;
-  itemName: string | null;
+  item: InventoryItemData | null;
+}
+
+interface WorldBootstrapPayload {
+  selfId: string;
+  players: PlayerSnapshot[];
+  inventory: InventoryItemData[];
+  inventorySlotCount: number;
+  developmentMode: boolean;
+  isAdmin: boolean;
+  adminItemCatalog: AdminItemDefinition[];
 }
 
 interface HudState {
@@ -226,6 +262,36 @@ interface DebugStatsState {
   heapUsedMb: number | null;
   heapLimitMb: number | null;
   dustStats: { totalObjects: number; renderedTris: number; nearCount: number; midCount: number; farCount: number };
+}
+
+const DEFAULT_INVENTORY_SLOT_COUNT = 3;
+const ADMIN_MENU_SHORTCUT = 'G';
+// Set to true to always enable dev/admin features on the client regardless of server flag.
+const FORCE_DEVELOPMENT_MODE = true;
+const ADMIN_ITEM_TABS: Array<{ id: AdminItemTab; label: string }> = [
+  { id: 'drone', label: 'Drone' },
+  { id: 'ship', label: 'Ship' },
+  { id: 'misc', label: 'Misc' },
+];
+
+function matchesKeyboardShortcut(event: KeyboardEvent, shortcut: string): boolean {
+  const normalizedShortcut = shortcut.trim().toLowerCase();
+  if (!normalizedShortcut) {
+    return false;
+  }
+
+  const normalizedCode = event.code.trim().toLowerCase();
+  const normalizedKey = event.key.trim().toLowerCase();
+
+  if (normalizedCode === normalizedShortcut || normalizedKey === normalizedShortcut) {
+    return true;
+  }
+
+  if (normalizedShortcut.length === 1 && /^[a-z0-9]$/i.test(normalizedShortcut)) {
+    return normalizedCode === `key${normalizedShortcut}` || normalizedCode === `digit${normalizedShortcut}`;
+  }
+
+  return false;
 }
 
 type SettingsTab = 'keybinds' | 'graphics' | 'audio';
@@ -4198,14 +4264,6 @@ function SunDirectionalLight({
 function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () => void }): ReactElement {
   const galaxy = useMemo(() => generateGalaxy(42), []);
   const stationNetwork = useMemo(() => buildStationNetwork(galaxy), [galaxy]);
-  const inventorySlots = useMemo<InventorySlotData[]>(
-    () => [
-      { id: 'slot-1', itemName: null },
-      { id: 'slot-2', itemName: null },
-      { id: 'slot-3', itemName: null },
-    ],
-    [],
-  );
   const homeSystemId = galaxy.systems[0]?.id ?? 'system-1';
   const homeStation = useMemo(
     () =>
@@ -4217,6 +4275,15 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
   );
   const [players, setPlayers] = useState<Record<string, PlayerSnapshot>>({});
   const [selfId, setSelfId] = useState('');
+  const [inventoryItems, setInventoryItems] = useState<InventoryItemData[]>([]);
+  const [inventorySlotCount, setInventorySlotCount] = useState(DEFAULT_INVENTORY_SLOT_COUNT);
+  const [developmentMode, setDevelopmentMode] = useState(FORCE_DEVELOPMENT_MODE);
+  const [adminModeEnabled, setAdminModeEnabled] = useState(false);
+  const [adminItemCatalog, setAdminItemCatalog] = useState<AdminItemDefinition[]>([]);
+  const [adminMenuOpen, setAdminMenuOpen] = useState(false);
+  const adminMenuOpenRef = useRef(false);
+  useEffect(() => { adminMenuOpenRef.current = adminMenuOpen; }, [adminMenuOpen]);
+  const [adminMenuStatus, setAdminMenuStatus] = useState('Admin catalog ready.');
   const [activeSystemId, setActiveSystemId] = useState(homeSystemId);
   const [activeFrameOrigin, setActiveFrameOrigin] = useState<Vec3Tuple>(homeStation?.localPosition ?? [0, 0, 0]);
   const [showDebugAnchors, setShowDebugAnchors] = useState(false);
@@ -4340,6 +4407,13 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     () => stationNetwork.filter((station) => station.systemId === activeSystemId),
     [activeSystemId, stationNetwork],
   );
+  const inventorySlots = useMemo<InventorySlotData[]>(
+    () => Array.from({ length: inventorySlotCount }, (_, index) => ({
+      id: `slot-${index + 1}`,
+      item: inventoryItems[index] ?? null,
+    })),
+    [inventoryItems, inventorySlotCount],
+  );
   
   
   // Refresh the ETA countdown every second (live countdown)
@@ -4389,6 +4463,9 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
   const sendState = useCallback((payload: PlayerSnapshot) => {
     socketRef.current?.emit('state:update', payload);
   }, []);
+  const grantAdminItem = useCallback((itemId: string) => {
+    socketRef.current?.emit('admin:item-grant', { itemId });
+  }, []);
 
   useEffect(() => {
     if (!homeStation) {
@@ -4421,21 +4498,42 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     socketRef.current = socket;
 
     socket.on('connect', () => {
+      console.log('[Socket] connected, id:', socket.id, '| token:', session.token ? 'present' : 'MISSING');
       setHud((current) => ({ ...current, connected: true, prompt: 'Click the viewport to capture the mouse.' }));
     });
 
-    socket.on('disconnect', () => {
+    socket.on('disconnect', (reason) => {
+      console.log('[Socket] disconnected, reason:', reason);
       setHud((current) => ({ ...current, connected: false, prompt: 'Disconnected. Refresh or re-login.' }));
     });
 
     socket.on('connect_error', (error) => {
-      setHud((current) => ({ ...current, connected: false, prompt: error.message || 'Connection failed.' }));
+      console.error('[Socket] connect_error:', error.message);
+      if (error.message === 'Invalid token.' || error.message === 'Authentication required.') {
+        // Stored token is expired/invalid — clear it so the user can re-login.
+        persistSession(null);
+        setHud((current) => ({ ...current, connected: false, prompt: 'Session expired. Please log in again.' }));
+      } else {
+        setHud((current) => ({ ...current, connected: false, prompt: error.message || 'Connection failed.' }));
+      }
     });
 
-    socket.on('world:bootstrap', (payload: { selfId: string; players: PlayerSnapshot[] }) => {
+    socket.on('world:bootstrap', (payload: WorldBootstrapPayload) => {
+      console.log('[Bootstrap] received — developmentMode:', payload.developmentMode, 'isAdmin:', payload.isAdmin);
       const mapped = Object.fromEntries(payload.players.map((player) => [player.socketId, player]));
       setSelfId(payload.selfId);
       setPlayers(mapped);
+      setInventoryItems(Array.isArray(payload.inventory) ? payload.inventory : []);
+      setInventorySlotCount(Number.isFinite(payload.inventorySlotCount) ? Math.max(1, payload.inventorySlotCount) : DEFAULT_INVENTORY_SLOT_COUNT);
+      setDevelopmentMode(FORCE_DEVELOPMENT_MODE || Boolean(payload.developmentMode));
+      setAdminModeEnabled(Boolean(payload.isAdmin ?? payload.developmentMode));
+      setAdminItemCatalog(Array.isArray(payload.adminItemCatalog) ? payload.adminItemCatalog : []);
+      setAdminMenuStatus(Boolean(payload.developmentMode)
+        ? `Development mode active. Press ${ADMIN_MENU_SHORTCUT} to open the admin catalog.`
+        : 'Development mode disabled on the server.');
+      if (!payload.developmentMode) {
+        setAdminMenuOpen(false);
+      }
 
       const self = payload.players.find((entry) => entry.socketId === payload.selfId);
       if (self) {
@@ -4454,6 +4552,14 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
 
     socket.on('world:snapshot', (nextPlayers: PlayerSnapshot[]) => {
       setPlayers(Object.fromEntries(nextPlayers.map((player) => [player.socketId, player])));
+    });
+
+    socket.on('inventory:update', (nextInventory: InventoryItemData[]) => {
+      setInventoryItems(Array.isArray(nextInventory) ? nextInventory : []);
+    });
+
+    socket.on('admin:item-grant-result', (payload: { ok?: boolean; message?: string }) => {
+      setAdminMenuStatus(payload?.message?.trim() || (payload?.ok ? 'Item added to inventory.' : 'Admin action failed.'));
     });
 
     return () => {
@@ -4495,6 +4601,56 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   }, [settings.keybinds.toggleDebug]);
+
+  useEffect(() => {
+    console.log('[AdminMenu] shortcut effect registered — developmentMode:', developmentMode, 'settingsOpen:', settingsOpen);
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target;
+      const isTypingTarget =
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        (target instanceof HTMLElement && target.isContentEditable);
+
+      console.log('[AdminMenu] keydown code:', event.code, 'key:', event.key, '| devMode:', developmentMode, 'settingsOpen:', settingsOpen, 'isTypingTarget:', isTypingTarget, 'repeat:', event.repeat);
+
+      if (isTypingTarget || event.repeat || settingsOpen || !developmentMode) {
+        return;
+      }
+
+      if (!matchesKeyboardShortcut(event, ADMIN_MENU_SHORTCUT)) {
+        return;
+      }
+
+      console.log('[AdminMenu] toggling menu open');
+      event.preventDefault();
+      setAdminMenuOpen((current) => !current);
+    };
+
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [adminModeEnabled, developmentMode, settingsOpen]);
+
+  useEffect(() => {
+    if (!adminMenuOpen) {
+      return undefined;
+    }
+
+    // Release pointer lock so the mouse cursor is visible while the menu is open.
+    if (document.pointerLockElement) {
+      document.exitPointerLock();
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.code === 'Escape') {
+        event.preventDefault();
+        setAdminMenuOpen(false);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [adminMenuOpen]);
 
   const handleFastTravel = useCallback(
     (station: StationNode) => {
@@ -4640,6 +4796,7 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           settings={settings}
           showDebugAnchors={showDebugAnchors}
           shipConfig={getShipConfig(DEFAULT_SHIP_ID)}
+          adminMenuOpenRef={adminMenuOpenRef}
         />
         {settings.graphics.postProcessingEnabled ? (
           settings.graphics.outlineStyle === 'geometric' ? <BlenderEdgePostProcess /> : <CartoonOutlinePostProcess />
@@ -4817,6 +4974,21 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
           </div>
         ) : null}
 
+        {developmentMode ? (
+          <div style={{ position: 'fixed', top: 6, left: '50%', transform: 'translateX(-50%)', background: '#ef4444', color: '#fff', padding: '2px 10px', fontSize: 11, zIndex: 99999, borderRadius: 4, fontFamily: 'monospace', pointerEvents: 'none', letterSpacing: 1 }}>DEV</div>
+        ) : null}
+
+        {developmentMode && adminMenuOpen ? (
+          <AdminItemMenuModal
+            catalog={adminItemCatalog}
+            inventoryItemCount={inventoryItems.length}
+            inventorySlotCount={inventorySlotCount}
+            onClose={() => setAdminMenuOpen(false)}
+            onGrantItem={grantAdminItem}
+            statusMessage={adminMenuStatus}
+          />
+        ) : null}
+
         {hud.speedLimitNotice ? (
           <div
             className="hud-speed-limit-banner"
@@ -4974,6 +5146,7 @@ function GameScene({
   settings,
   showDebugAnchors,
   shipConfig,
+  adminMenuOpenRef,
 }: {
   activeFrameOrigin: Vec3Tuple;
   autopilotActive: boolean;
@@ -4999,6 +5172,7 @@ function GameScene({
   settings: AppSettings;
   showDebugAnchors: boolean;
   shipConfig: ShipConfig;
+  adminMenuOpenRef: MutableRefObject<boolean>;
 }): ReactElement {
   const { camera, gl, scene } = useThree();
   const interiorCollision = useShipInteriorCollisionData(shipConfig);
@@ -5076,6 +5250,10 @@ function GameScene({
         return;
       }
 
+      if (adminMenuOpenRef.current) {
+        return;
+      }
+
       if (document.pointerLockElement !== gl.domElement) {
         gl.domElement.requestPointerLock();
       }
@@ -5102,6 +5280,9 @@ function GameScene({
     };
 
     const clickHandler = () => {
+      if (adminMenuOpenRef.current) {
+        return;
+      }
       if (document.pointerLockElement !== gl.domElement) {
         gl.domElement.requestPointerLock();
       }
@@ -6393,6 +6574,149 @@ function WarpSpeedEffect({ localStateRef }: { localStateRef: MutableRefObject<Lo
   );
 }
 
+function ItemThumbnail({ itemName, thumbnail }: { itemName: string; thumbnail: ItemThumbnailData }): ReactElement {
+  return (
+    <div className="item-thumbnail" style={{ ['--thumb-accent' as string]: thumbnail.accent, ['--thumb-background' as string]: thumbnail.background }}>
+      <div className="item-thumbnail-grid" />
+      <svg className="item-thumbnail-icon" viewBox="0 0 48 48" aria-hidden="true">
+        {thumbnail.icon === 'drone' ? (
+          <>
+            <circle cx="24" cy="24" r="6" fill="currentColor" opacity="0.95" />
+            <path d="M24 10L29 19H19L24 10Z" fill="currentColor" opacity="0.8" />
+            <path d="M38 24L29 29V19L38 24Z" fill="currentColor" opacity="0.8" />
+            <path d="M24 38L19 29H29L24 38Z" fill="currentColor" opacity="0.8" />
+            <path d="M10 24L19 19V29L10 24Z" fill="currentColor" opacity="0.8" />
+          </>
+        ) : null}
+        {thumbnail.icon === 'ship' ? (
+          <>
+            <path d="M24 7L35 24L24 20L13 24L24 7Z" fill="currentColor" opacity="0.92" />
+            <path d="M17 26L24 24L31 26L28 38L24 34L20 38L17 26Z" fill="currentColor" opacity="0.7" />
+          </>
+        ) : null}
+        {thumbnail.icon === 'misc' ? (
+          <>
+            <rect x="13" y="13" width="22" height="22" rx="3" fill="currentColor" opacity="0.85" />
+            <path d="M18 18H30V30H18Z" fill="none" stroke="rgba(2,6,23,0.8)" strokeWidth="2" />
+          </>
+        ) : null}
+      </svg>
+      <span className="item-thumbnail-label">{thumbnail.label}</span>
+      <span className="item-thumbnail-name">{itemName}</span>
+    </div>
+  );
+}
+
+function AdminItemMenuModal({
+  catalog,
+  inventoryItemCount,
+  inventorySlotCount,
+  onClose,
+  onGrantItem,
+  statusMessage,
+}: {
+  catalog: AdminItemDefinition[];
+  inventoryItemCount: number;
+  inventorySlotCount: number;
+  onClose: () => void;
+  onGrantItem: (itemId: string) => void;
+  statusMessage: string;
+}): ReactElement {
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedTab, setSelectedTab] = useState<AdminItemTab>('drone');
+  const normalizedQuery = searchQuery.trim().toLowerCase();
+
+  const visibleItems = useMemo(() => {
+    if (normalizedQuery) {
+      return catalog.filter((item) =>
+        item.name.toLowerCase().includes(normalizedQuery) ||
+        item.description.toLowerCase().includes(normalizedQuery) ||
+        item.tab.toLowerCase().includes(normalizedQuery),
+      );
+    }
+
+    return catalog.filter((item) => item.tab === selectedTab);
+  }, [catalog, normalizedQuery, selectedTab]);
+
+  return (
+    <div className="admin-menu-overlay" onClick={onClose} role="presentation">
+      <section className="admin-menu-modal tech-window" aria-label="Admin item menu" onClick={(event) => event.stopPropagation()}>
+        <div className="tech-window-header admin-menu-header">
+          <div>
+            <span className="tech-window-label">Development</span>
+            <span className="tech-window-title">Admin Item Menu</span>
+          </div>
+          <button className="tech-window-button admin-menu-close-button" onClick={onClose} type="button" aria-label="Close admin item menu" title="Close admin item menu">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true">
+              <path d="M6 6l12 12M18 6 6 18" />
+            </svg>
+          </button>
+        </div>
+        <div className="admin-menu-body">
+          <div className="admin-menu-toolbar">
+            <div className="navigator-search admin-menu-search">
+              <input
+                type="text"
+                placeholder="Search all tabs..."
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.currentTarget.value)}
+              />
+            </div>
+            <div className="admin-menu-meta">
+              <span>Inventory</span>
+              <strong>{inventoryItemCount} / {inventorySlotCount}</strong>
+            </div>
+          </div>
+          <nav className="admin-menu-tabs" aria-label="Admin item tabs">
+            {ADMIN_ITEM_TABS.map((tab) => {
+              const tabCount = catalog.filter((item) => item.tab === tab.id).length;
+              return (
+                <button
+                  key={tab.id}
+                  className={`admin-menu-tab${selectedTab === tab.id ? ' is-active' : ''}`}
+                  onClick={() => setSelectedTab(tab.id)}
+                  type="button"
+                >
+                  <span>{tab.label}</span>
+                  <strong>{tabCount}</strong>
+                </button>
+              );
+            })}
+          </nav>
+          <div className="admin-menu-results">
+            {visibleItems.length ? (
+              <div className="admin-menu-grid">
+                {visibleItems.map((item) => (
+                  <button key={item.id} className="admin-menu-card" onClick={() => onGrantItem(item.id)} type="button">
+                    <ItemThumbnail itemName={item.name} thumbnail={item.thumbnail} />
+                    <div className="admin-menu-card-copy">
+                      <div>
+                        <strong>{item.name}</strong>
+                        <span>{normalizedQuery ? ADMIN_ITEM_TABS.find((tab) => tab.id === item.tab)?.label ?? item.tab : item.description}</span>
+                      </div>
+                      <em>{normalizedQuery ? item.description : 'Grant to inventory'}</em>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="admin-menu-empty">
+                <strong>{normalizedQuery ? 'No matching items' : 'No items registered'}</strong>
+                <span>
+                  {normalizedQuery
+                    ? 'Try a different search term. Search scans the full admin catalog across every tab.'
+                    : 'The admin catalog is ready. Add drone, ship, or misc definitions on the server to populate this menu.'}
+                </span>
+              </div>
+            )}
+          </div>
+          <div className="admin-menu-status">{statusMessage}</div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function InventoryHud({ slots }: { slots: InventorySlotData[] }): ReactElement {
   return (
     <section className="inventory-hud tech-window" aria-label="Inventory">
@@ -6402,13 +6726,23 @@ function InventoryHud({ slots }: { slots: InventorySlotData[] }): ReactElement {
       </div>
       <div className="inventory-slots">
         {slots.map((slot, index) => {
-          const empty = !slot.itemName;
+          const empty = !slot.item;
 
           return (
             <div key={slot.id} className={`inventory-slot${empty ? ' inventory-slot-empty' : ''}`}>
               <span className="inventory-slot-index">{index + 1}</span>
               <div className="inventory-slot-core">
-                <span>{slot.itemName ?? 'Empty'}</span>
+                {slot.item ? (
+                  <>
+                    <ItemThumbnail itemName={slot.item.itemName} thumbnail={slot.item.thumbnail} />
+                    <div className="inventory-slot-copy">
+                      <span>{slot.item.itemName}</span>
+                      <strong>x{slot.item.quantity}</strong>
+                    </div>
+                  </>
+                ) : (
+                  <span>Empty</span>
+                )}
               </div>
             </div>
           );

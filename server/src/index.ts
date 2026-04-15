@@ -11,6 +11,31 @@ import { Server } from 'socket.io';
 type Mode = 'space' | 'interior' | 'pilot';
 type Vec3 = [number, number, number];
 type Quat = [number, number, number, number];
+type AdminItemTab = 'drone' | 'ship' | 'misc';
+
+interface ItemThumbnailData {
+  icon: AdminItemTab;
+  accent: string;
+  background: string;
+  label: string;
+}
+
+interface AdminItemDefinition {
+  id: string;
+  name: string;
+  tab: AdminItemTab;
+  description: string;
+  thumbnail: ItemThumbnailData;
+}
+
+interface InventoryItemData {
+  instanceId: string;
+  itemId: string;
+  itemName: string;
+  tab: AdminItemTab;
+  quantity: number;
+  thumbnail: ItemThumbnailData;
+}
 
 interface UserRecord {
   id: string;
@@ -37,7 +62,10 @@ interface PlayerState {
   mode: Mode;
   insideShip: boolean;
   ship: ShipState;
+  inventory: InventoryItemData[];
 }
+
+type PublicPlayerState = Omit<PlayerState, 'inventory'>;
 
 interface AuthToken extends JwtPayload {
   userId: string;
@@ -46,10 +74,13 @@ interface AuthToken extends JwtPayload {
 
 const PORT = Number(process.env.PORT ?? 3001);
 const JWT_SECRET = process.env.JWT_SECRET ?? 'spacesim-dev-secret';
+const development_mode = String(process.env.DEVELOPMENT_MODE ?? 'false').toLowerCase() === 'true';
 const HOME_SYSTEM_ID = 'system-1';
 const PLAYER_SPAWN_SPREAD_METERS = 120;
 const PLAYER_SPAWN_VERTICAL_SPREAD_METERS = 40;
 const SHIP_SPAWN_OFFSET_METERS = 18;
+const INVENTORY_SLOT_COUNT = 3;
+const ADMIN_ITEM_CATALOG: AdminItemDefinition[] = [];
 const dataDir = path.resolve(process.cwd(), 'data');
 const usersFilePath = path.resolve(dataDir, 'users.json');
 const serverRoot = path.resolve(__dirname, '..');
@@ -112,8 +143,35 @@ function sanitizeQuat(value: unknown, fallback: Quat): Quat {
   return isQuat(value) ? [value[0], value[1], value[2], value[3]] : fallback;
 }
 
+function toPublicPlayerState(player: PlayerState): PublicPlayerState {
+  return {
+    socketId: player.socketId,
+    id: player.id,
+    username: player.username,
+    frameSystemId: player.frameSystemId,
+    frameOrigin: player.frameOrigin,
+    position: player.position,
+    velocity: player.velocity,
+    rotation: player.rotation,
+    mode: player.mode,
+    insideShip: player.insideShip,
+    ship: player.ship,
+  };
+}
+
+function buildInventoryItem(definition: AdminItemDefinition): InventoryItemData {
+  return {
+    instanceId: randomUUID(),
+    itemId: definition.id,
+    itemName: definition.name,
+    tab: definition.tab,
+    quantity: 1,
+    thumbnail: definition.thumbnail,
+  };
+}
+
 function broadcastSnapshot(): void {
-  io.emit('world:snapshot', Array.from(players.values()));
+  io.emit('world:snapshot', Array.from(players.values(), toPublicPlayerState));
 }
 
 function buildSpawnState(socketId: string, userId: string, username: string): PlayerState {
@@ -137,11 +195,12 @@ function buildSpawnState(socketId: string, userId: string, username: string): Pl
       velocity: [0, 0, 0],
       rotation: [0, 0, 0, 1],
     },
+    inventory: [],
   };
 }
 
 app.get('/api/health', (_request, response) => {
-  response.json({ ok: true, players: players.size });
+  response.json({ ok: true, players: players.size, development_mode });
 });
 
 if (hasClientBuild) {
@@ -229,6 +288,13 @@ app.post('/api/auth/login', async (request, response) => {
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token;
 
+  // In development mode allow unauthenticated / expired-token connections.
+  if (development_mode && typeof token !== 'string') {
+    socket.data.user = { userId: 'dev-guest-' + randomUUID(), username: 'DevGuest' } as AuthToken;
+    next();
+    return;
+  }
+
   if (typeof token !== 'string') {
     next(new Error('Authentication required.'));
     return;
@@ -245,7 +311,13 @@ io.use((socket, next) => {
     socket.data.user = decoded;
     next();
   } catch {
-    next(new Error('Invalid token.'));
+    if (development_mode) {
+      // Expired / invalid token in dev mode — allow anyway with a guest identity.
+      socket.data.user = { userId: 'dev-guest-' + randomUUID(), username: 'DevGuest' } as AuthToken;
+      next();
+    } else {
+      next(new Error('Invalid token.'));
+    }
   }
 });
 
@@ -256,7 +328,12 @@ io.on('connection', (socket) => {
 
   socket.emit('world:bootstrap', {
     selfId: socket.id,
-    players: Array.from(players.values()),
+    players: Array.from(players.values(), toPublicPlayerState),
+    inventory: player.inventory,
+    inventorySlotCount: INVENTORY_SLOT_COUNT,
+    developmentMode: development_mode,
+    isAdmin: development_mode,
+    adminItemCatalog: ADMIN_ITEM_CATALOG,
   });
 
   broadcastSnapshot();
@@ -287,6 +364,49 @@ io.on('connection', (socket) => {
 
     players.set(socket.id, current);
     broadcastSnapshot();
+  });
+
+  socket.on('admin:item-grant', (payload: { itemId?: string }) => {
+    const current = players.get(socket.id);
+
+    if (!current) {
+      return;
+    }
+
+    if (!development_mode) {
+      socket.emit('admin:item-grant-result', {
+        ok: false,
+        message: 'Development mode is disabled on the server.',
+      });
+      return;
+    }
+
+    const itemId = typeof payload?.itemId === 'string' ? payload.itemId : '';
+    const definition = ADMIN_ITEM_CATALOG.find((entry) => entry.id === itemId);
+
+    if (!definition) {
+      socket.emit('admin:item-grant-result', {
+        ok: false,
+        message: 'That item is not available in the admin catalog.',
+      });
+      return;
+    }
+
+    if (current.inventory.length >= INVENTORY_SLOT_COUNT) {
+      socket.emit('admin:item-grant-result', {
+        ok: false,
+        message: 'Inventory full. Clear a slot before granting another item.',
+      });
+      return;
+    }
+
+    current.inventory = [...current.inventory, buildInventoryItem(definition)];
+    players.set(socket.id, current);
+    socket.emit('inventory:update', current.inventory);
+    socket.emit('admin:item-grant-result', {
+      ok: true,
+      message: `${definition.name} added to inventory.`,
+    });
   });
 
   socket.on('disconnect', () => {

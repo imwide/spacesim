@@ -37,7 +37,7 @@ Player height is too tall inside the ship. I used a reference in blender that wa
 
 Integrating drones step by step:
 
-Make a working admin item menu. Make a server variable called "development_mode" and if this is active, there will be a working admin item menu, similar to minecrafts creative mode inventory. Admins will be able to immediatley access any item and test it. For now dont add any items, but add the base for this to work. Integrate different "tabs" (for now a drone tab, ship tab and misc tab) and a search function that works across tabs. When clicking an item, it will be added to the players inventory. Each item in the inventory should have a "thumbnail" for the item.
+
 
 - Let's add our first item: A drone. This one is called the "scout_drone" It should be available in the drone tab in the admin item menu. Thumbnail and 3d model (glb file, including LODs prepared for the existing LOD system) can be found under public/models/drones and public/textures/thumbnails
 For each drones (there will be more in the future) add a config file with for now the paths of the model and thumbnail. The palyer should for now just be able to get this drone from the menu, and have it as an item. no additional functionality yet.
