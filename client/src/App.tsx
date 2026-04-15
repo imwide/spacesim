@@ -89,9 +89,10 @@ const INTERIOR_GRAVITY_METERS_PER_SECOND = 9.81 * METERS_PER_WORLD_UNIT;
 const INTERIOR_JUMP_VELOCITY = 5.0 * METERS_PER_WORLD_UNIT;
 const SHIP_THRUST_ACCELERATION = 14 * METERS_PER_WORLD_UNIT;
 const SHIP_MAX_SPEED_METERS_PER_SECOND = 240 * METERS_PER_WORLD_UNIT;
-const SHIP_STATION_SLOW_ZONE_START_METERS = 2_000;
+const SHIP_STATION_SLOW_ZONE_START_METERS = 1_200;
 const SHIP_STATION_SLOW_ZONE_MIN_METERS = 100;
 const SHIP_STATION_SLOW_ZONE_MIN_SPEED_METERS_PER_SECOND = 10;
+const SHIP_STATION_SLOW_ZONE_DISABLE_AWAY_DOT = -0.5; // cos(120°)
 const SHIP_STATION_MANUAL_HANDLING_MULTIPLIER = 0.2;
 const SHIP_LINEAR_DAMPING = 0.18;
 const SHIP_MANUAL_ANGULAR_ACCELERATION = 2.8;
@@ -1498,7 +1499,12 @@ function getStationBorderLimitedManualSpeed(
   defaultMaxSpeed: number,
 ): StationBorderSpeedLimitInfo {
   let nearestBorderDistance = Number.POSITIVE_INFINITY;
-  let nearestAwayDirection: THREE.Vector3 | null = null;
+  let nearestFieldRadius = 0;
+  let nearestCenterDistance = Number.POSITIVE_INFINITY;
+  let nearestAwayDirectionX = 0;
+  let nearestAwayDirectionY = 0;
+  let nearestAwayDirectionZ = 0;
+  let hasNearestAwayDirection = false;
 
   fields.forEach((field) => {
     const dx = shipPosition.x - field.position[0];
@@ -1508,13 +1514,36 @@ function getStationBorderLimitedManualSpeed(
     const borderDistance = centerDistance - field.radius - shipRadius;
     if (borderDistance < nearestBorderDistance) {
       nearestBorderDistance = borderDistance;
-      nearestAwayDirection = centerDistance > 1e-6
-        ? new THREE.Vector3(dx / centerDistance, dy / centerDistance, dz / centerDistance)
-        : null;
+      nearestFieldRadius = field.radius;
+      nearestCenterDistance = centerDistance;
+      if (centerDistance > 1e-6) {
+        nearestAwayDirectionX = dx / centerDistance;
+        nearestAwayDirectionY = dy / centerDistance;
+        nearestAwayDirectionZ = dz / centerDistance;
+        hasNearestAwayDirection = true;
+      } else {
+        nearestAwayDirectionX = 0;
+        nearestAwayDirectionY = 0;
+        nearestAwayDirectionZ = 0;
+        hasNearestAwayDirection = false;
+      }
     }
   });
-  if (!Number.isFinite(nearestBorderDistance) || nearestBorderDistance >= SHIP_STATION_SLOW_ZONE_START_METERS) {
+  const outerBoundaryRadius = nearestFieldRadius + shipRadius + SHIP_STATION_SLOW_ZONE_START_METERS;
+  if (!Number.isFinite(nearestBorderDistance) || !Number.isFinite(nearestCenterDistance) || nearestCenterDistance > outerBoundaryRadius) {
     return { maxSpeed: defaultMaxSpeed, active: false };
+  }
+
+  if (hasNearestAwayDirection && shipVelocity.lengthSq() > 1e-6) {
+    const velocityLength = Math.sqrt(shipVelocity.x * shipVelocity.x + shipVelocity.y * shipVelocity.y + shipVelocity.z * shipVelocity.z);
+    const velocityTowardStation = -(
+      (shipVelocity.x / velocityLength) * nearestAwayDirectionX +
+      (shipVelocity.y / velocityLength) * nearestAwayDirectionY +
+      (shipVelocity.z / velocityLength) * nearestAwayDirectionZ
+    );
+    if (velocityTowardStation < SHIP_STATION_SLOW_ZONE_DISABLE_AWAY_DOT) {
+      return { maxSpeed: defaultMaxSpeed, active: false };
+    }
   }
 
   if (nearestBorderDistance <= SHIP_STATION_SLOW_ZONE_MIN_METERS) {
@@ -1534,11 +1563,16 @@ function getStationBorderLimitedManualSpeed(
     THREE.MathUtils.clamp(normalizedDistance, 0, 1),
   );
 
-  if (!nearestAwayDirection || shipVelocity.lengthSq() <= 1e-6) {
+  if (!hasNearestAwayDirection || shipVelocity.lengthSq() <= 1e-6) {
     return { maxSpeed: limitedSpeed, active: true };
   }
 
-  const movingAway = shipVelocity.clone().normalize().dot(nearestAwayDirection) > 0;
+  const shipVelocityLength = Math.sqrt(shipVelocity.x * shipVelocity.x + shipVelocity.y * shipVelocity.y + shipVelocity.z * shipVelocity.z);
+  const movingAway = (
+    (shipVelocity.x / shipVelocityLength) * nearestAwayDirectionX +
+    (shipVelocity.y / shipVelocityLength) * nearestAwayDirectionY +
+    (shipVelocity.z / shipVelocityLength) * nearestAwayDirectionZ
+  ) > 0;
   if (!movingAway) {
     return { maxSpeed: limitedSpeed, active: true };
   }
@@ -7287,6 +7321,45 @@ function createGalaxySpriteTexture(seedKey: string): THREE.CanvasTexture {
   return texture;
 }
 
+let _circularGlowTex: THREE.CanvasTexture | null = null;
+function getCircularGlowTexture(): THREE.CanvasTexture {
+  if (_circularGlowTex) return _circularGlowTex;
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
+  const c = size / 2;
+  const g = ctx.createRadialGradient(c, c, 0, c, c, c);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.3, 'rgba(255,255,255,0.7)');
+  g.addColorStop(0.6, 'rgba(255,255,255,0.2)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  _circularGlowTex = new THREE.CanvasTexture(canvas);
+  return _circularGlowTex;
+}
+
+let _solidCircleTex: THREE.CanvasTexture | null = null;
+function getSolidCircleTexture(): THREE.CanvasTexture {
+  if (_solidCircleTex) return _solidCircleTex;
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
+  const c = size / 2;
+  const g = ctx.createRadialGradient(c, c, 0, c, c, c);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.85, 'rgba(255,255,255,1)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  _solidCircleTex = new THREE.CanvasTexture(canvas);
+  return _solidCircleTex;
+}
+
 type SkyFeatureSprite = {
   color: string;
   opacity: number;
@@ -7297,12 +7370,16 @@ type SkyFeatureSprite = {
 };
 
 function GalaxySkybox(): ReactElement {
-  const { camera } = useThree();
+  const { camera, scene } = useThree();
   const groupRef = useRef<THREE.Group>(null);
   const skyRadius = 9_000_000;
   const starRadius = skyRadius * 0.965;
   const featureRadius = skyRadius * 0.94;
-  const nebulaTexture = useMemo(() => createNebulaSkyTexture('spacesim-skybox-v2'), []);
+  const nebulaTexture = useMemo(() => {
+    const tex = createNebulaSkyTexture('spacesim-skybox-v2');
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    return tex;
+  }, []);
   const glowTexture = useMemo(() => createSkyGlowTexture(), []);
   const galaxyTextureA = useMemo(() => createGalaxySpriteTexture('spacesim-galaxy-a'), []);
   const galaxyTextureB = useMemo(() => createGalaxySpriteTexture('spacesim-galaxy-b'), []);
@@ -7389,13 +7466,15 @@ function GalaxySkybox(): ReactElement {
   }, [featureRadius, makeSpherePoint]);
 
   useEffect(() => {
+    scene.background = nebulaTexture;
     return () => {
       nebulaTexture.dispose();
       glowTexture.dispose();
       galaxyTextureA.dispose();
       galaxyTextureB.dispose();
+      scene.background = null;
     };
-  }, [galaxyTextureA, galaxyTextureB, glowTexture, nebulaTexture]);
+  }, [galaxyTextureA, galaxyTextureB, glowTexture, nebulaTexture, scene]);
 
   useFrame(() => {
     if (!groupRef.current) {
@@ -7416,18 +7495,6 @@ function GalaxySkybox(): ReactElement {
         triCategory: 'Skybox',
       }}
     >
-      <mesh frustumCulled={false} renderOrder={-1000} userData={{ ignoreMarkerOcclusion: true, ignoreOutline: true, ignoreStarOcclusion: true }}>
-        <sphereGeometry args={[skyRadius, 64, 32]} />
-        <meshBasicMaterial
-          map={nebulaTexture}
-          side={THREE.BackSide}
-          toneMapped={false}
-          depthWrite={false}
-          depthTest={false}
-          fog={false}
-        />
-      </mesh>
-
       {starLayers.map((layer, index) => (
         <points
           key={`sky-stars-${index}`}
@@ -7969,7 +8036,7 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
     <group ref={shieldGroupRef} userData={{ stationForceFieldId: fieldId, ignoreCameraCollision: true, ignoreOutline: true, triCategory: 'Force Fields' }}>
       {/* Raycast sphere hidden — analytical findStationForceFieldHitOnSegment handles collision */}
       <mesh ref={raycastMeshRef} visible={false} userData={{ stationForceFieldId: fieldId }} frustumCulled={false}>
-        <sphereGeometry args={[radius, 32, 24]} />
+        <sphereGeometry args={[radius, 16, 12]} />
         <meshBasicMaterial transparent opacity={0} depthWrite={false} side={THREE.DoubleSide} colorWrite={false} />
       </mesh>
       <mesh
@@ -7984,7 +8051,7 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
           customOutlineMaterial: forceFieldSentinelMaterial,
         }}
       >
-        <sphereGeometry args={[radius + 1.5, 64, 48]} />
+        <sphereGeometry args={[radius + 1.5, 24, 18]} />
         <shaderMaterial
           ref={shieldMaterialRef}
           uniforms={shieldUniforms}
@@ -8093,6 +8160,7 @@ function ShipWeaponEffects({
   const impactFlashRefs = useRef<Array<THREE.Mesh | null>>([]);
   const impactGlowRefs = useRef<Array<THREE.Mesh | null>>([]);
   const impactParticleRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const weaponGlowTex = useMemo(() => getCircularGlowTexture(), []);
   const lastFireAtRef = useRef(-Infinity);
   const nextGunIndexRef = useRef(0);
   const nextProjectileIndexRef = useRef(0);
@@ -8147,13 +8215,15 @@ function ShipWeaponEffects({
   const muzzleWorld = useMemo(() => new THREE.Vector3(), []);
   const tracerDirection = useMemo(() => new THREE.Vector3(), []);
   const tracerGlowScale = useMemo(
-    () => new THREE.Vector3(SHIP_WEAPON_PROJECTILE_RADIUS * 2.4, SHIP_WEAPON_PROJECTILE_LENGTH * 1.08, SHIP_WEAPON_PROJECTILE_RADIUS * 2.4),
+    () => new THREE.Vector3(SHIP_WEAPON_PROJECTILE_RADIUS * 4.8, SHIP_WEAPON_PROJECTILE_LENGTH * 1.08, 1),
     [],
   );
   const tracerMidpoint = useMemo(() => new THREE.Vector3(), []);
   const tracerQuaternion = useMemo(() => new THREE.Quaternion(), []);
+  const tracerCrossQuaternion = useMemo(() => new THREE.Quaternion(), []);
+  const tracerLocalCrossRot = useMemo(() => new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2), []);
   const tracerScale = useMemo(
-    () => new THREE.Vector3(SHIP_WEAPON_PROJECTILE_RADIUS, SHIP_WEAPON_PROJECTILE_LENGTH, SHIP_WEAPON_PROJECTILE_RADIUS),
+    () => new THREE.Vector3(SHIP_WEAPON_PROJECTILE_RADIUS * 2, SHIP_WEAPON_PROJECTILE_LENGTH, 1),
     [],
   );
   const proxyDir = useMemo(() => new THREE.Vector3(), []);
@@ -8360,10 +8430,13 @@ function ShipWeaponEffects({
       tracerDirection.copy(projectile.velocity).normalize();
       tracerMidpoint.copy(projectile.position).addScaledVector(tracerDirection, -SHIP_WEAPON_PROJECTILE_LENGTH * 0.5);
       tracerQuaternion.setFromUnitVectors(tracerUp, tracerDirection);
+      // Second plane rotated 90° around the velocity axis for X-shape
+      tracerCrossQuaternion.copy(tracerQuaternion).multiply(tracerLocalCrossRot);
 
       headMesh.visible = true;
       headMesh.position.copy(projectile.position);
       headMesh.scale.setScalar(SHIP_WEAPON_PROJECTILE_RADIUS * 3.25);
+      headMesh.quaternion.copy(frameState.camera.quaternion);
 
       tracerCoreMesh.visible = true;
       tracerCoreMesh.position.copy(tracerMidpoint);
@@ -8372,7 +8445,7 @@ function ShipWeaponEffects({
 
       tracerGlowMesh.visible = true;
       tracerGlowMesh.position.copy(tracerMidpoint);
-      tracerGlowMesh.quaternion.copy(tracerQuaternion);
+      tracerGlowMesh.quaternion.copy(tracerCrossQuaternion);
       tracerGlowMesh.scale.copy(tracerGlowScale);
     }
 
@@ -8404,9 +8477,11 @@ function ShipWeaponEffects({
       flashCoreMesh.visible = true;
       flashCoreMesh.position.copy(flashPosition);
       flashCoreMesh.scale.setScalar(flash.scale * (0.45 + alpha * 1.2));
+      flashCoreMesh.quaternion.copy(frameState.camera.quaternion);
       flashGlowMesh.visible = true;
       flashGlowMesh.position.copy(flashPosition);
       flashGlowMesh.scale.setScalar(flash.scale * (0.9 + alpha * 2.0));
+      flashGlowMesh.quaternion.copy(frameState.camera.quaternion);
       const flashCoreMaterial = flashCoreMesh.material;
       if (flashCoreMaterial instanceof THREE.MeshBasicMaterial) {
         flashCoreMaterial.opacity = 0.78 + alpha * 0.22;
@@ -8456,6 +8531,7 @@ function ShipWeaponEffects({
       impactFlashMesh.visible = true;
       impactFlashMesh.position.copy(impact.position);
       impactFlashMesh.scale.setScalar((0.18 + impactAlpha * 0.72) * SHIP_WEAPON_IMPACT_SCALE_MULTIPLIER);
+      impactFlashMesh.quaternion.copy(frameState.camera.quaternion);
       const impactFlashMaterial = impactFlashMesh.material;
       if (impactFlashMaterial instanceof THREE.MeshBasicMaterial) {
         impactFlashMaterial.opacity = 0.45 + impactAlpha * 0.55;
@@ -8464,6 +8540,7 @@ function ShipWeaponEffects({
       impactGlowMesh.visible = true;
       impactGlowMesh.position.copy(impact.position);
       impactGlowMesh.scale.setScalar((0.35 + impactAlpha * 1.4) * SHIP_WEAPON_IMPACT_SCALE_MULTIPLIER);
+      impactGlowMesh.quaternion.copy(frameState.camera.quaternion);
       const impactGlowMaterial = impactGlowMesh.material;
       if (impactGlowMaterial instanceof THREE.MeshBasicMaterial) {
         impactGlowMaterial.opacity = 0.18 + impactAlpha * 0.2;
@@ -8482,6 +8559,7 @@ function ShipWeaponEffects({
         particleMesh.visible = true;
         particleMesh.position.copy(impact.position).add(impact.particleOffsets[particleIndex]);
         particleMesh.scale.setScalar((0.03 + impactAlpha * 0.08) * SHIP_WEAPON_IMPACT_SCALE_MULTIPLIER);
+        particleMesh.quaternion.copy(frameState.camera.quaternion);
         const particleMaterial = particleMesh.material;
         if (particleMaterial instanceof THREE.MeshBasicMaterial) {
           particleMaterial.opacity = 0.1 + impactAlpha * 0.5;
@@ -8494,23 +8572,25 @@ function ShipWeaponEffects({
     <group ref={weaponEffectsRef} userData={{ ignoreWeaponCollision: true, ignoreOutline: true, triCategory: 'Weapons' }}>
       {projectiles.map((_, index) => (
         <group key={`weapon-projectile-${index}`}>
+          {/* X-shape billboard: two crossed planes along the velocity axis */}
           <mesh ref={(mesh) => {
             projectileTracerGlowRefs.current[index] = mesh;
           }} visible={false} renderOrder={60}>
-            <cylinderGeometry args={[1, 1, 1, 8, 1, true]} />
-            <meshBasicMaterial color="#ff8a47" transparent opacity={0.22} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+            <planeGeometry args={[1, 1]} />
+            <meshBasicMaterial color="#ffffff" transparent opacity={0.22} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} side={THREE.DoubleSide} />
           </mesh>
           <mesh ref={(mesh) => {
             projectileTracerCoreRefs.current[index] = mesh;
           }} visible={false} renderOrder={61}>
-            <cylinderGeometry args={[1, 1, 1, 8, 1, true]} />
-            <meshBasicMaterial color="#ffffff" transparent opacity={0.96} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+            <planeGeometry args={[1, 1]} />
+            <meshBasicMaterial color="#ffffff" transparent opacity={0.96} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} side={THREE.DoubleSide} />
           </mesh>
+          {/* Head replaced by a small plane billboard */}
           <mesh ref={(mesh) => {
             projectileHeadRefs.current[index] = mesh;
           }} visible={false} renderOrder={62}>
-            <sphereGeometry args={[1, 10, 10]} />
-            <meshBasicMaterial color="#fff3d6" transparent opacity={1} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+            <planeGeometry args={[2, 2]} />
+            <meshBasicMaterial color="#fff3d6" transparent opacity={1} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} side={THREE.DoubleSide} />
           </mesh>
         </group>
       ))}
@@ -8519,14 +8599,14 @@ function ShipWeaponEffects({
           <mesh ref={(mesh) => {
             flashGlowRefs.current[index] = mesh;
           }} visible={false} renderOrder={63}>
-            <sphereGeometry args={[1, 12, 12]} />
-            <meshBasicMaterial color="#fff0d8" transparent opacity={0.6} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+            <planeGeometry args={[2, 2]} />
+            <meshBasicMaterial color="#fff0d8" transparent opacity={0.6} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} side={THREE.DoubleSide} map={weaponGlowTex} />
           </mesh>
           <mesh ref={(mesh) => {
             flashCoreRefs.current[index] = mesh;
           }} visible={false} renderOrder={64}>
-            <sphereGeometry args={[1, 12, 12]} />
-            <meshBasicMaterial color="#ffffff" transparent opacity={1} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+            <planeGeometry args={[2, 2]} />
+            <meshBasicMaterial color="#ffffff" transparent opacity={1} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} side={THREE.DoubleSide} map={weaponGlowTex} />
           </mesh>
         </group>
       ))}
@@ -8535,14 +8615,14 @@ function ShipWeaponEffects({
           <mesh ref={(mesh) => {
             impactGlowRefs.current[impactIndex] = mesh;
           }} visible={false} renderOrder={65}>
-            <sphereGeometry args={[1, 12, 12]} />
-            <meshBasicMaterial color="#ff9d57" transparent opacity={0.35} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+            <planeGeometry args={[2, 2]} />
+            <meshBasicMaterial color="#ff9d57" transparent opacity={0.35} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} side={THREE.DoubleSide} map={weaponGlowTex} />
           </mesh>
           <mesh ref={(mesh) => {
             impactFlashRefs.current[impactIndex] = mesh;
           }} visible={false} renderOrder={66}>
-            <sphereGeometry args={[1, 12, 12]} />
-            <meshBasicMaterial color="#fff4df" transparent opacity={1} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+            <planeGeometry args={[2, 2]} />
+            <meshBasicMaterial color="#fff4df" transparent opacity={1} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} side={THREE.DoubleSide} map={weaponGlowTex} />
           </mesh>
           {Array.from({ length: SHIP_WEAPON_IMPACT_PARTICLE_COUNT }, (_, particleIndex) => (
             <mesh
@@ -8553,8 +8633,8 @@ function ShipWeaponEffects({
               visible={false}
               renderOrder={67}
             >
-              <sphereGeometry args={[1, 8, 8]} />
-              <meshBasicMaterial color="#d9c2a3" transparent opacity={0.6} depthWrite={false} toneMapped={false} />
+              <planeGeometry args={[2, 2]} />
+              <meshBasicMaterial color="#d9c2a3" transparent opacity={0.6} depthWrite={false} toneMapped={false} side={THREE.DoubleSide} map={weaponGlowTex} />
             </mesh>
           ))}
         </group>
@@ -8593,6 +8673,19 @@ function ShipThrusterEffects({
   const particlePosition = useMemo(() => new THREE.Vector3(), []);
   const flameScale = useMemo(() => new THREE.Vector3(), []);
   const glowScale = useMemo(() => new THREE.Vector3(), []);
+  const billboardQuat = useMemo(() => new THREE.Quaternion(), []);
+  const axialFlameQuat = useMemo(() => new THREE.Quaternion(), []);
+  const flameRollQuat = useMemo(() => new THREE.Quaternion(), []);
+  const finalFlameQuat = useMemo(() => new THREE.Quaternion(), []);
+  const thrusterGlowTex = useMemo(() => getCircularGlowTexture(), []);
+  const thrusterBillboardScaleMultiplier = 2.5;
+  const localPlumeDirection = useMemo(() => new THREE.Vector3(0, 0, 1), []);
+  const localCameraPosition = useMemo(() => new THREE.Vector3(), []);
+  const localFlameNormal = useMemo(() => new THREE.Vector3(), []);
+  const localFlameRight = useMemo(() => new THREE.Vector3(), []);
+  const localFallbackAxis = useMemo(() => new THREE.Vector3(), []);
+  const billboardBasis = useMemo(() => new THREE.Matrix4(), []);
+  const localFlameRollAxis = useMemo(() => new THREE.Vector3(0, 1, 0), []);
 
   useFrame((frameState, delta) => {
     const state = localStateRef.current;
@@ -8612,6 +8705,7 @@ function ShipThrusterEffects({
     inverseRotation.copy(state.shipRotation).invert();
     localVelocity.copy(state.shipVelocity).applyQuaternion(inverseRotation);
     localAcceleration.applyQuaternion(inverseRotation);
+    localCameraPosition.copy(frameState.camera.position).sub(state.shipPosition).applyQuaternion(inverseRotation);
 
     const forwardSpeed = Math.max(0, -localVelocity.z);
     const accelerationMagnitude = localAcceleration.length();
@@ -8659,6 +8753,9 @@ function ShipThrusterEffects({
       const visible = intensity > 0.015;
       const flameVisible = visible && plumeLength > 0.08;
 
+      // Billboard quaternion: camera world quat transformed into ship-local space
+      billboardQuat.copy(state.shipRotation).invert().premultiply(frameState.camera.quaternion);
+
       for (let blobIndex = 0; blobIndex < SHIP_THRUSTER_FLAME_BLOB_COUNT; blobIndex += 1) {
         const flameMesh = thrusterFlameRefs.current[thrusterIndex * SHIP_THRUSTER_FLAME_BLOB_COUNT + blobIndex];
         if (!flameMesh) {
@@ -8670,24 +8767,56 @@ function ShipThrusterEffects({
           continue;
         }
 
-        const blobPhase = blobIndex / Math.max(1, SHIP_THRUSTER_FLAME_BLOB_COUNT - 1);
+        const isBaseFlame = blobIndex === 0;
+        const blobPhase = isBaseFlame
+          ? 0
+          : (blobIndex - 1) / Math.max(1, SHIP_THRUSTER_FLAME_BLOB_COUNT - 2);
         const turbulence = elapsed * (1.5 + intensity * 2.6) + thrusterIndex * 0.91 + blobIndex * 1.37;
         const widthJitter = 0.82 + 0.2 * Math.sin(turbulence * 1.8);
         const sideJitter = 0.04 + intensity * 0.06;
         flamePosition.copy(anchor).add(baseOffset);
-        flamePosition.x += Math.sin(turbulence * 1.9) * sideJitter * (0.2 + blobPhase);
-        flamePosition.y += Math.cos(turbulence * 1.6) * sideJitter * (0.18 + blobPhase * 0.8);
-        flamePosition.z += plumeLength * (0.12 + blobPhase * 0.72);
+        flamePosition.x += Math.sin(turbulence * 1.9) * sideJitter * (isBaseFlame ? 0.08 : (0.2 + blobPhase));
+        flamePosition.y += Math.cos(turbulence * 1.6) * sideJitter * (isBaseFlame ? 0.08 : (0.18 + blobPhase * 0.8));
+        flamePosition.z += isBaseFlame
+          ? plumeLength * 0.05
+          : plumeLength * (0.18 + blobPhase * 0.68);
         flameMesh.position.copy(flamePosition);
 
-        const blobRadius = plumeRadius * (1.1 - blobPhase * 0.45) * widthJitter;
-        const blobLength = plumeLength * (0.38 - blobPhase * 0.05) * (0.92 + 0.16 * Math.sin(turbulence));
-        flameScale.set(blobRadius, blobRadius, blobLength);
+        const blobRadius = isBaseFlame
+          ? plumeRadius * (1.55 + intensity * 0.35) * widthJitter
+          : plumeRadius * (1.02 - blobPhase * 0.28) * widthJitter;
+        const blobLength = isBaseFlame
+          ? plumeRadius * (1.45 + intensity * 0.28)
+          : plumeLength * (0.46 - blobPhase * 0.08) * (0.92 + 0.16 * Math.sin(turbulence));
+        flameScale.set(blobRadius * thrusterBillboardScaleMultiplier, blobLength * thrusterBillboardScaleMultiplier, 1);
         flameMesh.scale.copy(flameScale);
+        if (isBaseFlame) {
+          flameMesh.quaternion.identity();
+        } else {
+          localFlameNormal.copy(localCameraPosition).sub(flamePosition);
+          localFlameNormal.addScaledVector(localPlumeDirection, -localFlameNormal.dot(localPlumeDirection));
+          if (localFlameNormal.lengthSq() < 1e-6) {
+            localFallbackAxis.set(1, 0, 0);
+            localFlameNormal.copy(localFallbackAxis).addScaledVector(localPlumeDirection, -localFallbackAxis.dot(localPlumeDirection));
+          }
+          if (localFlameNormal.lengthSq() < 1e-6) {
+            localFallbackAxis.set(0, 1, 0);
+            localFlameNormal.copy(localFallbackAxis).addScaledVector(localPlumeDirection, -localFallbackAxis.dot(localPlumeDirection));
+          }
+          localFlameNormal.normalize();
+          localFlameRight.copy(localPlumeDirection).cross(localFlameNormal).normalize();
+          billboardBasis.makeBasis(localFlameRight, localPlumeDirection, localFlameNormal);
+          axialFlameQuat.setFromRotationMatrix(billboardBasis);
+          flameRollQuat.setFromAxisAngle(localFlameRollAxis, ((blobIndex - 1) % 2) * (Math.PI / 2));
+          finalFlameQuat.copy(axialFlameQuat).multiply(flameRollQuat);
+          flameMesh.quaternion.copy(finalFlameQuat);
+        }
 
         const flameMaterial = flameMesh.material;
         if (flameMaterial instanceof THREE.MeshBasicMaterial) {
-          flameMaterial.opacity = (0.26 + intensity * 0.22) * (1 - blobPhase * 0.14);
+          flameMaterial.opacity = isBaseFlame
+            ? 0.38 + intensity * 0.2
+            : (0.24 + intensity * 0.2) * (1 - blobPhase * 0.14);
         }
       }
 
@@ -8697,8 +8826,9 @@ function ShipThrusterEffects({
           glowPosition.copy(anchor).add(baseOffset);
           glowMesh.position.copy(glowPosition);
           const flicker = 0.88 + 0.12 * Math.sin(elapsed * 22 + thrusterIndex * 1.73);
-          glowScale.setScalar((SHIP_THRUSTER_GLOW_RADIUS * (0.5 + intensity * 1.25)) * flicker);
+          glowScale.setScalar((SHIP_THRUSTER_GLOW_RADIUS * (0.5 + intensity * 1.25)) * flicker * thrusterBillboardScaleMultiplier);
           glowMesh.scale.copy(glowScale);
+          glowMesh.quaternion.identity();
           const glowMaterial = glowMesh.material;
           if (glowMaterial instanceof THREE.MeshBasicMaterial) {
             glowMaterial.opacity = 0.18 + intensity * 0.16;
@@ -8724,7 +8854,8 @@ function ShipThrusterEffects({
         particlePosition.y += Math.sin(driftAngle) * SHIP_THRUSTER_PARTICLE_DRIFT * phase;
         particlePosition.z += phase * plumeLength;
         mesh.position.copy(particlePosition);
-        mesh.scale.setScalar(0.05 + intensity * 0.11 + (1 - phase) * 0.08);
+        mesh.scale.setScalar((0.05 + intensity * 0.11 + (1 - phase) * 0.08) * thrusterBillboardScaleMultiplier);
+        mesh.quaternion.copy(billboardQuat);
         const particleMaterial = mesh.material;
         if (particleMaterial instanceof THREE.MeshBasicMaterial) {
           particleMaterial.opacity = (0.08 + intensity * 0.3) * (1 - phase * 0.72);
@@ -8746,8 +8877,8 @@ function ShipThrusterEffects({
               visible={false}
               renderOrder={58}
             >
-              <sphereGeometry args={[1, 10, 10]} />
-              <meshBasicMaterial color="#c9fbff" transparent opacity={0.42} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+              <planeGeometry args={[2, 2]} />
+              <meshBasicMaterial color="#c9fbff" transparent opacity={0.42} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} side={THREE.DoubleSide} map={thrusterGlowTex} />
             </mesh>
           ))}
           <mesh
@@ -8757,8 +8888,8 @@ function ShipThrusterEffects({
             visible={false}
             renderOrder={59}
           >
-            <sphereGeometry args={[1, 12, 12]} />
-            <meshBasicMaterial color="#4fe7ff" transparent opacity={0.3} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+            <planeGeometry args={[2, 2]} />
+            <meshBasicMaterial color="#4fe7ff" transparent opacity={0.3} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} side={THREE.DoubleSide} map={thrusterGlowTex} />
           </mesh>
           {Array.from({ length: SHIP_THRUSTER_PARTICLE_COUNT }, (_, particleIndex) => (
             <mesh
@@ -8769,8 +8900,8 @@ function ShipThrusterEffects({
               visible={false}
               renderOrder={57}
             >
-              <sphereGeometry args={[1, 8, 8]} />
-              <meshBasicMaterial color="#8bf3ff" transparent opacity={0.22} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} />
+              <planeGeometry args={[2, 2]} />
+              <meshBasicMaterial color="#8bf3ff" transparent opacity={0.22} depthWrite={false} toneMapped={false} blending={THREE.AdditiveBlending} side={THREE.DoubleSide} map={thrusterGlowTex} />
             </mesh>
           ))}
         </group>
@@ -8782,8 +8913,8 @@ function ShipThrusterEffects({
 function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system, localStateRef }: { autopilotTarget: AutopilotDestination | null; highlightedTarget: HighlightTarget | null; renderPosition: Vec3Tuple; system: StarSystemData; localStateRef: MutableRefObject<LocalGameState> }): ReactElement {
   const { camera } = useThree();
   const starVisualsRef = useRef<THREE.Group>(null);
-  const haloRef = useRef<THREE.Mesh>(null);
-  const haloMaterialRef = useRef<THREE.MeshBasicMaterial>(null);
+  const haloRef = useRef<THREE.Sprite>(null);
+  const haloMaterialRef = useRef<THREE.SpriteMaterial>(null);
   const worldPosition = useMemo(() => new THREE.Vector3(...renderPosition), [renderPosition]);
   const projectedPosition = useMemo(() => new THREE.Vector3(), []);
   const cameraForward = useMemo(() => new THREE.Vector3(), []);
@@ -8831,7 +8962,7 @@ function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system
     const haloScale = 2.05 + closeBoost * 0.8 + screenFactor * 0.75;
     const haloOpacity = THREE.MathUtils.clamp((0.08 + closeBoost * 0.12 + screenFactor * 0.03) * visibilityFactor, 0.03, 0.42);
 
-    haloRef.current.scale.setScalar(haloScale);
+    haloRef.current.scale.setScalar(haloScale * system.radius * 2);
     haloMaterialRef.current.opacity = haloOpacity;
   });
 
@@ -8845,14 +8976,12 @@ function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system
         visibleRange={STAR_LENS_FLARE_RANGE}
       >
         <group ref={starVisualsRef} userData={{ triCategory: 'Star' }}>
-          <mesh userData={{ ignoreStarOcclusion: true }}>
-            <sphereGeometry args={[system.radius, 24, 24]} />
-            <meshBasicMaterial color={system.color} />
-          </mesh>
-          <mesh ref={haloRef} scale={1.85} userData={{ ignoreStarOcclusion: true }}>
-            <sphereGeometry args={[system.radius, 20, 20]} />
-            <meshBasicMaterial ref={haloMaterialRef} color={system.color} transparent opacity={0.11} />
-          </mesh>
+          <sprite scale={[system.radius * 2, system.radius * 2, 1]} userData={{ ignoreStarOcclusion: true }}>
+            <spriteMaterial color={system.color} toneMapped={false} map={getSolidCircleTexture()} />
+          </sprite>
+          <sprite ref={haloRef} scale={[system.radius * 2 * 1.85, system.radius * 2 * 1.85, 1]} userData={{ ignoreStarOcclusion: true }}>
+            <spriteMaterial ref={haloMaterialRef} color={system.color} transparent opacity={0.11} map={getCircularGlowTexture()} />
+          </sprite>
         </group>
       </PhysicalProxyGroup>
 
@@ -9333,7 +9462,7 @@ function SpaceStation({ station, physicalPosition, scale }: { station: StationDa
   }, [station.id]);
 
   return (
-    <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={1_200_000_000}>
+    <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={30_000}>
       <>
         <StationForceField fieldId={`${station.id}:force-field`} radius={fieldRadius} />
         {station.modelPath ? (
