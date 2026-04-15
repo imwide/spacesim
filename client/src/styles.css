@@ -421,10 +421,57 @@ button.tech-window-button.tech-window-button-danger:hover {
   font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', monospace;
   font-size: 0.78rem;
   line-height: 1.35;
-  text-align: center;
-  white-space: pre;
   text-shadow: 0 1px 8px rgba(0, 0, 0, 0.7);
   z-index: 3;
+}
+
+.debug-stats-columns {
+  display: flex;
+  gap: 2rem;
+  align-items: flex-start;
+}
+
+.debug-stats-general {
+  white-space: pre;
+  text-align: left;
+}
+
+.debug-stats-triangles {
+  text-align: left;
+  min-width: 10rem;
+}
+
+.debug-stats-tri-header {
+  display: block;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  opacity: 0.6;
+  margin-bottom: 0.18rem;
+}
+
+.debug-stats-tri-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  line-height: 1.4;
+}
+
+.debug-stats-tri-name {
+  opacity: 0.78;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 10rem;
+}
+
+.debug-stats-tri-count {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.debug-stats-dust {
+  text-align: left;
+  min-width: 9rem;
 }
 
 .hud-interaction-pills {

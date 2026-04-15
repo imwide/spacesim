@@ -1,6 +1,6 @@
 import { Html, useGLTF } from '@react-three/drei';
 import { fixGLBTransparency, setupLODs } from './lod';
-import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { Canvas, useFrame, useLoader, useThree } from '@react-three/fiber';
 import { type ShipConfig, getShipConfig, DEFAULT_SHIP_ID } from './shipConfig';
 import {
   ShipExteriorModel,
@@ -208,16 +208,23 @@ interface HudState {
   interactionPills: Array<{ key: string; label: string }>;
 }
 
+interface TriangleBreakdown {
+  total: number;
+  categories: Map<string, number>;
+}
+
 interface DebugStatsState {
   fps: number;
   calls: number;
   triangles: number;
+  triangleBreakdown: Map<string, number>;
   lines: number;
   points: number;
   geometries: number;
   textures: number;
   heapUsedMb: number | null;
   heapLimitMb: number | null;
+  dustStats: { totalObjects: number; renderedTris: number; nearCount: number; midCount: number; farCount: number };
 }
 
 type SettingsTab = 'keybinds' | 'graphics' | 'audio';
@@ -444,8 +451,21 @@ interface StationBorderSpeedLimitInfo {
   active: boolean;
 }
 
-function getVisibleSceneTriangleCount(scene: THREE.Scene): number {
-  let triangleCount = 0;
+function getTriangleCategory(object: THREE.Object3D): string {
+  let node: THREE.Object3D | null = object;
+  while (node) {
+    const cat = node.userData?.triCategory;
+    if (typeof cat === 'string') {
+      return cat;
+    }
+    node = node.parent;
+  }
+  return 'Other';
+}
+
+function getVisibleSceneTriangleBreakdown(scene: THREE.Scene): TriangleBreakdown {
+  let total = 0;
+  const categories = new Map<string, number>();
 
   scene.traverseVisible((object) => {
     if (!(object instanceof THREE.Mesh)) {
@@ -461,22 +481,27 @@ function getVisibleSceneTriangleCount(scene: THREE.Scene): number {
     const hasFiniteDrawRange = Number.isFinite(drawRangeCount) && drawRangeCount >= 0;
     const instanceMultiplier = object instanceof THREE.InstancedMesh ? Math.max(object.count, 0) : 1;
 
+    let meshTriangles = 0;
+
     if (geometry.index) {
       const indexCount = hasFiniteDrawRange ? Math.min(geometry.index.count, drawRangeCount) : geometry.index.count;
-      triangleCount += Math.floor(indexCount / 3) * instanceMultiplier;
-      return;
+      meshTriangles = Math.floor(indexCount / 3) * instanceMultiplier;
+    } else {
+      const positionAttribute = geometry.getAttribute('position');
+      if (!positionAttribute) {
+        return;
+      }
+
+      const vertexCount = hasFiniteDrawRange ? Math.min(positionAttribute.count, drawRangeCount) : positionAttribute.count;
+      meshTriangles = Math.floor(vertexCount / 3) * instanceMultiplier;
     }
 
-    const positionAttribute = geometry.getAttribute('position');
-    if (!positionAttribute) {
-      return;
-    }
-
-    const vertexCount = hasFiniteDrawRange ? Math.min(positionAttribute.count, drawRangeCount) : positionAttribute.count;
-    triangleCount += Math.floor(vertexCount / 3) * instanceMultiplier;
+    total += meshTriangles;
+    const category = getTriangleCategory(object);
+    categories.set(category, (categories.get(category) ?? 0) + meshTriangles);
   });
 
-  return triangleCount;
+  return { total, categories };
 }
 
 interface StationForceFieldHitResult {
@@ -4167,12 +4192,14 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
     fps: 0,
     calls: 0,
     triangles: 0,
+    triangleBreakdown: new Map(),
     lines: 0,
     points: 0,
     geometries: 0,
     textures: 0,
     heapUsedMb: null,
     heapLimitMb: null,
+    dustStats: { totalObjects: 0, renderedTris: 0, nearCount: 0, midCount: 0, farCount: 0 },
   });
   const [pilotCrosshair, setPilotCrosshair] = useState<PilotCrosshairState>({
     visible: false,
@@ -4185,6 +4212,11 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('keybinds');
   const [autopilotDestination, setAutopilotDestination] = useState<AutopilotDestination | null>(null);
+
+  // Keep the module-level debug flag in sync so AsteroidDust can read it in useFrame
+  useEffect(() => {
+    dustDebugOverlayActive = showDebugAnchors && settings.graphics.showDebugOverlay;
+  }, [showDebugAnchors, settings.graphics.showDebugOverlay]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -4783,7 +4815,9 @@ function SpaceSim({ session, onLogout }: { session: AuthSession; onLogout: () =>
 
         {showDebugAnchors && settings.graphics.showDebugOverlay ? (
           <div className="debug-stats-overlay" aria-label="Debug statistics">
-            {`FPS ${Math.round(debugStats.fps)}
+            <div className="debug-stats-columns">
+              <div className="debug-stats-general">
+                {`FPS ${Math.round(debugStats.fps)}
 CALLS ${debugStats.calls}
 TRIS ${debugStats.triangles.toLocaleString()}
 LINES ${debugStats.lines.toLocaleString()}
@@ -4791,6 +4825,43 @@ POINTS ${debugStats.points.toLocaleString()}
 GEOMS ${debugStats.geometries}
 TEX ${debugStats.textures}
 HEAP ${debugStats.heapUsedMb != null ? `${debugStats.heapUsedMb.toFixed(1)} / ${debugStats.heapLimitMb?.toFixed(1) ?? '-'} MB` : 'N/A'}`}
+              </div>
+              <div className="debug-stats-triangles">
+                <span className="debug-stats-tri-header">TRIANGLES</span>
+                {Array.from(debugStats.triangleBreakdown.entries())
+                  .sort((a, b) => b[1] - a[1])
+                  .filter(([, count]) => count > 0)
+                  .map(([category, count]) => (
+                    <div key={category} className="debug-stats-tri-row">
+                      <span className="debug-stats-tri-name">{category}</span>
+                      <span className="debug-stats-tri-count">{count.toLocaleString()}</span>
+                    </div>
+                  ))}
+              </div>
+              <div className="debug-stats-dust">
+                <span className="debug-stats-tri-header">DUST DETAIL</span>
+                <div className="debug-stats-tri-row">
+                  <span className="debug-stats-tri-name">Particles</span>
+                  <span className="debug-stats-tri-count">{debugStats.dustStats.totalObjects.toLocaleString()}</span>
+                </div>
+                <div className="debug-stats-tri-row">
+                  <span className="debug-stats-tri-name">Rendered</span>
+                  <span className="debug-stats-tri-count">{debugStats.dustStats.renderedTris.toLocaleString()}</span>
+                </div>
+                <div className="debug-stats-tri-row">
+                  <span className="debug-stats-tri-name">Near{'<'}500m</span>
+                  <span className="debug-stats-tri-count">{debugStats.dustStats.nearCount.toLocaleString()}</span>
+                </div>
+                <div className="debug-stats-tri-row">
+                  <span className="debug-stats-tri-name" style={{ color: '#ff69b4' }}>Mid{'<'}2km</span>
+                  <span className="debug-stats-tri-count">{debugStats.dustStats.midCount.toLocaleString()}</span>
+                </div>
+                <div className="debug-stats-tri-row">
+                  <span className="debug-stats-tri-name" style={{ color: '#39ff14' }}>Far{'<'}20km</span>
+                  <span className="debug-stats-tri-count">{debugStats.dustStats.farCount.toLocaleString()}</span>
+                </div>
+              </div>
+            </div>
           </div>
         ) : null}
 
@@ -5045,7 +5116,15 @@ function GameScene({
     const interval = window.setInterval(() => {
       const renderInfo = gl.info.render;
       const memoryInfo = gl.info.memory;
-      const visibleTriangles = getVisibleSceneTriangleCount(scene);
+      const breakdown = getVisibleSceneTriangleBreakdown(scene);
+      // Snapshot dust debug stats and reset the accumulator for the next poll cycle
+      const dustStats = {
+        totalObjects: dustDebugAccumulator.totalObjects,
+        renderedTris: dustDebugAccumulator.renderedTris,
+        nearCount: dustDebugAccumulator.nearCount,
+        midCount: dustDebugAccumulator.midCount,
+        farCount: dustDebugAccumulator.farCount,
+      };
       const perfMemory = 'memory' in performance
         ? ((performance as Performance & {
             memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number };
@@ -5055,13 +5134,15 @@ function GameScene({
       setDebugStats({
         fps: potentialFpsValueRef.current,
         calls: renderInfo.calls,
-        triangles: visibleTriangles,
+        triangles: breakdown.total,
+        triangleBreakdown: breakdown.categories,
         lines: renderInfo.lines,
         points: renderInfo.points,
         geometries: memoryInfo.geometries,
         textures: memoryInfo.textures,
         heapUsedMb: perfMemory ? perfMemory.usedJSHeapSize / (1024 * 1024) : null,
         heapLimitMb: perfMemory ? perfMemory.jsHeapSizeLimit / (1024 * 1024) : null,
+        dustStats,
       });
     }, 250);
 
@@ -7332,6 +7413,7 @@ function GalaxySkybox(): ReactElement {
         ignoreMarkerOcclusion: true,
         ignoreOutline: true,
         ignoreStarOcclusion: true,
+        triCategory: 'Skybox',
       }}
     >
       <mesh frustumCulled={false} renderOrder={-1000} userData={{ ignoreMarkerOcclusion: true, ignoreOutline: true, ignoreStarOcclusion: true }}>
@@ -7695,6 +7777,7 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
   const shieldMaterialRef = useRef<THREE.ShaderMaterial>(null);
   const localHitPoint = useMemo(() => new THREE.Vector3(), []);
   const localNormal = useMemo(() => new THREE.Vector3(), []);
+  const fieldWorldPos = useMemo(() => new THREE.Vector3(), []);
   const shieldTexture = useMemo(() => createHexPatternTexture(), []);
   const shieldUniforms = useMemo(
     () => ({
@@ -7766,10 +7849,22 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
     shieldTexture.dispose();
   }, [shieldTexture]);
 
-  useFrame((_state, delta) => {
+  useFrame((state, delta) => {
+    // Skip processing entirely when the station is more than 10 km away.
+    // Within the linear proxy range (25 km), proxy distance === real distance.
+    const group = shieldGroupRef.current;
+    if (group) {
+      group.getWorldPosition(fieldWorldPos);
+      if (state.camera.position.distanceTo(fieldWorldPos) > 10_000) {
+        if (shieldMeshRef.current) shieldMeshRef.current.visible = false;
+        return;
+      }
+    }
+
     const shaderMaterial = shieldMaterialRef.current;
     const impactNormals = shieldUniforms.impactNormals.value;
     const impactStrengths = shieldUniforms.impactStrengths.value;
+    let anyActive = false;
 
     for (let i = 0; i < STATION_FORCE_FIELD_MAX_SPOTS; i += 1) {
       const spot = spots[i];
@@ -7788,9 +7883,16 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
 
       impactNormals[i].copy(spot.normal);
       impactStrengths[i] = 1 - spot.age / spot.life;
+      anyActive = true;
     }
 
-    if (shaderMaterial) {
+    // Only render the shield mesh when at least one impact spot is active.
+    // This eliminates ~6k triangles per force field when not being shot.
+    if (shieldMeshRef.current) {
+      shieldMeshRef.current.visible = anyActive;
+    }
+
+    if (shaderMaterial && anyActive) {
       shaderMaterial.uniformsNeedUpdate = true;
     }
   });
@@ -7864,14 +7966,15 @@ function StationForceField({ fieldId, radius }: { fieldId: string; radius: numbe
   }, []);
 
   return (
-    <group ref={shieldGroupRef} userData={{ stationForceFieldId: fieldId, ignoreCameraCollision: true, ignoreOutline: true }}>
-      {/* Invisible raycast-only sphere — always present, never visually rendered */}
-      <mesh ref={raycastMeshRef} userData={{ stationForceFieldId: fieldId }} frustumCulled={false}>
+    <group ref={shieldGroupRef} userData={{ stationForceFieldId: fieldId, ignoreCameraCollision: true, ignoreOutline: true, triCategory: 'Force Fields' }}>
+      {/* Raycast sphere hidden — analytical findStationForceFieldHitOnSegment handles collision */}
+      <mesh ref={raycastMeshRef} visible={false} userData={{ stationForceFieldId: fieldId }} frustumCulled={false}>
         <sphereGeometry args={[radius, 32, 24]} />
         <meshBasicMaterial transparent opacity={0} depthWrite={false} side={THREE.DoubleSide} colorWrite={false} />
       </mesh>
       <mesh
         ref={shieldMeshRef}
+        visible={false}
         renderOrder={69}
         frustumCulled={false}
         userData={{
@@ -8388,7 +8491,7 @@ function ShipWeaponEffects({
   });
 
   return (
-    <group ref={weaponEffectsRef} userData={{ ignoreWeaponCollision: true, ignoreOutline: true }}>
+    <group ref={weaponEffectsRef} userData={{ ignoreWeaponCollision: true, ignoreOutline: true, triCategory: 'Weapons' }}>
       {projectiles.map((_, index) => (
         <group key={`weapon-projectile-${index}`}>
           <mesh ref={(mesh) => {
@@ -8631,7 +8734,7 @@ function ShipThrusterEffects({
   });
 
   return (
-    <group userData={{ ignoreOutline: true, ignoreWeaponCollision: true }}>
+    <group userData={{ ignoreOutline: true, ignoreWeaponCollision: true, triCategory: 'Thrusters' }}>
       {thrusterAnchors.map((_, thrusterIndex) => (
         <group key={`thruster-${thrusterIndex}`}>
           {Array.from({ length: SHIP_THRUSTER_FLAME_BLOB_COUNT }, (_, blobIndex) => (
@@ -8741,7 +8844,7 @@ function StarSystem({ autopilotTarget, highlightedTarget, renderPosition, system
         physicalPosition={renderPosition}
         visibleRange={STAR_LENS_FLARE_RANGE}
       >
-        <group ref={starVisualsRef}>
+        <group ref={starVisualsRef} userData={{ triCategory: 'Star' }}>
           <mesh userData={{ ignoreStarOcclusion: true }}>
             <sphereGeometry args={[system.radius, 24, 24]} />
             <meshBasicMaterial color={system.color} />
@@ -9014,7 +9117,7 @@ function PlanetBody({ physicalPosition, planet }: { physicalPosition: Vec3Tuple;
     <>
       <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={PLANET_VISIBILITY_RANGE}>
         {/* Exclude planet meshes from edge-line shader overlays */}
-        <group userData={{ ignoreOutline: true }}>
+        <group userData={{ ignoreOutline: true, triCategory: 'Planets' }}>
           <AdaptiveBodySurface
             color={planet.color}
             lowSegments={20}
@@ -9027,7 +9130,7 @@ function PlanetBody({ physicalPosition, planet }: { physicalPosition: Vec3Tuple;
         </group>
       </PhysicalProxyGroup>
 
-      <group userData={{ ignoreOutline: true }}>
+      <group userData={{ ignoreOutline: true, triCategory: 'Terrain' }}>
         <PlanetTerrain
           planetPosition={physicalPosition}
           planetRadius={planet.radius}
@@ -9055,7 +9158,7 @@ function MoonBody({ moon, physicalPosition }: { moon: MoonData; physicalPosition
     <>
       <PhysicalProxyGroup physicalPosition={physicalPosition} visibleRange={PLANET_VISIBILITY_RANGE}>
         {/* Exclude moon meshes from edge-line shader overlays */}
-        <group userData={{ ignoreOutline: true }}>
+        <group userData={{ ignoreOutline: true, triCategory: 'Moons' }}>
           <AdaptiveBodySurface
             color={moon.color}
             lowSegments={16}
@@ -9068,7 +9171,7 @@ function MoonBody({ moon, physicalPosition }: { moon: MoonData; physicalPosition
         </group>
       </PhysicalProxyGroup>
 
-      <group userData={{ ignoreOutline: true }}>
+      <group userData={{ ignoreOutline: true, triCategory: 'Terrain' }}>
         <PlanetTerrain
           planetPosition={physicalPosition}
           planetRadius={moon.radius}
@@ -9234,11 +9337,11 @@ function SpaceStation({ station, physicalPosition, scale }: { station: StationDa
       <>
         <StationForceField fieldId={`${station.id}:force-field`} radius={fieldRadius} />
         {station.modelPath ? (
-          <group ref={walkableRootRef} scale={station.modelScale}>
+          <group ref={walkableRootRef} scale={station.modelScale} userData={{ triCategory: station.modelPath.replace(/^.*\//, '').replace(/\.glb$/i, '') }}>
             <StationModel modelPath={station.modelPath} />
           </group>
         ) : (
-          <group ref={walkableRootRef} scale={scale}>
+          <group ref={walkableRootRef} scale={scale} userData={{ triCategory: 'Stations (proc.)' }}>
             <>
               <mesh>
                 <cylinderGeometry args={[0.8, 0.8, 5.5, 18]} />
@@ -9264,8 +9367,102 @@ function SpaceStation({ station, physicalPosition, scale }: { station: StationDa
   );
 }
 
+const DUST_ASTEROID_CULL_DISTANCE = 20_000;
+const DUST_BILLBOARD_MID_DISTANCE = 500;   // <500m → dodecahedron, 500m–2km → mid billboard
+const DUST_BILLBOARD_FAR_DISTANCE = 2_000;  // 2km–20km → far billboard
+
+/** Set by the top-level HUD component so AsteroidDust can check debug mode. */
+let dustDebugOverlayActive = false;
+
+/** Module-level accumulator written by every AsteroidDust useFrame, read by the debug overlay interval.
+ *  Uses a double-buffer: WIP values accumulate during the current frame;
+ *  when a new frame starts the first useFrame to detect it promotes WIP → display. */
+const dustDebugAccumulator = {
+  // Display values (last complete frame) — read by the debug interval
+  totalObjects: 0,
+  renderedTris: 0,
+  nearCount: 0,
+  midCount: 0,
+  farCount: 0,
+  // Work-in-progress values (current frame, still accumulating)
+  _wip_totalObjects: 0,
+  _wip_renderedTris: 0,
+  _wip_nearCount: 0,
+  _wip_midCount: 0,
+  _wip_farCount: 0,
+  /** Elapsed-time stamp of the frame currently being accumulated. */
+  _lastFrameTime: -1,
+};
+
+/** Billboard ShaderMaterial that always faces the camera and renders a textured quad.
+ *  In debug mode the `uDebugColor` uniform overrides the texture with a solid color. */
+function createDustBillboardMaterial(texture: THREE.Texture, debugColor: THREE.Color): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uTexture: { value: texture },
+      uDebug: { value: 0 },
+      uDebugColor: { value: debugColor },
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      #ifdef USE_LOGDEPTHBUF
+        varying float vFragDepth;
+      #endif
+      void main() {
+        vUv = uv;
+        // Extract per-instance scale (column lengths of instanceMatrix)
+        float sx = length(vec3(instanceMatrix[0].xyz));
+        float sy = length(vec3(instanceMatrix[1].xyz));
+        // Apply the model (group) uniform scale from PhysicalProxyGroup
+        float modelScale = length(vec3(modelMatrix[0].xyz));
+        sx *= modelScale;
+        sy *= modelScale;
+        // Transform instance position from group-local to world space via modelMatrix
+        vec3 instanceWorldPos = (modelMatrix * vec4(instanceMatrix[3].xyz, 1.0)).xyz;
+        // Billboard: use camera-aligned axes with world-space instance position & scale
+        vec3 camRight = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
+        vec3 camUp    = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
+        vec3 worldPos = instanceWorldPos
+          + camRight * position.x * sx
+          + camUp    * position.y * sy;
+        gl_Position = projectionMatrix * viewMatrix * vec4(worldPos, 1.0);
+        #ifdef USE_LOGDEPTHBUF
+          vFragDepth = 1.0 + gl_Position.w;
+        #endif
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform sampler2D uTexture;
+      uniform float uDebug;
+      uniform vec3 uDebugColor;
+      varying vec2 vUv;
+      #ifdef USE_LOGDEPTHBUF
+        uniform float logDepthBufFC;
+        varying float vFragDepth;
+      #endif
+      void main() {
+        vec4 texColor = texture2D(uTexture, vUv);
+        if (texColor.a < 0.05) discard;
+        if (uDebug > 0.5) {
+          gl_FragColor = vec4(uDebugColor, texColor.a);
+        } else {
+          gl_FragColor = texColor;
+        }
+        #ifdef USE_LOGDEPTHBUF
+          gl_FragDepth = log2(vFragDepth) * logDepthBufFC * 0.5;
+        #endif
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+}
+
 function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: DustAsteroidData[]; localStateRef: MutableRefObject<LocalGameState>; physicalPosition: Vec3Tuple; show: boolean }): ReactElement {
   const instancedMeshRef = useRef<THREE.InstancedMesh>(null);
+  const billboardMidRef = useRef<THREE.InstancedMesh>(null);
+  const billboardFarRef = useRef<THREE.InstancedMesh>(null);
   const dustGroupRef = useRef<THREE.Group>(null);
   const explosionFlashRefs = useRef<Array<THREE.Mesh | null>>([]);
   const explosionGlowRefs = useRef<Array<THREE.Mesh | null>>([]);
@@ -9273,8 +9470,24 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
   const nextExplosionIndexRef = useRef(0);
   const shotCountsRef = useRef<number[]>([]);
   const removedRef = useRef<boolean[]>([]);
+  /** Maps compacted instance buffer indices → original dust indices for weapon-hit resolution. */
+  const meshIndexMapRef = useRef<number[]>([]);
   const matrixDummy = useMemo(() => new THREE.Object3D(), []);
-  const hiddenPosition = useMemo(() => new THREE.Vector3(0, -1_000_000, 0), []);
+  const dustParticlePhysPos = useMemo(() => new THREE.Vector3(), []);
+
+  // Load billboard textures
+  const billboardMidTex = useLoader(THREE.TextureLoader, '/textures/dust_billboard.png');
+  const billboardFarTex = useLoader(THREE.TextureLoader, '/textures/dust_billboard_far.png');
+
+  // Billboard materials (created once, uniforms updated per-frame for debug)
+  const billboardMidMat = useMemo(
+    () => createDustBillboardMaterial(billboardMidTex, new THREE.Color('#ff69b4')),
+    [billboardMidTex],
+  );
+  const billboardFarMat = useMemo(
+    () => createDustBillboardMaterial(billboardFarTex, new THREE.Color('#39ff14')),
+    [billboardFarTex],
+  );
   const localHitPoint = useMemo(() => new THREE.Vector3(), []);
   const worldHitPoint = useMemo(() => new THREE.Vector3(), []);
   const randomDirection = useMemo(() => new THREE.Vector3(), []);
@@ -9316,6 +9529,7 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
 
     shotCountsRef.current = Array.from({ length: dust.length }, () => 0);
     removedRef.current = Array.from({ length: dust.length }, () => false);
+    meshIndexMapRef.current = Array.from({ length: dust.length }, (_, i) => i);
 
     dust.forEach((_, index) => {
       instancedMeshRef.current?.setMatrixAt(index, baseMatrices[index]);
@@ -9323,33 +9537,40 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
     instancedMeshRef.current.instanceMatrix.needsUpdate = true;
     instancedMeshRef.current.computeBoundingSphere();
 
+    // Initialize billboard InstancedMeshes with zero count (compaction loop will populate them)
+    if (billboardMidRef.current) {
+      billboardMidRef.current.count = 0;
+      billboardMidRef.current.instanceMatrix.needsUpdate = true;
+    }
+    if (billboardFarRef.current) {
+      billboardFarRef.current.count = 0;
+      billboardFarRef.current.instanceMatrix.needsUpdate = true;
+    }
+
     const handleDustImpact = (hit: THREE.Intersection<THREE.Object3D>) => {
-      const instanceId = hit.instanceId;
-      if (instanceId === undefined || instanceId === null || removedRef.current[instanceId]) {
+      const compactedId = hit.instanceId;
+      if (compactedId === undefined || compactedId === null) {
+        return;
+      }
+      const originalId = meshIndexMapRef.current[compactedId];
+      if (originalId === undefined || removedRef.current[originalId]) {
         return;
       }
 
-      shotCountsRef.current[instanceId] = (shotCountsRef.current[instanceId] ?? 0) + 1;
-      if (shotCountsRef.current[instanceId] < DUST_ASTEROID_HITS_TO_DESTROY) {
+      shotCountsRef.current[originalId] = (shotCountsRef.current[originalId] ?? 0) + 1;
+      if (shotCountsRef.current[originalId] < DUST_ASTEROID_HITS_TO_DESTROY) {
         return;
       }
 
-      removedRef.current[instanceId] = true;
-      matrixDummy.position.copy(hiddenPosition);
-      matrixDummy.rotation.set(0, 0, 0);
-      matrixDummy.scale.setScalar(0.0001);
-      matrixDummy.updateMatrix();
-      instancedMeshRef.current?.setMatrixAt(instanceId, matrixDummy.matrix);
-      if (instancedMeshRef.current) {
-        instancedMeshRef.current.instanceMatrix.needsUpdate = true;
-      }
+      removedRef.current[originalId] = true;
+      // The next useFrame compaction pass will exclude this particle from the buffer.
 
       const explosion = explosions[nextExplosionIndexRef.current % explosions.length];
       nextExplosionIndexRef.current += 1;
       explosion.active = true;
       explosion.age = 0;
       explosion.life = DUST_ASTEROID_EXPLOSION_LIFETIME_SECONDS;
-      explosion.scale = Math.max(0.6, dust[instanceId]?.size ?? 0.6) * 2.8;
+      explosion.scale = Math.max(0.6, dust[originalId]?.size ?? 0.6) * 2.8;
       worldHitPoint.copy(hit.point);
       localHitPoint.copy(worldHitPoint);
       dustGroupRef.current?.worldToLocal(localHitPoint);
@@ -9395,8 +9616,10 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
     };
 
     const shouldIgnoreDustImpact = (hit: THREE.Intersection<THREE.Object3D>) => {
-      const instanceId = hit.instanceId;
-      return instanceId === undefined || instanceId === null || removedRef.current[instanceId];
+      const compactedId = hit.instanceId;
+      if (compactedId === undefined || compactedId === null) return true;
+      const originalId = meshIndexMapRef.current[compactedId];
+      return originalId === undefined || removedRef.current[originalId];
     };
 
     instancedMeshRef.current.userData.onWeaponImpact = handleDustImpact;
@@ -9408,9 +9631,102 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
         delete instancedMeshRef.current.userData.shouldIgnoreWeaponImpact;
       }
     };
-  }, [baseMatrices, dust, explosions, fallbackForward, hiddenPosition, localHitPoint, localStateRef, lookMatrix, lookOrigin, lookTarget, matrixDummy, nextExplosionIndexRef, projectedForward, randomDirection, shipBlastDirection, targetShipRotation, upward, worldHitPoint]);
+  }, [baseMatrices, dust, explosions, fallbackForward, localHitPoint, localStateRef, lookMatrix, lookOrigin, lookTarget, matrixDummy, nextExplosionIndexRef, projectedForward, randomDirection, shipBlastDirection, targetShipRotation, upward, worldHitPoint]);
 
   useFrame((_state, delta) => {
+    // --- 3-tier LOD + 20km cull: compact each InstancedMesh independently ---
+    // Distance is computed in SCENE space using the group's world matrix
+    // so the LOD tiers match what the user actually sees (after proxy compression).
+    const meshIM = instancedMeshRef.current;
+    const midIM = billboardMidRef.current;
+    const farIM = billboardFarRef.current;
+    const group = dustGroupRef.current;
+    if (meshIM && group) {
+      const camPos = _state.camera.position;
+      let nNear = 0;   // dodecahedron (<500m)
+      let nMid = 0;    // mid billboard (500m–2km)
+      let nFar = 0;    // far billboard (2km–20km)
+      const TRIS_PER_DODECA = 36;
+      const TRIS_PER_BILLBOARD = 2;
+
+      // Get the group's world matrix (set by PhysicalProxyGroup) so we can
+      // transform each particle's local offset into scene space.
+      group.updateWorldMatrix(true, false);
+      const groupMatrix = group.matrixWorld;
+
+      for (let i = 0; i < dust.length; i++) {
+        if (removedRef.current[i]) continue;
+
+        const d = dust[i];
+        // Transform particle local position into scene space via the group's world matrix
+        dustParticlePhysPos.set(d.position[0], d.position[1], d.position[2]);
+        dustParticlePhysPos.applyMatrix4(groupMatrix);
+        const dist = camPos.distanceTo(dustParticlePhysPos);
+
+        if (dist > DUST_ASTEROID_CULL_DISTANCE) continue;
+
+        if (dist <= DUST_BILLBOARD_MID_DISTANCE) {
+          // Near: full dodecahedron
+          meshIM.setMatrixAt(nNear, baseMatrices[i]);
+          meshIndexMapRef.current[nNear] = i;
+          nNear++;
+        } else if (dist <= DUST_BILLBOARD_FAR_DISTANCE) {
+          // Mid: texture billboard
+          if (midIM) {
+            midIM.setMatrixAt(nMid, baseMatrices[i]);
+            nMid++;
+          }
+        } else {
+          // Far: small texture billboard
+          if (farIM) {
+            farIM.setMatrixAt(nFar, baseMatrices[i]);
+            nFar++;
+          }
+        }
+      }
+
+      meshIM.count = nNear;
+      meshIM.instanceMatrix.needsUpdate = true;
+      if (midIM) {
+        midIM.count = nMid;
+        midIM.instanceMatrix.needsUpdate = true;
+      }
+      if (farIM) {
+        farIM.count = nFar;
+        farIM.instanceMatrix.needsUpdate = true;
+      }
+
+      // Toggle debug color uniforms
+      const debugOn = dustDebugOverlayActive ? 1 : 0;
+      billboardMidMat.uniforms.uDebug.value = debugOn;
+      billboardFarMat.uniforms.uDebug.value = debugOn;
+
+      // Compute triangle stats
+      const renderedTris = nNear * TRIS_PER_DODECA + nMid * TRIS_PER_BILLBOARD + nFar * TRIS_PER_BILLBOARD;
+
+      // Double-buffer: detect new frame and promote WIP → display
+      const frameTime = _state.clock.elapsedTime;
+      if (frameTime !== dustDebugAccumulator._lastFrameTime) {
+        dustDebugAccumulator.totalObjects = dustDebugAccumulator._wip_totalObjects;
+        dustDebugAccumulator.renderedTris = dustDebugAccumulator._wip_renderedTris;
+        dustDebugAccumulator.nearCount = dustDebugAccumulator._wip_nearCount;
+        dustDebugAccumulator.midCount = dustDebugAccumulator._wip_midCount;
+        dustDebugAccumulator.farCount = dustDebugAccumulator._wip_farCount;
+        dustDebugAccumulator._wip_totalObjects = 0;
+        dustDebugAccumulator._wip_renderedTris = 0;
+        dustDebugAccumulator._wip_nearCount = 0;
+        dustDebugAccumulator._wip_midCount = 0;
+        dustDebugAccumulator._wip_farCount = 0;
+        dustDebugAccumulator._lastFrameTime = frameTime;
+      }
+      dustDebugAccumulator._wip_totalObjects += dust.length;
+      dustDebugAccumulator._wip_nearCount += nNear;
+      dustDebugAccumulator._wip_midCount += nMid;
+      dustDebugAccumulator._wip_farCount += nFar;
+      dustDebugAccumulator._wip_renderedTris += renderedTris;
+    }
+
+    // --- Explosion animations ---
     for (let explosionIndex = 0; explosionIndex < explosions.length; explosionIndex += 1) {
       const explosion = explosions[explosionIndex];
       const hasAllBurstMeshes = Array.from({ length: DUST_ASTEROID_EXPLOSION_SUB_BURSTS }).every((_, burstIndex) => {
@@ -9520,14 +9836,25 @@ function AsteroidDust({ dust, localStateRef, physicalPosition, show }: { dust: D
   return (
     <PhysicalProxyGroup
       physicalPosition={physicalPosition}
-      visibleRange={SMALL_ASTEROID_VISIBILITY_RANGE * 2}
+      visibleRange={DUST_ASTEROID_CULL_DISTANCE + 8_000}
       linearDistance={ASTEROID_PROXY_LINEAR_DISTANCE}
       logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}
     >
-      <group ref={dustGroupRef} visible={show} userData={{ ignoreOutline: true }}>
+      <group ref={dustGroupRef} visible={show} userData={{ ignoreOutline: true, triCategory: 'Asteroid Dust' }}>
+        {/* Tier 1: Full dodecahedron for <500m */}
         <instancedMesh ref={instancedMeshRef} args={[null as any, null as any, dust.length]} frustumCulled={false}>
           <dodecahedronGeometry args={[1, 0]} />
           <meshStandardMaterial color="#64748b" roughness={0.96} metalness={0.06} />
+        </instancedMesh>
+        {/* Tier 2: Mid billboard (500m–2km) */}
+        <instancedMesh ref={billboardMidRef} args={[null as any, null as any, dust.length]} frustumCulled={false} userData={{ triCategory: 'Asteroid Dust' }}>
+          <planeGeometry args={[2, 2]} />
+          <primitive object={billboardMidMat} attach="material" />
+        </instancedMesh>
+        {/* Tier 3: Far billboard (2km–20km) */}
+        <instancedMesh ref={billboardFarRef} args={[null as any, null as any, dust.length]} frustumCulled={false} userData={{ triCategory: 'Asteroid Dust' }}>
+          <planeGeometry args={[2, 2]} />
+          <primitive object={billboardFarMat} attach="material" />
         </instancedMesh>
         {explosions.map((_, explosionIndex) => (
           <group key={`dust-explosion-${explosionIndex}`}>
@@ -9590,11 +9917,11 @@ function AsteroidMesh({
   return (
     <PhysicalProxyGroup
       physicalPosition={physicalPosition}
-      visibleRange={SMALL_ASTEROID_VISIBILITY_RANGE * 2}
+      visibleRange={20_000}
       linearDistance={ASTEROID_PROXY_LINEAR_DISTANCE}
       logarithmicFactor={ASTEROID_PROXY_LOG_FACTOR}
     >
-      <group rotation={asteroid.rotation} scale={visualScale} visible={show}>
+      <group rotation={asteroid.rotation} scale={visualScale} visible={show} userData={{ triCategory: 'Asteroids' }}>
         {asteroid.shape === 'abstract' ? (
           <mesh>
             <icosahedronGeometry args={[1, 1]} />
@@ -9615,7 +9942,7 @@ function AsteroidMesh({
 
 function ShipExterior({ highlight = false }: { highlight?: boolean }): ReactElement {
   return (
-    <group>
+    <group userData={{ triCategory: 'Ships (proc.)' }}>
       <mesh position={[0, 0, 0]}>
         <capsuleGeometry args={[1.05, 6.4, 6, 18]} />
         <meshStandardMaterial color={highlight ? '#93c5fd' : '#94a3b8'} metalness={0.5} roughness={0.35} />
@@ -9654,7 +9981,7 @@ function ShipExterior({ highlight = false }: { highlight?: boolean }): ReactElem
 
 function ShipInterior({ isPilot = false }: { isPilot?: boolean }): ReactElement {
   return (
-    <group>
+    <group userData={{ triCategory: 'Ships (proc.)' }}>
       <mesh position={[0, -0.1, 0]} rotation={[-Math.PI / 2, 0, 0]}>
         <planeGeometry args={[6, 11]} />
         <meshStandardMaterial color="#111827" metalness={0.2} roughness={0.9} />
@@ -9722,7 +10049,7 @@ function RemotePlayer({
 
 function Astronaut(): ReactElement {
   return (
-    <group>
+    <group userData={{ triCategory: 'Astronaut' }}>
       <mesh position={[0, 0, 0]}>
         <capsuleGeometry args={[0.28, 0.74, 4, 12]} />
         <meshStandardMaterial color="#cbd5e1" metalness={0.08} roughness={0.82} />

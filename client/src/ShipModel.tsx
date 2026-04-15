@@ -340,7 +340,7 @@ export function ShipExteriorModel({ config, showDebugAnchors = true }: ShipExter
   });
 
   return (
-    <group>
+    <group userData={{ triCategory: `${config.name} (ext)` }}>
       <group rotation={[0, Math.PI, 0]}>
         <primitive object={clonedScene} />
       </group>
@@ -437,7 +437,7 @@ export function ShipInteriorModel({ config, showDebugAnchors = true, seatOutline
   });
 
   return (
-    <group>
+    <group userData={{ triCategory: `${config.name} (int)` }}>
       <group rotation={[0, Math.PI, 0]}>
         <primitive object={clonedScene} />
       </group>

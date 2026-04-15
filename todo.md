@@ -50,3 +50,57 @@ Make ship slowly turn horizontal while no user input
 -7.28286
 
 if any mesh inside a glb file has the word "organic" in its name, the "blender" like edge shader should not be applied but instead the old outline shader should be applied. Also rename this old outline shader to the "organic outline shader" and the blender like edge shader to the "geometric edge shader".
+
+
+
+Triangle optimization:
+
+While at asteroid field:
+- Asteroid dust has 36k triangles.
+- Planets have 1,5k triangles
+- Star has 1,1k triangles
+- Moons have 480 triangles
+- Force fields have 7,4k triangles
+- Skybox has 3,9k triangles
+- Unclear what the category thrusters does but it has 3,9k triangles
+
+During travel:
+![alt text](image.png)
+
+While at planet station:
+Force fields have 52k triangles
+"station1" all of a sudden has 28k triangles
+Thrusters have 6,6k triangles
+skybox same
+planets have 2,28k triangles
+star same
+moons 960 triangles
+
+Optimization:
+- Force fields: Why do they have triangles in the first place? Should just get visible when shot. No triangles are being rendered before that. During shooting it mereley renders a part of the force field that was hit. optimize this. Also i have a suspicion force fields of other stations neaby are rendered. dont even take force fields into consideration that are further than 10km
+- Asteroid dust: optimize the asteroid "dust" meshes by rendering billboards inplace of the mesh if they are further than 500m away.
+
+Further Optimization:
+- Force fields: (Still after optimizaion while being shot up to 6k triangles. Fix this. not that much geometry is nessecary. For a single force field only render the triangles around the area being hit and nothing else.)
+- Planets and moons (~3k triangles): Do not render planets and moons that are further than 0.5 AU away at all
+- Skybox (3,9k triangles): Use a cubemap skybox similar to this:
+    const loader = new THREE.CubeTextureLoader();
+    const texture = loader.load([
+    'px.jpg', 'nx.jpg',
+    'py.jpg', 'ny.jpg',
+    'pz.jpg', 'nz.jpg'
+    ]);
+    scene.background = texture;
+- Thrusters (6,6k triangles) What is meant by thrusters and why do they have 4-6,6k triangles
+- Stations: Do not render stations further than 30km away.
+- Star(s): do not render the star as a conventional mesh at all, but simply as a circle billboard always pointing at the camera, with the same material as it has right now.
+
+36 triangles per asteroid dust means there are 1000 asteroids in the dust field.
+
+
+Another thing i noticed, is that when flying away, after a few kilometers outside of the asteroid field, the asteroid dust suddenly "shifts" horizontally in position. When going back near it it shifts back. This might be the reason the location of where which LOD is rendered is also shifted, or not the reason but these issues might have the same cause. This feels likea  real cause. I also noticed that the position of the asteroid dust "cloud" in general is off center of the rest of the asteroid fild. One side has asteroid dust far beyond the end of the field while the other side has no asteroid dust at all. Meaning somehow the actual center of the asteroid dust is not centered around the center of the field, and therefore everythign is displaced
+
+New low-distance autopilot (targets less than 15km away):
+Generate a flightpath. The flightpath should be visualized through a yellow line in debug mode.
+At first its a straight line. If the straight line intersects with any objects, a point of intersection is "marked" like a vertice/node on this line. This point is then moved away from the object in the direction from its center to the point until it is at least 200m away from the object's surface. Repeat this process up to 10 times or until there are no intersections anymore.
+The line is then smoothed out by applying a bezier curve to it. The ship then follows this line while leaning in the curves and while correctly using acceleration and deceleration as in normal flight. The ship can during low distance autopilot never move faster than its normal max speed.
